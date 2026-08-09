@@ -347,9 +347,9 @@ function modelProblem(model, providers, slugs, gatewayModels) {
     return `duplicate gateway model ${model.gatewayModel}`;
   }
   if (model.listed) {
-    // Listed fields are optional: catalog.mjs falls back to the native
-    // template for anything absent, so a relayed GPT needs no metadata copy.
-    // Present fields are still validated.
+    // Listed fields are optional and validated when present. Catalog metadata
+    // is provider-specific: WLB clones its exact native upstream entry while
+    // MiMo emits its explicit Xiaomi field set.
     for (const field of [
       "displayName",
       "description",

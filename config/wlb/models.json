@@ -7,8 +7,23 @@
       "upstreamModel": "gpt-5.6-sol",
       "provider": "wlb-relay",
       "listed": true,
-      "displayName": "GPT-5.6-Sol (WLB)",
-      "priority": 110
+      "displayName": "GPT-5.6-Sol (WLB)"
+    },
+    {
+      "slug": "wlb-relay/gpt-5.6-terra",
+      "gatewayModel": "wlb-relay-gpt-5-6-terra",
+      "upstreamModel": "gpt-5.6-terra",
+      "provider": "wlb-relay",
+      "listed": true,
+      "displayName": "GPT-5.6-Terra (WLB)"
+    },
+    {
+      "slug": "wlb-relay/gpt-5.6-luna",
+      "gatewayModel": "wlb-relay-gpt-5-6-luna",
+      "upstreamModel": "gpt-5.6-luna",
+      "provider": "wlb-relay",
+      "listed": true,
+      "displayName": "GPT-5.6-Luna (WLB)"
     }
   ]
 }

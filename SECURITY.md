@@ -1,143 +1,63 @@
-# Security model
+# Security guide
 
-The router has its own trust root separate from Codex's: a random caller key,
-an internal service key, a private state directory, per-provider API-key
-files, and a dedicated service identity and port range. Kimi OAuth is the
-intentional exception: the router reuses the official Kimi CLI session under
-`~/.kimi-code`.
+Codex Router Lite is a local Node service. It has one router process, forwards
+Responses API requests directly to the selected upstream, and does not include
+LiteLLM, a forwarder, Python, OAuth, or a tray application.
 
-## Credential separation
+## Credentials
 
-Codex Router handles four credential classes and keeps them on distinct paths:
+- The only routed providers are `mimo-token-plan` and `wlb-relay`. Set their
+  keys with `provider-key mimo-token-plan set` and
+  `provider-key wlb-relay set`.
+- By default, protected key files are
+  `~/.codex/codex-router/mimo-api-key.secret` and
+  `~/.codex/codex-router/wlb-api-key.secret`. `CODEX_ROUTER_STATE_DIR` or
+  `MODEL_ROUTER_STATE_DIR` may select another state directory.
+- Files are restricted to the current user (`600` on POSIX and a current-user
+  ACL on Windows). Environment variables are supported for a foreground run;
+  use the protected files for a background service.
+- Keys are read only to create the upstream `Authorization` header. They are
+  not written to the catalog, Codex config, or logs. Never commit or paste a
+  key, a full generated caller URL, or a live state-directory file.
+- Routed requests do not forward Codex's incoming account/authentication
+  headers. Native GPT requests use the allow-listed Codex headers needed by
+  the native backend.
 
-- ChatGPT/Codex authentication is allow-listed only for native GPT requests.
-- Kimi Code OAuth is read from the official Kimi CLI directory and sent only to
-  the Kimi Code managed endpoint.
-- Kimi Platform API keys are sent only to the configured Kimi Platform endpoint.
-- DeepSeek API keys are sent only to the configured DeepSeek endpoint.
+The state directory also contains `caller-secret`. It authenticates Codex's
+loopback URL and is separate from provider keys; treat it as sensitive.
+Processes running as the same operating-system user can generally read the
+user's Codex config and state, so this is not a same-user malware boundary.
 
-External requests never receive ChatGPT account IDs, Codex installation IDs,
-attestation headers, or the caller's authorization header. The loopback gateway
-uses a random internal key, which the final forwarder replaces with exactly one
-provider credential.
+## Network and proxy boundary
 
-No provider credential is written to the model registry, catalog, Codex config,
-generated LiteLLM config, logs, or health responses. Codex config does contain a
-random, local-only caller capability as part of the managed loopback URL. The
-config, its backup, migration snapshots, and diagnostic output are therefore
-protected or redacted.
+The router binds to loopback by default (port `4102` unless configured). Do not
+change it to a public listener, tunnel it, or expose it on a shared network.
+The caller capability is checked before a model request is read or forwarded.
 
-## Local secret storage
+The configured provider URLs use HTTPS and the router calls each provider's
+`/responses` endpoint directly. Keep normal TLS verification enabled and only
+trust a proxy you operate. `src/start.mjs` sets `NODE_USE_ENV_PROXY=1` and
+passes `HTTP_PROXY`/`HTTPS_PROXY`; the default proxy is
+`http://127.0.0.1:7897`, with loopback in `NO_PROXY`. A proxy can observe or
+modify traffic if it terminates TLS, so review proxy configuration and logs.
 
-Router state lives under `$CODEX_HOME/codex-router` by default:
+Request logging is off by default. `CODEX_ROUTER_REQUEST_LOG=1` records request
+method, URL, status, and duration for troubleshooting; redact the caller
+capability and any private paths before sharing logs. Router errors do not log
+request or response bodies or provider key values, but logs can still contain
+model names and paths.
 
-| File | Purpose | Mode |
-| --- | --- | --- |
-| `internal-secret` | Random loopback service key | `600` |
-| `caller-secret` | Random capability used by that app target's router requests | `600` |
-| `kimi-api-key.secret` | Optional Kimi Platform key | `600` |
-| `deepseek-api-key.secret` | Optional DeepSeek key | `600` |
-| `xai-api-key.secret` | Optional xAI key | `600` |
-| `anthropic-api-key.secret` | Optional Anthropic key | `600` |
-| `native-models.json` | Cached native Codex catalog | `600` |
-| `merged-models.json` | Native plus registry model catalog | `600` |
-| `litellm.yaml` | Generated routes with environment references only | `600` |
-| `enabled-providers.json` | Picker visibility, no credential values | `600` |
-| `install-manifest.json` | Installed version and rollback metadata | `600` |
-| `migrations/` | Protected config/service rollback snapshots | private |
-| `support/` | Locally generated diagnostic bundles | `600` files |
+## Supported runtime and updates
 
-The router can read provider keys from process environment or compatible
-legacy macOS Keychain services. The interactive helper writes protected local
-files so the per-user background service can access them without copying
-secrets into its service definition. Files use mode `600` on POSIX systems. On
-Windows, the helper removes inherited ACL entries and grants access only to the
-current user SID.
-
-Installers deliberately do not copy API-key environment variables into launchd,
-systemd, or Task Scheduler definitions. Environment-only credentials work for a
-foreground router process, but background setup requires a protected file.
-Compatible legacy Keychain lookup is a migration path only.
-
-Kimi OAuth remains under `$KIMI_CODE_HOME` or `~/.kimi-code`; Codex Router does
-not copy it into its own state directory.
-
-Never commit the state directory, a provider key, a Kimi credential file, or
-a generated config from a live installation.
-
-## Network boundary
-
-The router, LiteLLM gateway, OAuth forwarder, and API forwarder bind only to
-`127.0.0.1`. Every model route requires a random caller capability, which Codex carries
-in the managed URL.
-Internal gateway and forwarder routes require a separate random service key,
-and credential-detail health responses are authenticated.
-Model requests must use JSON; requests with browser-origin headers are rejected,
-and the router sends no CORS permission headers. This remains compatible with
-Codex API-key sessions that do not attach a bearer header to the loopback hop.
-
-This blocks drive-by browser requests and processes running without access to
-the user's protected files. It does not create a security boundary against
-malicious code already running as the same OS user, which can generally read
-that user's Codex config and process state. Do not change listeners to
-`0.0.0.0`, tunnel the ports, or expose them on a shared network. These controls
-are not internet-facing authentication.
-
-Codex may include the request URL in its own error output. Treat the full URL as
-sensitive even though it is loopback-only; redact the generated path before
-sharing screenshots or logs.
-
-API base URL overrides are trusted-user configuration. A malicious override can
-send the matching provider credential to another server. Inspect background
-service environment changes and never accept an untrusted `config/providers.json`.
-
-## Configuration safety
-
-The config manager:
-
-- Writes only a marked `openai_base_url` and `model_catalog_json` block.
-- Preserves `model`, `model_provider`, reasoning settings, profiles, and ChatGPT
-  authentication.
-- Refuses to replace an unmarked user-owned base URL or catalog.
-- Creates `~/.codex/config.toml.pre-codex-router` before its first change.
-- Atomically rewrites the config and restricts it to the current user.
-- Recognizes and removes the earlier Kimi-specific managed block during upgrade.
-- Snapshots recognized old service definitions and exact config before migration.
-- Refuses unknown router catalogs and unrecognized origin URLs during update.
-
-Review the scoped difference with:
-
-```sh
-diff -u ~/.codex/config.toml.pre-codex-router ~/.codex/config.toml
-```
-
-## Dependency and release hygiene
-
-LiteLLM is version-pinned because it processes prompts, tool calls, streams, and
-provider responses. Node dependencies are locked by `package-lock.json`. CI runs
-syntax, audit, and route/state tests on macOS, Linux, and Windows. Tagged source
-archives include SHA-256 checksums and GitHub build-provenance attestations.
-
-The convenience bootstrap commands track the repository's default branch. Users
-who need a fully reviewable or pinned install should download a tagged archive,
-verify `SHA256SUMS` and its provenance, inspect it, and run the local installer.
-
-Model discovery is read-only and never edits the registry. The live compatibility
-suite requires both `--live` and `--yes` because it sends prompts and consumes
-provider quota. Repository workflows receive provider keys only through GitHub
-Secrets; pull-request CI never receives them.
-
-Support bundles exclude logs by default and are never uploaded automatically.
-The optional redacted log tail can still contain private prompt or response text
-and must be inspected before sharing.
-
-Network-facing error handlers do not return or log raw exception text. Detailed
-credential state is available only through authenticated local health checks and
-the redacted doctor/support workflows.
+Use Node.js `>=22.19.0` as declared in `package.json` and keep the lockfile in
+sync. After changing a routed model, run `node src/catalog.mjs`, reload the
+router process, and restart Codex if its picker has not reloaded. Run the
+checked-in metadata and syntax checks before distributing a change.
 
 ## Reporting a vulnerability
 
 Use [GitHub Private Vulnerability Reporting](https://github.com/duolahypercho/codex-router/security/advisories/new).
-Do not include technical vulnerability details, access tokens, API keys,
-credential files, full prompts, response bodies, or unredacted logs in a public
-issue.
+Include the router revision, operating system, Node.js version, and Codex CLI
+version, plus a minimal reproduction and redacted logs. Do not include API
+keys, caller URLs, credential files, prompts, response bodies, or unredacted
+state-directory contents in an issue.

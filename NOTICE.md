@@ -1,13 +1,11 @@
 # Attribution
 
-This project uses the merged-model-catalog and built-in-provider routing
-pattern demonstrated by [opencodex](https://github.com/lidge-jun/opencodex).
-The implementation in this repository provides a registry-driven local router
-for Codex plus built-in Kimi and DeepSeek integrations.
+This is an independent Lite fork of
+[duolahypercho/codex-router](https://github.com/duolahypercho/codex-router).
+It keeps the upstream project's MIT-licensed foundation and adapts the local
+router for Codex's native catalog plus the MiMo Token Plan and WLB Relay
+providers.
 
-`opencodex` is distributed under the MIT License. Copyright (c) 2026
-opencodex contributors.
-
-This is an independent community project. It is not affiliated with or
-endorsed by OpenAI, Anthropic, Moonshot AI, the Kimi Code team, DeepSeek, or
-OpenRouter.
+MiMo, Xiaomi, WLB, and related service names are their respective owners'
+trademarks or service names. This project is not affiliated with or endorsed by
+OpenAI, Xiaomi/MiMo, WLB Club, or the upstream repository's maintainers.

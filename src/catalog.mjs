@@ -118,6 +118,11 @@ function nativeCatalog() {
 const BASELINE_EFFORTS = ["minimal", "low", "medium", "high", "xhigh"];
 const EFFORT_LADDER = [...BASELINE_EFFORTS, "max", "ultra"];
 const MAX_EFFORT_SINCE = [0, 143, 0];
+const ALLOWED_NATIVE_SLUGS = new Set([
+  "gpt-5.6-sol",
+  "gpt-5.6-terra",
+  "gpt-5.6-luna",
+]);
 
 export function codexEffortVocabulary(version) {
   const match = /(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.]+)?/.exec(String(version || ""));
@@ -176,38 +181,6 @@ function selectedModel() {
   return root.match(/^\s*model\s*=\s*["\']([^"\']+)["\']/m)?.[1];
 }
 
-function identityName(model) {
-  const displayName = String(model.displayName || "").trim();
-  if (displayName) {
-    return displayName.replace(/\s*\((?:OAuth|API)\)\s*$/i, "").trim() || displayName;
-  }
-  const slug = String(model.slug || "").trim();
-  const bare = slug.includes("/") ? slug.slice(slug.indexOf("/") + 1) : slug;
-  return bare || "an external model";
-}
-
-function rewriteIdentity(text, model) {
-  if (typeof text !== "string" || !text) return text;
-  const name = identityName(model);
-  return text
-    .replace(
-      /\b(?:a coding agent|an agent) based on GPT-5\b/g,
-      `a coding agent based on ${name}`,
-    )
-    .replace(/\bbased on GPT-5\b/g, `based on ${name}`);
-}
-
-function rewriteModelMessages(messages, model) {
-  if (!messages || typeof messages !== "object" || Array.isArray(messages)) {
-    return messages;
-  }
-  const next = { ...messages };
-  if (typeof next.instructions_template === "string") {
-    next.instructions_template = rewriteIdentity(next.instructions_template, model);
-  }
-  return next;
-}
-
 function normalizeNativeModel(model) {
   return {
     ...model,
@@ -219,90 +192,45 @@ function normalizeNativeModel(model) {
 }
 
 export function routedModel(template, model) {
-  // Registry fields are optional for listed models: anything absent falls
-  // back to the native template, which is how a relayed GPT (wlb-relay) can
-  // inherit the official metadata wholesale instead of maintaining a copy.
-  const next = {
-    ...template,
+  if (model.provider === "wlb-relay") {
+    if (!template || template.slug !== model.upstreamModel) {
+      throw new Error(
+        `Native catalog is missing exact upstream model ${model.upstreamModel} required by ${model.slug}.`,
+      );
+    }
+    return {
+      ...template,
+      slug: model.slug,
+      display_name: model.displayName ?? template.display_name,
+    };
+  }
+  if (model.provider !== "mimo-token-plan") {
+    throw new Error(`Unsupported routed model provider ${model.provider}.`);
+  }
+  return {
     slug: model.slug,
-    display_name: model.displayName ?? template.display_name,
-    description: model.description ?? template.description,
-    priority: model.priority ?? template.priority,
+    display_name: model.displayName,
+    description: model.description,
+    default_reasoning_level: model.defaultEffort,
+    supported_reasoning_levels: model.reasoningLevels,
+    shell_type: "shell_command",
     visibility: "list",
     supported_in_api: true,
-    default_reasoning_level: model.defaultEffort ?? template.default_reasoning_level,
-    supported_reasoning_levels:
-      model.reasoningLevels ?? template.supported_reasoning_levels,
-    context_window: model.contextWindow ?? template.context_window,
-    max_context_window: model.contextWindow ?? template.max_context_window,
-    effective_context_window_percent:
-      template.effective_context_window_percent ?? 95,
-    auto_compact_token_limit: model.autoCompact ?? template.auto_compact_token_limit,
-    input_modalities: model.inputModalities ?? template.input_modalities,
-    comp_hash: model.compHash ?? template.comp_hash,
-    supports_parallel_tool_calls:
-      model.supportsParallelToolCalls ?? template.supports_parallel_tool_calls,
-    truncation_policy: model.truncationPolicy ?? template.truncation_policy,
-    additional_speed_tiers: [],
-    service_tiers: [],
-    // Codex surfaces this once per slug (up to its own show cap) as the
-    // "Introducing {model}" announcement; absent copy must stay null so the
-    // client never renders an empty card.
-    availability_nux:
-      typeof model.availabilityNux === "string" && model.availabilityNux.trim()
-        ? { message: model.availabilityNux.trim() }
-        : null,
-    // Codex renders the markdown as the whole "Codex just got an upgrade"
-    // modal when this entry is the operator's current model and the target
-    // slug is listed; {model_from}/{model_to} are substituted by the client.
-    upgrade: model.upgradeTo
-      ? {
-          model: model.upgradeTo.model,
-          migration_markdown: model.upgradeTo.markdown.trim(),
-        }
-      : null,
-    supports_reasoning_summaries:
-      model.supportsReasoningSummaries ?? template.supports_reasoning_summaries ?? false,
-    default_reasoning_summary:
-      (model.supportsReasoningSummaries ?? template.supports_reasoning_summaries)
-        ? model.defaultReasoningSummary ?? template.default_reasoning_summary ?? "auto"
-        : "none",
-    support_verbosity: model.supportVerbosity ?? template.support_verbosity ?? false,
-    default_verbosity:
-      (model.supportVerbosity ?? template.support_verbosity)
-        ? template.default_verbosity ?? null
-        : null,
-    // Capability toggles come from the registry entry, never from the native
-    // template: an absent flag keeps the conservative default so a routed
-    // model only advertises what its slug's gateway path actually verified.
-    // "hosted" is the only search mode the request path can serve today (the
-    // provider backend runs the search server-side, as the Grok OAuth
-    // forwarder does); the registry loader rejects anything else.
-    supports_search_tool: model.searchTool?.mode === "hosted",
+    priority: model.priority,
+    base_instructions: model.baseInstructions,
+    supports_reasoning_summaries: model.supportsReasoningSummaries,
+    default_reasoning_summary: model.defaultReasoningSummary,
+    support_verbosity: model.supportVerbosity,
+    truncation_policy: model.truncationPolicy,
+    supports_parallel_tool_calls: model.supportsParallelToolCalls,
     supports_image_detail_original: model.supportsImageDetailOriginal === true,
-    use_responses_lite: false,
-    // Codex only knows one ApplyPatchToolType variant. The native template
-    // carries "freeform", but upstreams that reject OpenAI custom tools (Meta
-    // Responses, for example) must opt out explicitly; null is the only value
-    // that suppresses the tool without making the catalog unparseable.
-    apply_patch_tool_type: model.supportsApplyPatchTool === false ? null : "freeform",
-    // Codex v2 collaboration only exposes spawn_agent model overrides whose
-    // catalog entry advertises the same backend version as the parent. Models
-    // opt in after their tool and encrypted-payload relay paths are verified.
-    multi_agent_version: model.multiAgentVersion || "v1",
+    context_window: model.contextWindow,
+    max_context_window: model.contextWindow,
+    effective_context_window_percent: 95,
+    experimental_supported_tools: [],
+    input_modalities: model.inputModalities,
+    supports_search_tool: false,
   };
-  // An explicit baseInstructions wins verbatim (the MiMo docs ship their
-  // own identity block); otherwise the template's identity is rewritten to
-  // the model's display name as before.
-  if (typeof model.baseInstructions === "string" && model.baseInstructions.trim()) {
-    next.base_instructions = model.baseInstructions;
-  } else if (typeof next.base_instructions === "string") {
-    next.base_instructions = rewriteIdentity(next.base_instructions, model);
-  }
-  if (next.model_messages) {
-    next.model_messages = rewriteModelMessages(next.model_messages, model);
-  }
-  return next;
 }
 
 export const AUTO_ANNOUNCE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
@@ -395,19 +323,21 @@ function sortCatalogModels(models) {
 }
 
 export function buildMergedCatalog(native, routedModelsList, { includeNative = true } = {}) {
-  const template =
-    native.models.find((model) => model.slug === "gpt-5.5") ||
-    native.models.find((model) => model.visibility === "list") ||
-    native.models[0];
-  if (!template) {
+  if (!native || !Array.isArray(native.models) || native.models.length === 0) {
     throw new Error("Native model catalog is empty.");
   }
   const models = new Map(
     includeNative
-      ? native.models.map((model) => [model.slug, normalizeNativeModel(model)])
+      ? native.models
+          .filter((model) => ALLOWED_NATIVE_SLUGS.has(model.slug))
+          .map((model) => [model.slug, normalizeNativeModel(model)])
       : [],
   );
   for (const model of routedModelsList) {
+    const template =
+      model.provider === "wlb-relay"
+        ? native.models.find((nativeModel) => nativeModel.slug === model.upstreamModel)
+        : undefined;
     models.set(model.slug, routedModel(template, model));
   }
   return sortCatalogModels(models.values());

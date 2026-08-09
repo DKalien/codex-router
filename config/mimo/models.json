@@ -9,7 +9,7 @@
       "listed": true,
       "displayName": "mimo-v2.5-pro",
       "description": "MiMo-v2.5-Pro: Trillion-parameter Flagship Agent Foundation",
-      "priority": 101,
+      "priority": 0,
       "defaultEffort": "high",
       "reasoningLevels": [
         {
@@ -31,11 +31,9 @@
       },
       "supportsParallelToolCalls": false,
       "contextWindow": 1048576,
-      "autoCompact": 996147,
       "inputModalities": [
         "text"
-      ],
-      "compHash": "mimo-v2.5-pro-v1"
+      ]
     },
     {
       "slug": "mimo-token-plan/mimo-v2.5",
@@ -45,7 +43,7 @@
       "listed": true,
       "displayName": "mimo-v2.5",
       "description": "MiMo-V2.5: Native Omni-modal Perception Model",
-      "priority": 100,
+      "priority": 1,
       "defaultEffort": "high",
       "reasoningLevels": [
         {
@@ -68,12 +66,10 @@
       "supportsParallelToolCalls": false,
       "supportsImageDetailOriginal": true,
       "contextWindow": 1048576,
-      "autoCompact": 996147,
       "inputModalities": [
         "text",
         "image"
-      ],
-      "compHash": "mimo-v2.5-v1"
+      ]
     }
   ]
 }

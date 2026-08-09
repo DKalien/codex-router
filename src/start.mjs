@@ -23,7 +23,21 @@ const callerKey = assertCallerSecret(
   readFileSync(CALLER_SECRET_PATH, "utf8").trim(),
 );
 
+// Native GPT traffic is proxied to chatgpt.com, which is unreachable from
+// a direct connection here; Codex itself rides the system proxy, but Node's
+// fetch ignores it unless told. Route every upstream call through the local
+// Clash mixed port: its own GEOIP rules keep domestic provider endpoints
+// (MiMo) on DIRECT, so no VPN quota is spent on them. Override with the
+// standard *_PROXY variables when the proxy listens elsewhere.
+const proxyUrl =
+  process.env.HTTPS_PROXY ||
+  process.env.https_proxy ||
+  "http://127.0.0.1:7897";
 const commonEnv = {
+  NODE_USE_ENV_PROXY: "1",
+  HTTP_PROXY: proxyUrl,
+  HTTPS_PROXY: proxyUrl,
+  NO_PROXY: process.env.NO_PROXY || process.env.no_proxy || "127.0.0.1,localhost",
   MODEL_ROUTER_TARGET: TARGET,
   MODEL_ROUTER_STATE_DIR: STATE_DIR,
   MODEL_ROUTER_CALLER_KEY: callerKey,

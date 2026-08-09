@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "slug": "mimo-token-plan/mimo-v2.5-pro",
+      "gatewayModel": "mimo-token-plan-mimo-v2-5-pro",
+      "upstreamModel": "mimo-v2.5-pro",
+      "provider": "mimo-token-plan",
+      "listed": true,
+      "displayName": "MiMo V2.5 Pro",
+      "description": "Xiaomi MiMo V2.5 Pro via Token Plan. Trillion-parameter flagship agent model.",
+      "priority": 3,
+      "defaultEffort": "high",
+      "reasoningLevels": [
+        {
+          "effort": "none",
+          "description": "Disable Thinking"
+        },
+        {
+          "effort": "high",
+          "description": "Enabled Thinking"
+        }
+      ],
+      "contextWindow": 1048576,
+      "inputModalities": [
+        "text"
+      ],
+      "autoCompact": 900000,
+      "compHash": "mimo-v2.5-pro-v1"
+    },
+    {
+      "slug": "mimo-token-plan/mimo-v2.5",
+      "gatewayModel": "mimo-token-plan-mimo-v2-5",
+      "upstreamModel": "mimo-v2.5",
+      "provider": "mimo-token-plan",
+      "listed": true,
+      "displayName": "MiMo V2.5",
+      "description": "Xiaomi MiMo V2.5 via Token Plan. Native omni-modal perception model.",
+      "priority": 4,
+      "defaultEffort": "high",
+      "reasoningLevels": [
+        {
+          "effort": "none",
+          "description": "Disable Thinking"
+        },
+        {
+          "effort": "high",
+          "description": "Enabled Thinking"
+        }
+      ],
+      "contextWindow": 1048576,
+      "inputModalities": [
+        "text",
+        "image"
+      ],
+      "supportsImageDetailOriginal": true,
+      "autoCompact": 900000,
+      "compHash": "mimo-v2.5-v1"
+    }
+  ]
+}

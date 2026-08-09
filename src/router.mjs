@@ -29,7 +29,6 @@ import {
   loopback,
 } from "./paths.mjs";
 import { MODEL_BY_SLUG, PROVIDERS, providerForModel } from "./model-registry.mjs";
-import { createHealthCache } from "./health-cache.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
 import { readNativeRedirect } from "./native-redirect.mjs";
 import {
@@ -37,6 +36,7 @@ import {
   readProviderSelection,
   selectedConfiguredListedModels,
 } from "./provider-selection.mjs";
+import { resolveProviderCredential } from "./provider-credentials.mjs";
 import {
   estimateInputTokens,
   ResponseUsageTransform,
@@ -51,20 +51,6 @@ import {
 import { activityMetadataFromHeaders } from "./codex-session-names.mjs";
 import { translateGatewayError } from "./error-translation.mjs";
 import { recordUsageEvent } from "./usage-events.mjs";
-import {
-  describeImage,
-  evidenceCache,
-  hasNativeSession,
-  inputHasImage,
-  nativeAccountKey,
-  resolveVisionEngine,
-  stripImages,
-  substituteImages,
-  supportsImageInput,
-} from "./vision-bridge.mjs";
-import { readHiddenModels } from "./model-picker-state.mjs";
-import { readVisionBridgeSettings } from "./vision-bridge-state.mjs";
-import { installedNativeVisionEngines } from "./vision-engines.mjs";
 import { VERSION } from "./version.mjs";
 
 const LISTEN_HOST =
@@ -75,27 +61,17 @@ const LISTEN_PORT = Number(
 const NATIVE_BASE = (
   process.env.CODEX_NATIVE_BASE_URL || "https://chatgpt.com/backend-api/codex"
 ).replace(/\/+$/, "");
-const GATEWAY_BASE = (
-  process.env.CODEX_ROUTER_GATEWAY_BASE_URL ||
-  process.env.KIMI_GATEWAY_BASE_URL ||
-  loopback(PORTS.gateway, "/v1")
-).replace(/\/+$/, "");
-const OAUTH_HEALTH =
-  process.env.CODEX_ROUTER_OAUTH_HEALTH_URL ||
-  process.env.KIMI_OAUTH_HEALTH_URL ||
-  loopback(PORTS.oauth, "/health");
-const API_HEALTH =
-  process.env.CODEX_ROUTER_API_HEALTH_URL ||
-  process.env.KIMI_API_HEALTH_URL ||
-  loopback(PORTS.api, "/health");
-const GATEWAY_HEALTH =
-  process.env.CODEX_ROUTER_GATEWAY_HEALTH_URL ||
-  process.env.KIMI_GATEWAY_HEALTH_URL ||
-  loopback(PORTS.gateway, "/health/liveliness");
+// Lite: routed providers speak the Responses API natively, so turns go
+// straight to the provider endpoint with its own credential -- no local
+// gateway or forwarder in between.
+function providerBaseUrl(provider) {
+  return String(
+    (provider.baseUrlEnv && process.env[provider.baseUrlEnv]?.trim()) ||
+      provider.baseUrl,
+  ).replace(/\/+$/, "");
+}
 const CATALOG_PATH =
   process.env.CODEX_ROUTER_CATALOG || process.env.KIMI_ROUTER_CATALOG || MERGED_CATALOG_PATH;
-const INTERNAL_KEY =
-  process.env.CODEX_ROUTER_INTERNAL_KEY || process.env.KIMI_INTERNAL_KEY;
 const CALLER_KEY = process.env.CODEX_ROUTER_CALLER_KEY;
 const QUIET =
   process.env.CODEX_ROUTER_QUIET === "1" || process.env.KIMI_PROXY_QUIET === "1";
@@ -138,7 +114,6 @@ let lastUsedModel;
 let lastUsedSessionName;
 let errorStatusUntil = 0;
 
-if (!INTERNAL_KEY) throw new Error("CODEX_ROUTER_INTERNAL_KEY is required.");
 assertCallerSecret(CALLER_KEY);
 
 function pruneStaleActivity(now = Date.now()) {
@@ -333,9 +308,9 @@ function nativeHeaders(request) {
   return headers;
 }
 
-function routedHeaders() {
+function routedHeaders(credential) {
   return {
-    Authorization: `Bearer ${INTERNAL_KEY}`,
+    Authorization: `Bearer ${credential.value}`,
     "Content-Type": "application/json",
     "Accept-Encoding": "identity",
     "User-Agent": `codex-router/${VERSION}`,
@@ -391,49 +366,14 @@ function catalogModels() {
   }
 }
 
-// Shared across every /health request so a polling companion collapses into
-// one probe per service per window instead of three per poll.
-const healthCache = createHealthCache();
-
-function serviceHealth(url) {
-  return healthCache(url, () => probeService(url));
-}
-
-async function probeService(url) {
-  try {
-    const response = await fetch(url, {
-      headers: { Authorization: `Bearer ${INTERNAL_KEY}` },
-      signal: AbortSignal.timeout(3_000),
-    });
-    const raw = await response.json().catch(() => undefined);
-    const payload = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
-    return { ...payload, reachable: response.ok };
-  } catch {
-    return { reachable: false };
-  }
-}
-
+// Lite: no sidecar services remain, so health is the router process itself.
 async function healthPayload() {
-  const enabled = new Set(readProviderSelection());
-  const apiEnabled = [...PROVIDERS.values()].some(
-    (provider) => enabled.has(provider.id) && provider.kind === "openai-compatible",
-  );
-  const [oauth, api, gateway] = await Promise.all([
-    enabled.has("kimi-oauth")
-      ? serviceHealth(OAUTH_HEALTH)
-      : { reachable: true, enabled: false },
-    apiEnabled ? serviceHealth(API_HEALTH) : { reachable: true, enabled: false },
-    serviceHealth(GATEWAY_HEALTH),
-  ]);
   return {
-    ok: oauth.reachable && api.reachable && gateway.reachable,
+    ok: true,
     service: "codex-router",
     version: VERSION,
     router: "ready",
     activity: activityPayload(),
-    oauth,
-    api,
-    gateway,
   };
 }
 
@@ -760,167 +700,8 @@ async function normalizeRoutedAgentInput(request, input, signal) {
   return output;
 }
 
-// Which bill a bridged read lands on. A registry engine names its own provider;
-// a native engine spends the signed-in ChatGPT plan, which the tray already
-// calls `openai`; a local engine spends nothing but electricity.
-function visionEngineProvider(engine) {
-  if (engine.native) return "openai";
-  if (engine.local) return "local";
-  return engine.provider || "unknown";
-}
-
-// The cache only stops a *finished* read from being bought twice. Codex sends
-// concurrent requests, and one turn can carry the same image more than once, so
-// two reads of one screenshot were routinely in flight together -- both missing
-// the cache because neither had returned yet, and the engine charged twice for
-// one transcript. Seen in production: two overlapping reads of a single pasted
-// image, three seconds apart. Waiters share the first read's outcome, failure
-// included, because retrying an image the engine just refused buys the same
-// refusal again.
-const visionReadsInFlight = new Map();
-
-// Codex resends the whole conversation every turn, so the same screenshot
-// arrives again on every follow-up. Without the hash cache a five-turn
-// conversation about one image would buy the same transcript five times.
-async function visionEvidenceFor(url, engine, request, effort, question = "") {
-  // A native engine is spent on the caller's own ChatGPT session, so it can
-  // only be reached with the headers this very request arrived with. The router
-  // never stores those.
-  const nativeCall = request
-    ? { baseUrl: NATIVE_BASE, headers: nativeHeaders(request) }
-    : undefined;
-  // For a native engine the account is part of the identity of a transcript
-  // too. That call is authorized by the caller's live session, and a cache hit
-  // skips the call along with every re-check that this session may still spend
-  // this model. Landing on an entry takes the identical image bytes, so this is
-  // an entitlement boundary rather than a confidentiality one -- but it is
-  // still a boundary. Gateway and local engines keep the key they had: neither
-  // is scoped to a caller.
-  const account = engine.native ? nativeAccountKey(nativeCall?.headers) : "";
-  // The effort is part of the identity of a transcript: raising it and pasting
-  // the same screenshot again must re-read it, not replay the cheaper pass.
-  // The question is part of that identity too -- the same screenshot read for
-  // "what is the total?" and for "which rows are overdue?" are different
-  // readings -- but the evidence cache keys on the question itself, so folding
-  // it into this string as well would only key it twice.
-  const key = `${engine.slug}\u0000${effort || "default"}\u0000${account}\u0000${url}`;
-  const cached = evidenceCache.get(key, question);
-  // A cache hit buys nothing, so it records nothing: the events file is a
-  // record of spend, not of calls the router avoided.
-  if (cached !== undefined) return cached;
-  const readKey = `${key} ${question}`;
-  const running = visionReadsInFlight.get(readKey);
-  if (running) return running;
-  // Deliberately not tied to the caller's AbortSignal. The read is shared, so
-  // one client's cancellation would abort a read another live request is
-  // waiting on and cost it an image it could have had. `describeImage` bounds
-  // itself with its own timeout, and an abandoned read still fills the cache
-  // for the retry that usually follows.
-  const read = readVisionEvidence({ url, engine, nativeCall, effort, question, key });
-  visionReadsInFlight.set(readKey, read);
-  try {
-    return await read;
-  } finally {
-    visionReadsInFlight.delete(readKey);
-  }
-}
-
-// A bridged read is a request the operator never asked for by name, billed to
-// whichever engine won the ranking. It rides the same usage-events pipeline
-// every routed turn uses, so `usage-events.jsonl` and `control probe` show
-// that a vision call happened, against which model, and whether it worked --
-// otherwise the very first read on an install that enabled nothing would
-// leave no trace at all. Token counts are not available here (`describeImage`
-// returns the transcript, not the envelope), so the event carries what it
-// honestly has.
-async function readVisionEvidence({ url, engine, nativeCall, effort, question, key }) {
-  const startedAt = Date.now();
-  let status = 0;
-  try {
-    const text = await describeImage({
-      engine,
-      imageUrl: url,
-      gatewayBase: GATEWAY_BASE,
-      headers: routedHeaders(),
-      nativeCall,
-      effort,
-      question,
-    });
-    status = 200;
-    return evidenceCache.set(key, question, text);
-  } finally {
-    recordUsageEvent({
-      model: engine.slug,
-      provider: visionEngineProvider(engine),
-      status,
-      durationMs: Date.now() - startedAt,
-    });
-  }
-}
-
-// Text-only models get their images read by a vision-capable model the
-// operator already enabled. Turns without images cost nothing here, and a
-// model that reads images itself is never touched.
-async function bridgeVisionInput(input, route, request) {
-  if (!inputHasImage(input)) return input;
-  if (supportsImageInput(route)) return input;
-  if (route.visionBridge === false) {
-    return stripImages(input, `${route.displayName || route.slug} cannot read images`).input;
-  }
-  const settings = readVisionBridgeSettings();
-  // Nothing below is evaluated unless `resolveVisionEngine` is actually going to
-  // rank candidates, which it is not when the bridge is off and not when the
-  // engine is pinned to `local`. Both of those used to pay for this list anyway:
-  // `selectedConfiguredListedModels()` probes every provider's credential
-  // synchronously, spawning `/usr/bin/security` once per provider per keychain
-  // service on macOS, and this runs inside the request handler -- so a bridge
-  // that was switched off still stalled the event loop for ~250ms on every
-  // pasted image, for every other in-flight request as well.
-  //
-  // The set itself is unchanged. It is still exactly the selected, credentialed,
-  // listed models, plus native candidates that need two things at once, neither
-  // sufficient alone. The shared helper (`src/vision-engines.mjs`) applies the
-  // same auth gate the catalog build and the tray apply -- this path used to
-  // read the capture off disk with no gate at all. But every on-disk artifact is
-  // reused across a failed probe by design, so a sign-out leaves them naming an
-  // engine nothing can call. The caller's live session is the evidence that
-  // cannot be stale, so it has to hold too: without one there is no native
-  // engine to nominate, and a pin naming one stops resolving on the very next
-  // paste rather than at the next catalog rebuild.
-  const engine = resolveVisionEngine(
-    () => [
-      ...selectedConfiguredListedModels(),
-      ...(request && hasNativeSession(nativeHeaders(request))
-        ? installedNativeVisionEngines({ hidden: readHiddenModels() })
-        : []),
-    ],
-    settings,
-  );
-  if (!engine) {
-    // The catalog only advertises image input while an engine resolves, so
-    // this is the race where one went away mid-conversation, or a client that
-    // attached an image regardless.
-    return stripImages(
-      input,
-      "the router's vision bridge is off or has no enabled vision model to read it with",
-    ).input;
-  }
-  const engineName = engine.displayName || engine.slug;
-  const { effort } = settings;
-  const result = await substituteImages(input, async (url, _ordinal, question) => ({
-    text: await visionEvidenceFor(url, engine, request, effort, question),
-    engineName,
-  }));
-  // Never gated on QUIET, for the same reason the retry line is not: a
-  // production LaunchAgent hard-sets `CODEX_ROUTER_QUIET=1`, and this is the
-  // one line that says the router spent an engine's quota on a paste nobody
-  // named. Silent automatic spending is the failure mode; the log carries a
-  // model, an engine, and counts -- never a transcript.
-  console.error(
-    `[codex-router] vision-bridge model=${route.slug} engine=${engine.slug} ` +
-      `images=${result.images} described=${result.described} failed=${result.failed}`,
-  );
-  return result.input;
+async function bridgeVisionInput(input, _route, _request) {
+  return input;
 }
 
 // OpenAI-issued reasoning `encrypted_content` is an opaque token (Fernet-style,
@@ -1090,7 +871,7 @@ async function summarize(request, payload, route, signal) {
   );
   const body = {
     ...payload,
-    model: route.gatewayModel,
+    model: route.upstreamModel,
     stream: false,
     // An empty tool list already disables tool use on every forwarder, and
     // xAI rejects tool_choice "none" paired with it, so the field is omitted
@@ -1100,9 +881,22 @@ async function summarize(request, payload, route, signal) {
   };
   delete body.previous_response_id;
   delete body.client_metadata;
-  const upstream = await fetch(`${GATEWAY_BASE}/responses`, {
+  const provider = providerForModel(route);
+  const credential = resolveProviderCredential(provider);
+  if (!credential) {
+    return {
+      ok: false,
+      status: 409,
+      payload: {
+        error: {
+          message: `Provider ${provider.id} has no credential. Run ./bin/provider-key ${provider.id} set.`,
+        },
+      },
+    };
+  }
+  const upstream = await fetch(`${providerBaseUrl(provider)}/responses`, {
     method: "POST",
-    headers: routedHeaders(),
+    headers: routedHeaders(credential),
     body: JSON.stringify(body),
     signal,
   });
@@ -1333,7 +1127,7 @@ async function handleResponses(request, response, requestUrl) {
       }
       const routed = {
         ...payload,
-        model: route.gatewayModel,
+        model: route.upstreamModel,
         // The stored call history must use the same tool names as the tool
         // list, or the model copies the bare names out of its own transcript.
         input: collaborationFlattened ? flattenCollaborationHistory(input) : input,
@@ -1341,17 +1135,23 @@ async function handleResponses(request, response, requestUrl) {
       // Native OpenAI traffic keeps client_metadata; routed providers do not
       // consume it and the strict ones reject the unknown field.
       delete routed.client_metadata;
-      // Codex sends reasoning as an object. LiteLLM's Ollama path tests that
-      // value for membership of a string set, which raises on a dict and fails
-      // the whole turn -- 210 of them here before this was caught. Ollama has
-      // no reasoning-effort concept to map it onto anyway, so drop it rather
-      // than translate it into something the model never asked for.
       if (provider?.keyless) {
         delete routed.reasoning;
         delete routed.reasoning_effort;
       }
-      target = `${GATEWAY_BASE}/responses`;
-      headers = routedHeaders();
+      const credential = resolveProviderCredential(provider);
+      if (!credential) {
+        writeJson(response, 409, {
+          error: {
+            type: "provider_not_configured",
+            provider: provider.id,
+            message: `Provider ${provider.id} has no credential. Run ./bin/provider-key ${provider.id} set.`,
+          },
+        });
+        return;
+      }
+      target = `${providerBaseUrl(provider)}/responses`;
+      headers = routedHeaders(credential);
       routedBody = Buffer.from(JSON.stringify(routed), "utf8");
     } else {
       const native = { ...payload };
@@ -1382,10 +1182,7 @@ async function handleResponses(request, response, requestUrl) {
         signal: controller.signal,
       },
       {
-        // Routed traffic terminates at the local gateway, which has its own
-        // error translation and Retry-After handling below; leave it exactly
-        // as it was.
-        retries: route ? 0 : undefined,
+        retries: undefined,
         canRetry: () => nothingRelayed(response),
         onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
       },

@@ -2,7 +2,6 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 
 import { SOURCE_ROOT } from "./paths.mjs";
-import { readUserModels } from "./user-models.mjs";
 
 export const REGISTRY_PATH =
   process.env.MODEL_ROUTER_REGISTRY ||
@@ -393,48 +392,10 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   return undefined;
 }
 
-// User-curated models extend the checked-in registry. A broken entry (or a
-// collision after an upstream update ships the same model) must never take
-// the whole router down, so problems skip the entry and surface as warnings.
-function mergeUserModels(base) {
-  const warnings = [];
-  const models = [...base.models];
-  const slugs = new Set(models.map((model) => model.slug));
-  const gatewayModels = new Set(models.map((model) => model.gatewayModel));
-  const userModels = new Set();
-  for (const model of readUserModels()) {
-    const problem = modelProblem(model, base.providers, slugs, gatewayModels);
-    if (problem) {
-      warnings.push(`Skipped user model: ${problem}`);
-      continue;
-    }
-    slugs.add(model.slug);
-    gatewayModels.add(model.gatewayModel);
-    const frozen = Object.freeze(model);
-    userModels.add(frozen);
-    models.push(frozen);
-  }
-  // Upgrade targets may point at models merged later in the overlay, so they
-  // resolve only after the whole set settles.
-  const modelBySlug = new Map(models.map((model) => [model.slug, model]));
-  const kept = models.filter((model) => {
-    if (!userModels.has(model)) return true;
-    const problem = upgradeTargetProblem(model, modelBySlug);
-    if (problem) {
-      warnings.push(`Skipped user model: ${problem}`);
-      return false;
-    }
-    return true;
-  });
-  return { models: Object.freeze(kept), warnings: Object.freeze(warnings) };
-}
-
 const registry = loadRegistry();
-const merged = mergeUserModels(registry);
 
 export const PROVIDERS = registry.providers;
-export const MODELS = merged.models;
-export const USER_MODEL_WARNINGS = merged.warnings;
+export const MODELS = registry.models;
 export const LISTED_MODELS = Object.freeze(MODELS.filter((model) => model.listed));
 export const API_MODELS = Object.freeze(
   MODELS.filter((model) => PROVIDERS.get(model.provider)?.kind === "openai-compatible"),

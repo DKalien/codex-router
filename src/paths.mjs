@@ -2,7 +2,6 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { trayBundleDir } from "./tray-install.mjs";
 
 const supportedTargets = new Set(["codex"]);
 
@@ -37,8 +36,6 @@ export const NATIVE_CATALOG_PATH = path.join(STATE_DIR, "native-models.json");
 export const MERGED_CATALOG_PATH = path.join(STATE_DIR, "merged-models.json");
 export const NATIVE_ALIAS_PATH = path.join(STATE_DIR, "native-aliases.json");
 export const ANNOUNCED_MODELS_PATH = path.join(STATE_DIR, "announced-models.json");
-export const LITELLM_CONFIG_PATH = path.join(STATE_DIR, "litellm.yaml");
-export const INTERNAL_SECRET_PATH = path.join(STATE_DIR, "internal-secret");
 export const CALLER_SECRET_PATH = path.join(STATE_DIR, "caller-secret");
 export const CODEX_PROVIDER_MODE_PATH = path.join(STATE_DIR, "codex-provider-mode.json");
 export const PROVIDER_SELECTION_PATH = path.join(STATE_DIR, "enabled-providers.json");
@@ -59,24 +56,6 @@ export const LAUNCH_AGENTS_DIR =
   process.env.CODEX_ROUTER_LAUNCH_AGENTS_DIR ||
   path.join(os.homedir(), "Library", "LaunchAgents");
 export const LAUNCH_AGENT_PATH = path.join(LAUNCH_AGENTS_DIR, `${SERVICE_LABEL}.plist`);
-// The tray runs under its own agent rather than a login item: launchd is the
-// only thing that brings it back when it exits, and a login item only fires at
-// login. Both are registered by the installer so the companion is supervised
-// from the moment it is set up.
-export const TRAY_SERVICE_LABEL = `${SERVICE_LABEL}.tray`;
-export const TRAY_LAUNCH_AGENT_PATH = path.join(
-  LAUNCH_AGENTS_DIR,
-  `${TRAY_SERVICE_LABEL}.plist`,
-);
-// One companion per user, not one per checkout. Building into the repository
-// gave every clone its own bundle and left launchd pointing at whichever one
-// installed last; ~/Applications is also a LaunchServices location, so the app
-// resolves by name and can be found and quit like any other. This constant and
-// scripts/build-macos-tray-app.sh's default must name the same directory.
-export const TRAY_APP_PATH =
-  trayBundleDir("darwin", os.homedir()) ?? path.join(os.homedir(), "Applications", "Model Router.app");
-export const LEGACY_TRAY_APP_PATH = path.join(SOURCE_ROOT, "dist", "Model Router.app");
-export const TRAY_APP_BINARY = path.join(TRAY_APP_PATH, "Contents", "MacOS", "ModelRouterTray");
 
 function port(name, fallback) {
   const value = Number(process.env[name] || fallback);
@@ -86,26 +65,12 @@ function port(name, fallback) {
   return value;
 }
 
-// gateway/oauth/router/api are the original four; grokOauth is a fifth
-// forwarder port for the Grok OAuth provider.
+// Lite: the router is the only listening process.
 export const PORTS = {
-  gateway: port(
-    "MODEL_ROUTER_GATEWAY_PORT",
-    process.env.CODEX_ROUTER_GATEWAY_PORT || process.env.KIMI_GATEWAY_PORT || 4100,
-  ),
-  oauth: port(
-    "MODEL_ROUTER_OAUTH_PORT",
-    process.env.CODEX_ROUTER_OAUTH_PORT || process.env.KIMI_OAUTH_FORWARD_PORT || 4101,
-  ),
   router: port(
     "MODEL_ROUTER_PORT",
     process.env.CODEX_ROUTER_PORT || process.env.KIMI_ROUTER_PORT || 4102,
   ),
-  api: port(
-    "MODEL_ROUTER_API_PORT",
-    process.env.CODEX_ROUTER_API_PORT || process.env.KIMI_API_FORWARD_PORT || 4103,
-  ),
-  grokOauth: port("MODEL_ROUTER_GROK_OAUTH_PORT", 4108),
 };
 
 export function loopback(portNumber, suffix = "") {

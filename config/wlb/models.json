@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "slug": "wlb-relay/gpt-5.6-sol",
+      "gatewayModel": "wlb-relay-gpt-5-6-sol",
+      "upstreamModel": "gpt-5.6-sol",
+      "provider": "wlb-relay",
+      "listed": true,
+      "displayName": "GPT 5.6 Sol (WLB)",
+      "description": "GPT 5.6 Sol via WLB relay.",
+      "priority": 2,
+      "defaultEffort": "medium",
+      "reasoningLevels": [
+        {
+          "effort": "low",
+          "description": "Fast reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced reasoning"
+        },
+        {
+          "effort": "high",
+          "description": "Deep reasoning"
+        }
+      ],
+      "contextWindow": 262144,
+      "inputModalities": [
+        "text"
+      ],
+      "autoCompact": 220000,
+      "compHash": "gpt-5.6-sol-v1"
+    }
+  ]
+}

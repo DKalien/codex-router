@@ -48,17 +48,11 @@ function unit() {
     MODEL_ROUTER_TARGET: TARGET,
     MODEL_ROUTER_STATE_DIR: STATE_DIR,
     MODEL_ROUTER_QUIET: "1",
-    MODEL_ROUTER_GATEWAY_PORT: String(PORTS.gateway),
-    MODEL_ROUTER_OAUTH_PORT: String(PORTS.oauth),
     MODEL_ROUTER_PORT: String(PORTS.router),
-    MODEL_ROUTER_API_PORT: String(PORTS.api),
     CODEX_HOME,
     CODEX_ROUTER_STATE_DIR: STATE_DIR,
     CODEX_ROUTER_QUIET: "1",
-    CODEX_ROUTER_GATEWAY_PORT: String(PORTS.gateway),
-    CODEX_ROUTER_OAUTH_PORT: String(PORTS.oauth),
     CODEX_ROUTER_PORT: String(PORTS.router),
-    CODEX_ROUTER_API_PORT: String(PORTS.api),
     ...(process.env.KIMI_CODE_HOME ? { KIMI_CODE_HOME: process.env.KIMI_CODE_HOME } : {}),
   };
   return `[Unit]

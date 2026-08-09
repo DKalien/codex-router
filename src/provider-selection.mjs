@@ -13,8 +13,6 @@ import { protectPrivateFile } from "./file-security.mjs";
 import { PROVIDER_SELECTION_PATH, STATE_DIR, TARGET } from "./paths.mjs";
 import { LISTED_MODELS, PROVIDERS } from "./model-registry.mjs";
 import { targetCli } from "./target-integration.mjs";
-import { kimiOAuthStatus } from "./oauth-status.mjs";
-import { grokOAuthStatus } from "./grok-oauth-status.mjs";
 import { credentialStatus } from "./provider-credentials.mjs";
 
 const RETIRED_PROVIDER_ALIASES = new Map([["chatgpt-oauth", "grok-oauth"]]);
@@ -81,13 +79,7 @@ function filterKnownProviderIds(values) {
 export function configuredProviderIds() {
   const configured = [];
   for (const provider of PROVIDERS.values()) {
-    if (provider.kind === "oauth") {
-      if (provider.id === "kimi-oauth" && kimiOAuthStatus().configured) {
-        configured.push(provider.id);
-      } else if (provider.id === "grok-oauth" && grokOAuthStatus().configured) {
-        configured.push(provider.id);
-      }
-    } else if (provider.keyless) {
+    if (provider.keyless) {
       // Nothing to configure: the endpoint is on this machine. Whether it is
       // actually running is a health question, reported by doctor, not a
       // reason to hide the provider.

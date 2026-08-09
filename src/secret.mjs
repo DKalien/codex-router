@@ -11,11 +11,7 @@ import {
 } from "node:fs";
 
 import { protectPrivateFile } from "./file-security.mjs";
-import {
-  CALLER_SECRET_PATH,
-  INTERNAL_SECRET_PATH,
-  STATE_DIR,
-} from "./paths.mjs";
+import { CALLER_SECRET_PATH, STATE_DIR } from "./paths.mjs";
 
 const command = process.argv[2] || "status";
 const generatedSecretPattern = /^[A-Za-z0-9_-]{32,}$/;
@@ -63,18 +59,15 @@ function status(target) {
 if (command === "ensure") {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   chmodSync(STATE_DIR, 0o700);
-  ensureSecret(INTERNAL_SECRET_PATH);
   ensureSecret(CALLER_SECRET_PATH);
 }
 
-const internal = status(INTERNAL_SECRET_PATH);
 const caller = status(CALLER_SECRET_PATH);
 process.stdout.write(
   `${JSON.stringify({
-    present: internal.present && caller.present,
-    mode: internal.mode,
-    internal,
+    present: caller.present,
+    mode: caller.mode,
     caller,
   })}\n`,
 );
-if (!internal.present || !caller.present) process.exitCode = 1;
+if (!caller.present) process.exitCode = 1;

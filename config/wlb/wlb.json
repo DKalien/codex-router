@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "providers": [
+    {
+      "id": "wlb-relay",
+      "displayName": "WLB Relay",
+      "kind": "openai-compatible",
+      "ownedBy": "wlbclub",
+      "baseUrl": "https://codex.wlbclub.com",
+      "baseUrlEnv": "WLB_BASE_URL",
+      "credential": {
+        "environment": [
+          "WLB_API_KEY"
+        ],
+        "file": "wlb-api-key.secret",
+        "keychainServices": [
+          "codex-router-wlb"
+        ],
+        "prompt": "WLB Relay API key"
+      },
+      "protocol": "openai-responses"
+    }
+  ]
+}

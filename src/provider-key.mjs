@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { closeSync, openSync, readSync, writeSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync, rmSync, writeSync } from "node:fs";
 
 import {
   apiProvider,
@@ -7,12 +7,10 @@ import {
   primaryCredentialPath,
   writeProviderCredential,
 } from "./provider-credentials.mjs";
-import { providerNeedsCuration, removeApiCredential } from "./provider-onboarding.mjs";
-import { enableProvider } from "./provider-selection.mjs";
+import { disableProvider, enableProvider } from "./provider-selection.mjs";
 import { secretEntryFeedback, secretEntryProblem } from "./secret-entry.mjs";
 import {
   refreshTargetPickerIfInstalled,
-  targetCli,
   targetPickerName,
 } from "./target-integration.mjs";
 
@@ -240,14 +238,17 @@ if (command === "status") {
       refreshed ? ` Fully quit and reopen ${targetPickerName()} to refresh the model picker.` : ""
     }\n`,
   );
-  if (providerNeedsCuration(provider.id)) {
-    process.stdout.write(
-      `${provider.displayName} ships no preselected models. Run \`${targetCli(`curate-models ${provider.id}`)}\` ` +
-        `in an interactive terminal to choose which of its models appear in the picker.\n`,
-    );
-  }
 } else {
-  const removal = removeApiCredential(provider.id);
+  const target = primaryCredentialPath(provider);
+  const removedFiles = target && existsSync(target) ? 1 : 0;
+  if (removedFiles) rmSync(target, { force: true });
+  disableProvider(provider.id);
+  const remaining = credentialStatus(provider);
+  const removal = {
+    removedFiles,
+    stillConfigured: remaining.configured,
+    remainingSource: remaining.source,
+  };
   const refreshed = removal.removedFiles ? refreshTargetPickerIfInstalled() : false;
   process.stdout.write(
     removal.removedFiles

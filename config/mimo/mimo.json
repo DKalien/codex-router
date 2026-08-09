@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "providers": [
+    {
+      "id": "mimo-token-plan",
+      "displayName": "MiMo Token Plan",
+      "kind": "openai-compatible",
+      "ownedBy": "xiaomi",
+      "baseUrl": "https://token-plan-cn.xiaomimimo.com/v1",
+      "baseUrlEnv": "MIMO_BASE_URL",
+      "credential": {
+        "environment": [
+          "MIMO_API_KEY"
+        ],
+        "file": "mimo-api-key.secret",
+        "keychainServices": [
+          "codex-router-mimo"
+        ],
+        "prompt": "MiMo Token Plan API key"
+      },
+      "protocol": "openai-responses"
+    }
+  ]
+}

@@ -36,9 +36,8 @@ function vbsEscape(value) {
   return String(value).replaceAll('"', '""');
 }
 
-function wrapper() {
-  const start = path.join(SOURCE_ROOT, "src", "start.mjs");
-  const variables = {
+function serviceEnvironment() {
+  return {
     MODEL_ROUTER_TARGET: TARGET,
     MODEL_ROUTER_STATE_DIR: STATE_DIR,
     MODEL_ROUTER_QUIET: "1",
@@ -49,7 +48,11 @@ function wrapper() {
     CODEX_ROUTER_PORT: String(PORTS.router),
     ...(process.env.KIMI_CODE_HOME ? { KIMI_CODE_HOME: process.env.KIMI_CODE_HOME } : {}),
   };
-  return `@echo off\r\n${Object.entries(variables)
+}
+
+function wrapper() {
+  const start = path.join(SOURCE_ROOT, "src", "start.mjs");
+  return `@echo off\r\n${Object.entries(serviceEnvironment())
     .map(([key, value]) => `set "${key}=${cmdEscape(value)}"`)
     .join("\r\n")}\r\n"${cmdEscape(process.execPath)}" "${cmdEscape(start)}" >> "${cmdEscape(LOG_PATH)}" 2>&1\r\n`;
 }
@@ -69,14 +72,23 @@ function launcher() {
   // hand-edited state directory can never break out of the string literal.
   // Chr(34) supplies the quotes cmd.exe needs around the wrapper path, which
   // keeps this generated source free of stacked quote-doubling.
+  const start = path.join(SOURCE_ROOT, "src", "start.mjs");
   return [
     "Option Explicit",
     "",
-    "Dim quote, shell, status",
+    "Dim quote, shell, env, status",
     "quote = Chr(34)",
     'Set shell = CreateObject("WScript.Shell")',
+    'Set env = shell.Environment("PROCESS")',
+    ...Object.entries(serviceEnvironment()).map(
+      ([key, value]) => `env("${key}") = "${vbsEscape(value)}"`,
+    ),
     "On Error Resume Next",
-    `status = shell.Run("cmd.exe /D /C " & quote & quote & "${vbsEscape(wrapperPath)}" & quote & quote, 0, True)`,
+    // The scheduled task runs node.exe directly instead of the .cmd wrapper:
+    // cmd.exe parses its command line as Unicode, but parses batch FILES in
+    // the system ANSI code page, and a non-ASCII install location made the
+    // .cmd fail with a "path not found" error.
+    `status = shell.Run("cmd.exe /D /C " & quote & quote & "${vbsEscape(process.execPath)}" & quote & " " & quote & "${vbsEscape(start)}" & quote & " >> " & quote & "${vbsEscape(LOG_PATH)}" & quote & " 2>&1" & quote, 0, True)`,
     "If Err.Number <> 0 Then",
     "  WScript.Quit 1",
     "End If",

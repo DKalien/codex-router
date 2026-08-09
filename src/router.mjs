@@ -1428,7 +1428,18 @@ async function handleRequest(request, response) {
   });
 }
 
+// Verbose per-request log for diagnosing client behavior; off by default.
+const REQUEST_LOG = process.env.CODEX_ROUTER_REQUEST_LOG === "1";
+
 const server = http.createServer((request, response) => {
+  const startedAt = Date.now();
+  if (REQUEST_LOG) {
+    response.on("finish", () => {
+      console.error(
+        `[req] ${request.method} ${request.url} -> ${response.statusCode} ${Date.now() - startedAt}ms`,
+      );
+    });
+  }
   handleRequest(request, response).catch((error) => {
     const status = httpErrorStatus(error);
     // The bare string this used to log made every mid-stream failure
@@ -1456,6 +1467,7 @@ const server = http.createServer((request, response) => {
 });
 
 server.on("upgrade", (_request, socket) => {
+  if (REQUEST_LOG) console.error(`[req] WS upgrade ${_request.url}`);
   socket.on("error", () => {});
   socket.end(
     "HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",

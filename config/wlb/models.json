@@ -7,7 +7,8 @@
       "upstreamModel": "gpt-5.6-sol",
       "provider": "wlb-relay",
       "listed": true,
-      "displayName": "gpt-5.6-sol"
+      "displayName": "GPT-5.6-Sol (WLB)",
+      "priority": 110
     }
   ]
 }

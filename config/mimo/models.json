@@ -9,21 +9,32 @@
       "listed": true,
       "displayName": "mimo-v2.5-pro",
       "description": "MiMo-v2.5-Pro: Trillion-parameter Flagship Agent Foundation",
-      "priority": 0,
+      "priority": 101,
       "defaultEffort": "high",
       "reasoningLevels": [
-        { "effort": "none", "description": "Disable Thinking" },
-        { "effort": "high", "description": "Enabled Thinking" }
+        {
+          "effort": "none",
+          "description": "Disable Thinking"
+        },
+        {
+          "effort": "high",
+          "description": "Enabled Thinking"
+        }
       ],
       "baseInstructions": "You are MiMo, an AI assistant developed by Xiaomi. Today's date: {date} {week}. Your knowledge cutoff date is December 2024.",
       "supportsReasoningSummaries": true,
       "defaultReasoningSummary": "none",
       "supportVerbosity": false,
-      "truncationPolicy": { "mode": "bytes", "limit": 10000 },
+      "truncationPolicy": {
+        "mode": "bytes",
+        "limit": 10000
+      },
       "supportsParallelToolCalls": false,
       "contextWindow": 1048576,
       "autoCompact": 996147,
-      "inputModalities": ["text"],
+      "inputModalities": [
+        "text"
+      ],
       "compHash": "mimo-v2.5-pro-v1"
     },
     {
@@ -34,22 +45,34 @@
       "listed": true,
       "displayName": "mimo-v2.5",
       "description": "MiMo-V2.5: Native Omni-modal Perception Model",
-      "priority": 1,
+      "priority": 100,
       "defaultEffort": "high",
       "reasoningLevels": [
-        { "effort": "none", "description": "Disable Thinking" },
-        { "effort": "high", "description": "Enabled Thinking" }
+        {
+          "effort": "none",
+          "description": "Disable Thinking"
+        },
+        {
+          "effort": "high",
+          "description": "Enabled Thinking"
+        }
       ],
       "baseInstructions": "You are MiMo, an AI assistant developed by Xiaomi. Today's date: {date} {week}. Your knowledge cutoff date is December 2024.",
       "supportsReasoningSummaries": true,
       "defaultReasoningSummary": "none",
       "supportVerbosity": false,
-      "truncationPolicy": { "mode": "bytes", "limit": 10000 },
+      "truncationPolicy": {
+        "mode": "bytes",
+        "limit": 10000
+      },
       "supportsParallelToolCalls": false,
       "supportsImageDetailOriginal": true,
       "contextWindow": 1048576,
       "autoCompact": 996147,
-      "inputModalities": ["text", "image"],
+      "inputModalities": [
+        "text",
+        "image"
+      ],
       "compHash": "mimo-v2.5-v1"
     }
   ]

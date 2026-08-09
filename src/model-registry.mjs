@@ -315,7 +315,7 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   }
   if (
     model.defaultReasoningSummary !== undefined &&
-    !["auto", "concise", "detailed"].includes(model.defaultReasoningSummary)
+    !["auto", "concise", "detailed", "none"].includes(model.defaultReasoningSummary)
   ) {
     return `model ${model.slug} has an invalid defaultReasoningSummary`;
   }
@@ -347,36 +347,75 @@ function modelProblem(model, providers, slugs, gatewayModels) {
     return `duplicate gateway model ${model.gatewayModel}`;
   }
   if (model.listed) {
-    for (const field of ["displayName", "description", "defaultEffort", "compHash"]) {
-      if (typeof model[field] !== "string" || !model[field]) {
-        return `listed model ${model.slug} is missing ${field}`;
+    // Listed fields are optional: catalog.mjs falls back to the native
+    // template for anything absent, so a relayed GPT needs no metadata copy.
+    // Present fields are still validated.
+    for (const field of [
+      "displayName",
+      "description",
+      "defaultEffort",
+      "compHash",
+      "baseInstructions",
+    ]) {
+      if (model[field] !== undefined && (typeof model[field] !== "string" || !model[field])) {
+        return `listed model ${model.slug} has an invalid ${field}`;
       }
     }
-    if (!Array.isArray(model.reasoningLevels) || model.reasoningLevels.length === 0) {
-      return `listed model ${model.slug} requires reasoningLevels`;
-    }
-    if (!Number.isInteger(model.contextWindow) || model.contextWindow < 1) {
-      return `listed model ${model.slug} requires contextWindow`;
-    }
-    if (!Number.isInteger(model.priority)) {
-      return `listed model ${model.slug} requires an integer priority`;
+    if (model.truncationPolicy !== undefined) {
+      const policy = model.truncationPolicy;
+      if (
+        !policy ||
+        typeof policy !== "object" ||
+        Array.isArray(policy) ||
+        typeof policy.mode !== "string" ||
+        !Number.isInteger(policy.limit)
+      ) {
+        return `listed model ${model.slug} has an invalid truncationPolicy`;
+      }
     }
     if (
-      !Number.isInteger(model.autoCompact) ||
-      model.autoCompact < 1 ||
-      model.autoCompact > model.contextWindow
+      model.supportsParallelToolCalls !== undefined &&
+      typeof model.supportsParallelToolCalls !== "boolean"
     ) {
-      return `listed model ${model.slug} requires a valid autoCompact limit`;
+      return `listed model ${model.slug} has an invalid supportsParallelToolCalls`;
     }
     if (
-      !Array.isArray(model.inputModalities) ||
-      model.inputModalities.length === 0 ||
-      model.inputModalities.some((value) => !["text", "image"].includes(value))
+      model.supportVerbosity !== undefined &&
+      typeof model.supportVerbosity !== "boolean"
     ) {
-      return `listed model ${model.slug} requires supported inputModalities`;
+      return `listed model ${model.slug} has an invalid supportVerbosity`;
+    }
+    if (model.reasoningLevels !== undefined && !Array.isArray(model.reasoningLevels)) {
+      return `listed model ${model.slug} has invalid reasoningLevels`;
     }
     if (
-      model.reasoningLevels.some(
+      model.contextWindow !== undefined &&
+      (!Number.isInteger(model.contextWindow) || model.contextWindow < 1)
+    ) {
+      return `listed model ${model.slug} has an invalid contextWindow`;
+    }
+    if (model.priority !== undefined && !Number.isInteger(model.priority)) {
+      return `listed model ${model.slug} has an invalid priority`;
+    }
+    if (
+      model.autoCompact !== undefined &&
+      (!Number.isInteger(model.autoCompact) ||
+        model.autoCompact < 1 ||
+        (Number.isInteger(model.contextWindow) && model.autoCompact > model.contextWindow))
+    ) {
+      return `listed model ${model.slug} has an invalid autoCompact limit`;
+    }
+    if (
+      model.inputModalities !== undefined &&
+      (!Array.isArray(model.inputModalities) ||
+        model.inputModalities.length === 0 ||
+        model.inputModalities.some((value) => !["text", "image"].includes(value)))
+    ) {
+      return `listed model ${model.slug} has invalid inputModalities`;
+    }
+    if (
+      Array.isArray(model.reasoningLevels) &&
+      (model.reasoningLevels.some(
         (level) =>
           !level ||
           typeof level.effort !== "string" ||
@@ -384,7 +423,8 @@ function modelProblem(model, providers, slugs, gatewayModels) {
           typeof level.description !== "string" ||
           !level.description,
       ) ||
-      !model.reasoningLevels.some((level) => level.effort === model.defaultEffort)
+        (model.defaultEffort !== undefined &&
+          !model.reasoningLevels.some((level) => level.effort === model.defaultEffort)))
     ) {
       return `listed model ${model.slug} has invalid reasoningLevels`;
     }

@@ -219,22 +219,30 @@ function normalizeNativeModel(model) {
 }
 
 export function routedModel(template, model) {
+  // Registry fields are optional for listed models: anything absent falls
+  // back to the native template, which is how a relayed GPT (wlb-relay) can
+  // inherit the official metadata wholesale instead of maintaining a copy.
   const next = {
     ...template,
     slug: model.slug,
-    display_name: model.displayName,
-    description: model.description,
-    priority: model.priority,
+    display_name: model.displayName ?? template.display_name,
+    description: model.description ?? template.description,
+    priority: model.priority ?? template.priority,
     visibility: "list",
     supported_in_api: true,
-    default_reasoning_level: model.defaultEffort,
-    supported_reasoning_levels: model.reasoningLevels,
-    context_window: model.contextWindow,
-    max_context_window: model.contextWindow,
-    effective_context_window_percent: 95,
-    auto_compact_token_limit: model.autoCompact,
-    input_modalities: model.inputModalities,
-    comp_hash: model.compHash,
+    default_reasoning_level: model.defaultEffort ?? template.default_reasoning_level,
+    supported_reasoning_levels:
+      model.reasoningLevels ?? template.supported_reasoning_levels,
+    context_window: model.contextWindow ?? template.context_window,
+    max_context_window: model.contextWindow ?? template.max_context_window,
+    effective_context_window_percent:
+      template.effective_context_window_percent ?? 95,
+    auto_compact_token_limit: model.autoCompact ?? template.auto_compact_token_limit,
+    input_modalities: model.inputModalities ?? template.input_modalities,
+    comp_hash: model.compHash ?? template.comp_hash,
+    supports_parallel_tool_calls:
+      model.supportsParallelToolCalls ?? template.supports_parallel_tool_calls,
+    truncation_policy: model.truncationPolicy ?? template.truncation_policy,
     additional_speed_tiers: [],
     service_tiers: [],
     // Codex surfaces this once per slug (up to its own show cap) as the
@@ -253,13 +261,17 @@ export function routedModel(template, model) {
           migration_markdown: model.upgradeTo.markdown.trim(),
         }
       : null,
-    supports_reasoning_summaries: model.supportsReasoningSummaries === true,
+    supports_reasoning_summaries:
+      model.supportsReasoningSummaries ?? template.supports_reasoning_summaries ?? false,
     default_reasoning_summary:
-      model.supportsReasoningSummaries === true
-        ? model.defaultReasoningSummary || "auto"
+      (model.supportsReasoningSummaries ?? template.supports_reasoning_summaries)
+        ? model.defaultReasoningSummary ?? template.default_reasoning_summary ?? "auto"
         : "none",
-    support_verbosity: false,
-    default_verbosity: null,
+    support_verbosity: model.supportVerbosity ?? template.support_verbosity ?? false,
+    default_verbosity:
+      (model.supportVerbosity ?? template.support_verbosity)
+        ? template.default_verbosity ?? null
+        : null,
     // Capability toggles come from the registry entry, never from the native
     // template: an absent flag keeps the conservative default so a routed
     // model only advertises what its slug's gateway path actually verified.
@@ -279,7 +291,12 @@ export function routedModel(template, model) {
     // opt in after their tool and encrypted-payload relay paths are verified.
     multi_agent_version: model.multiAgentVersion || "v1",
   };
-  if (typeof next.base_instructions === "string") {
+  // An explicit baseInstructions wins verbatim (the MiMo docs ship their
+  // own identity block); otherwise the template's identity is rewritten to
+  // the model's display name as before.
+  if (typeof model.baseInstructions === "string" && model.baseInstructions.trim()) {
+    next.base_instructions = model.baseInstructions;
+  } else if (typeof next.base_instructions === "string") {
     next.base_instructions = rewriteIdentity(next.base_instructions, model);
   }
   if (next.model_messages) {

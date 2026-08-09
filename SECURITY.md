@@ -1,63 +1,51 @@
-# Security guide
+# 安全指南
 
-Codex Router Lite is a local Node service. It has one router process, forwards
-Responses API requests directly to the selected upstream, and does not include
-LiteLLM, a forwarder, Python, OAuth, or a tray application.
+Codex Router Lite 是一个本地 Node 服务。它只有一个路由器进程，将 Responses API
+请求直接转发给选定的上游，不包含 LiteLLM、转发器、Python、OAuth 或托盘应用。
 
-## Credentials
+## 凭据
 
-- The only routed providers are `mimo-token-plan` and `wlb-relay`. Set their
-  keys with `provider-key mimo-token-plan set` and
-  `provider-key wlb-relay set`.
-- By default, protected key files are
-  `~/.codex/codex-router/mimo-api-key.secret` and
-  `~/.codex/codex-router/wlb-api-key.secret`. `CODEX_ROUTER_STATE_DIR` or
-  `MODEL_ROUTER_STATE_DIR` may select another state directory.
-- Files are restricted to the current user (`600` on POSIX and a current-user
-  ACL on Windows). Environment variables are supported for a foreground run;
-  use the protected files for a background service.
-- Keys are read only to create the upstream `Authorization` header. They are
-  not written to the catalog, Codex config, or logs. Never commit or paste a
-  key, a full generated caller URL, or a live state-directory file.
-- Routed requests do not forward Codex's incoming account/authentication
-  headers. Native GPT requests use the allow-listed Codex headers needed by
-  the native backend.
+- 只路由 `mimo-token-plan` 和 `wlb-relay` 两个服务商。分别使用
+  `provider-key mimo-token-plan set` 和 `provider-key wlb-relay set` 设置密钥。
+- 受保护的密钥文件默认位于
+  `~/.codex/codex-router/mimo-api-key.secret` 和
+  `~/.codex/codex-router/wlb-api-key.secret`。可以通过
+  `CODEX_ROUTER_STATE_DIR` 或 `MODEL_ROUTER_STATE_DIR` 指定其他状态目录。
+- 文件权限仅授予当前用户（POSIX 使用 `600`，Windows 使用当前用户 ACL）。前台
+  运行可以使用环境变量；后台服务应使用受保护的密钥文件。
+- 密钥只用于创建上游 `Authorization` 请求头，不会写入模型目录、Codex 配置或
+  日志。绝不能提交或粘贴密钥、完整的 caller URL 或真实状态目录中的文件。
+- 路由请求不会向第三方服务商转发 Codex 传入的账户或身份验证请求头。原生 GPT
+  请求只使用原生后端所需的 Codex 白名单请求头。
 
-The state directory also contains `caller-secret`. It authenticates Codex's
-loopback URL and is separate from provider keys; treat it as sensitive.
-Processes running as the same operating-system user can generally read the
-user's Codex config and state, so this is not a same-user malware boundary.
+状态目录还包含 `caller-secret`，用于验证 Codex 访问本地回环地址的权限，与服务商
+密钥相互独立，也必须视为敏感信息。同一操作系统用户下运行的进程通常可以读取该用户
+的 Codex 配置和状态，因此这些措施不能防御同用户权限下的恶意程序。
 
-## Network and proxy boundary
+## 网络和代理边界
 
-The router binds to loopback by default (port `4102` unless configured). Do not
-change it to a public listener, tunnel it, or expose it on a shared network.
-The caller capability is checked before a model request is read or forwarded.
+路由器默认只监听回环地址（除非另行配置，端口为 `4102`）。不得改为公开监听地址、
+建立隧道或暴露到共享网络。读取或转发模型请求前，路由器会先验证 caller 凭据。
 
-The configured provider URLs use HTTPS and the router calls each provider's
-`/responses` endpoint directly. Keep normal TLS verification enabled and only
-trust a proxy you operate. `src/start.mjs` sets `NODE_USE_ENV_PROXY=1` and
-passes `HTTP_PROXY`/`HTTPS_PROXY`; the default proxy is
-`http://127.0.0.1:7897`, with loopback in `NO_PROXY`. A proxy can observe or
-modify traffic if it terminates TLS, so review proxy configuration and logs.
+配置中的服务商 URL 使用 HTTPS，路由器直接调用各服务商的 `/responses` 端点。
+应保持正常的 TLS 验证，并且只信任自己管理的代理。`src/start.mjs` 设置
+`NODE_USE_ENV_PROXY=1` 并传递 `HTTP_PROXY`/`HTTPS_PROXY`；代理默认是
+`http://127.0.0.1:7897`，`NO_PROXY` 则包含回环地址。如果代理终止 TLS，它可以
+观察或修改流量，因此应检查代理配置和日志。
 
-Request logging is off by default. `CODEX_ROUTER_REQUEST_LOG=1` records request
-method, URL, status, and duration for troubleshooting; redact the caller
-capability and any private paths before sharing logs. Router errors do not log
-request or response bodies or provider key values, but logs can still contain
-model names and paths.
+请求日志默认关闭。`CODEX_ROUTER_REQUEST_LOG=1` 会记录请求方法、URL、状态码和
+耗时，用于排查问题；分享日志前必须遮盖 caller 凭据和任何私有路径。路由器错误不会
+记录请求正文、响应正文或服务商密钥，但日志仍可能包含模型名称和路径。
 
-## Supported runtime and updates
+## 支持的运行环境和更新
 
-Use Node.js `>=22.19.0` as declared in `package.json` and keep the lockfile in
-sync. After changing a routed model, run `node src/catalog.mjs`, reload the
-router process, and restart Codex if its picker has not reloaded. Run the
-checked-in metadata and syntax checks before distributing a change.
+按照 `package.json` 的声明使用 Node.js `>=22.19.0`，并保持锁文件同步。修改路由
+模型后，运行 `node src/catalog.mjs`，重载路由器进程；如果模型选择器尚未刷新，再
+重启 Codex。分发变更前，必须运行仓库内的元数据和语法检查。
 
-## Reporting a vulnerability
+## 报告安全漏洞
 
-Use [GitHub Private Vulnerability Reporting](https://github.com/duolahypercho/codex-router/security/advisories/new).
-Include the router revision, operating system, Node.js version, and Codex CLI
-version, plus a minimal reproduction and redacted logs. Do not include API
-keys, caller URLs, credential files, prompts, response bodies, or unredacted
-state-directory contents in an issue.
+请使用 [GitHub 私密漏洞报告](https://github.com/duolahypercho/codex-router/security/advisories/new)。
+报告应包含路由器修订版本、操作系统、Node.js 版本和 Codex CLI 版本，以及最小复现
+步骤和已脱敏日志。不要在 issue 中提供 API 密钥、caller URL、凭据文件、提示词、
+响应正文或未经脱敏的状态目录内容。

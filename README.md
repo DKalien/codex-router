@@ -1,56 +1,54 @@
 # Codex Router Lite
 
-Fork of [duolahypercho/codex-router](https://github.com/duolahypercho/codex-router),
-stripped to one job: put native GPT and two Responses API providers into
-Codex's model picker and route their traffic locally.
+这是 [duolahypercho/codex-router](https://github.com/duolahypercho/codex-router)
+的精简分支，只做一件事：把原生 GPT 和两个兼容 Responses API 的第三方服务商加入
+Codex 的模型选择器，并在本地路由它们的请求。
 
-The merged catalog contains exactly eight entries:
+合并后的模型目录固定包含 8 个条目：
 
-- Native GPT-5.6 (ChatGPT login) — `gpt-5.6-sol`, `gpt-5.6-terra`,
+- 原生 GPT-5.6（ChatGPT 登录）— `gpt-5.6-sol`、`gpt-5.6-terra`、
   `gpt-5.6-luna`
-- **MiMo** — `mimo-token-plan/mimo-v2.5-pro`,
+- **MiMo** — `mimo-token-plan/mimo-v2.5-pro`、
   `mimo-token-plan/mimo-v2.5`
-- **WLB relay** — `wlb-relay/gpt-5.6-sol`, `wlb-relay/gpt-5.6-terra`,
+- **WLB 中继** — `wlb-relay/gpt-5.6-sol`、`wlb-relay/gpt-5.6-terra`、
   `wlb-relay/gpt-5.6-luna`
 
-Five entries are routed (the two MiMo entries and three WLB entries); the
-three native entries continue to use Codex's ChatGPT backend.
+其中 5 个带命名空间的条目由路由器转发（2 个 MiMo、3 个 WLB）；3 个原生条目
+继续使用 Codex 的 ChatGPT 后端。
 
-## What was removed from upstream
+## 从上游移除了什么
 
-Everything not needed for the two providers above: LiteLLM and other gateway or
-forwarder layers, Python, OAuth flows, provider presets, tray/desktop apps, and
-the self-updater. The service is Node-only: `src/start.mjs` supervises one
-`src/router.mjs` child, with no extra gateway or forwarder processes. The
-checked-in checks are `test/catalog-metadata.mjs` and `scripts-check.mjs`.
+已移除两个服务商不需要的全部组件：LiteLLM 及其他网关或转发层、Python、OAuth
+流程、服务商预设、托盘/桌面应用和自动更新器。服务仅依赖 Node：`src/start.mjs`
+监督一个 `src/router.mjs` 子进程，不再启动额外的网关或转发进程。仓库保留的检查
+脚本是 `test/catalog-metadata.mjs` 和 `scripts-check.mjs`。
 
-## Architecture
+## 架构
 
-Both providers speak the Responses API natively, so the chain is just
+两个第三方服务商都原生支持 Responses API，因此请求链路只有：
 
 ```
 Codex ──(config.toml: openai_base_url + model_catalog_json)──▶ router.mjs
-    ├─ native slug        → ChatGPT Codex backend (Codex auth passthrough)
-    ├─ mimo-token-plan/*  → MiMo Token Plan (MIMO_API_KEY injected)
-    └─ wlb-relay/*        → WLB Relay (WLB_API_KEY injected)
+    ├─ 原生 slug            → ChatGPT Codex 后端（透传 Codex 身份验证）
+    ├─ mimo-token-plan/*    → MiMo Token Plan（注入 MIMO_API_KEY）
+    └─ wlb-relay/*          → WLB Relay（注入 WLB_API_KEY）
 ```
 
-- **Catalog injection**: `src/catalog.mjs` captures Codex's native catalog,
-  emits only the three official GPT-5.6 native slugs, merges `config/`, and
-  writes `~/.codex/codex-router/merged-models.json`. The full native capture is
-  retained for exact WLB template lookup.
-- **Metadata**: each WLB entry clones the exact native entry named by its
-  `upstreamModel`, changing only the namespaced slug and WLB display name; a
-  missing native entry fails the build. MiMo entries use the explicit Xiaomi
-  field set in `src/catalog.mjs` and never inherit GPT metadata.
-- **Proxy**: upstream fetches honor `HTTPS_PROXY` (default
-  `http://127.0.0.1:7897`, the Clash mixed port) via
-  `NODE_USE_ENV_PROXY`. Clash's GEOIP rules keep domestic endpoints on DIRECT.
+- **注入模型目录**：`src/catalog.mjs` 捕获 Codex 原生模型目录，只输出 3 个官方
+  GPT-5.6 原生 slug，再与 `config/` 合并，并写入
+  `~/.codex/codex-router/merged-models.json`。完整的原生捕获仍保留，供 WLB 精确
+  查找模板。
+- **模型元数据**：每个 WLB 条目精确复制其 `upstreamModel` 指定的原生条目，只修改
+  带命名空间的 slug 和 WLB 显示名；找不到对应原生条目时构建会失败。MiMo 条目只
+  使用 `src/catalog.mjs` 中明确列出的 Xiaomi 字段，不继承 GPT 元数据。
+- **代理**：上游请求通过 `NODE_USE_ENV_PROXY` 使用 `HTTPS_PROXY`（默认
+  `http://127.0.0.1:7897`，即 Clash 混合端口）。Clash 的 GEOIP 规则会让国内
+  服务地址保持 DIRECT。
 
-## Install / daily use (Windows)
+## 安装与日常使用（Windows）
 
 ```powershell
-.\codex-router.ps1 install                    # deps + secrets + catalog + service
+.\codex-router.ps1 install                    # 安装依赖、密钥、目录和服务
 .\codex-router.ps1 provider-key mimo-token-plan set
 .\codex-router.ps1 provider-key wlb-relay set
 .\codex-router.ps1 enable
@@ -59,24 +57,23 @@ Codex ──(config.toml: openai_base_url + model_catalog_json)──▶ router.
 .\codex-router.ps1 uninstall
 ```
 
-POSIX: `bin/install`, `bin/provider-key`, `bin/enable`, `bin/disable`,
-`bin/uninstall`, `bin/start`.
+POSIX：`bin/install`、`bin/provider-key`、`bin/enable`、`bin/disable`、
+`bin/uninstall`、`bin/start`。
 
-State lives in `~/.codex/codex-router/` (catalog, secrets, logs).
-The service auto-starts at logon via a "Codex Router" scheduled task.
+状态保存在 `~/.codex/codex-router/`（模型目录、密钥和日志）。Windows 通过名为
+“Codex Router”的计划任务在登录时自动启动服务。
 
-## Maintenance
+## 维护
 
-- Official model updates: `node src/catalog.mjs` (auto re-captures when the
-  Codex CLI version changes), reload the router process, then restart Codex if
-  its picker still has the old catalog.
-- Adding/changing a routed model: edit `config/<provider>/models.json`, run
-  `node src/catalog.mjs`, reload the router (`node src/service.mjs restart`),
-  and restart Codex when the picker needs to reload.
-- Checks: `node test/catalog-metadata.mjs` and `node scripts-check.mjs`.
-- Request-level debugging: start with `CODEX_ROUTER_REQUEST_LOG=1`.
+- 更新官方模型：运行 `node src/catalog.mjs`（Codex CLI 版本变化时会自动重新
+  捕获），重载路由器进程；如果模型选择器仍显示旧目录，再重启 Codex。
+- 添加或修改路由模型：编辑 `config/<provider>/models.json`，运行
+  `node src/catalog.mjs`，再用 `node src/service.mjs restart` 重载路由器；模型
+  选择器需要重新载入时再重启 Codex。
+- 检查：`node test/catalog-metadata.mjs` 和 `node scripts-check.mjs`。
+- 请求级调试：使用 `CODEX_ROUTER_REQUEST_LOG=1` 启动。
 
-## Branches
+## 分支
 
-- `main` — untouched upstream snapshot
-- `lite` — this stripped version
+- `main` — 未修改的上游快照
+- `lite` — 当前精简版本

@@ -1,51 +1,47 @@
-# Codex Router Lite — agent instructions
+# Codex Router Lite — 代理说明
 
-This is a stripped personal fork. `main` is the untouched upstream snapshot;
-all work happens on `lite`.
+这是一个精简的个人分支。`main` 保持为未修改的上游快照；所有开发都在 `lite`
+分支进行。
 
-## Scope
+## 范围
 
-Only two third-party providers exist, both native Responses API, both reached
-by direct forwarding from `src/router.mjs` (no LiteLLM, no forwarders, no
-Python):
+只保留两个第三方服务商。它们都原生支持 Responses API，并由 `src/router.mjs`
+直接转发（没有 LiteLLM、转发器或 Python）：
 
 - `mimo-token-plan` — `config/mimo/` — `https://token-plan-cn.xiaomimimo.com/v1`
 - `wlb-relay` — `config/wlb/` — `https://codex.wlbclub.com`
 
-Do not reintroduce gateway/forwarder layers, provider presets, OAuth flows,
-the tray app, or the self-updater.
+不得重新引入网关/转发层、服务商预设、OAuth 流程、托盘应用或自动更新器。
 
-## Layout
+## 目录结构
 
-- `src/router.mjs` — the entire request path (native passthrough + direct
-  routed forwarding with per-provider credential injection)
-- `src/catalog.mjs` — builds `merged-models.json` from the native capture and
-  `config/`; emits only official GPT-5.6 native slugs, WLB clones exact native
-  upstream entries, while MiMo emits its explicit Xiaomi metadata
-- `src/model-registry.mjs` — loads and validates `config/**`; listed-model
-  fields are optional-but-validated
-- `src/start.mjs` — supervises the single router child and injects the proxy
-  environment (`NODE_USE_ENV_PROXY=1`, `HTTPS_PROXY` default
-  `http://127.0.0.1:7897`)
-- `codex-router.ps1` / `install.ps1` — Windows entry points; `bin/` — POSIX
+- `src/router.mjs` — 完整请求路径（原生请求透传，以及注入各服务商凭据后的直接
+  路由转发）
+- `src/catalog.mjs` — 根据原生捕获和 `config/` 构建 `merged-models.json`；只
+  输出官方 GPT-5.6 原生 slug，WLB 精确复制对应原生条目，MiMo 则输出明确指定的
+  Xiaomi 元数据
+- `src/model-registry.mjs` — 加载并验证 `config/**`；已列出模型的字段可选，但
+  提供时必须通过验证
+- `src/start.mjs` — 监督唯一的路由器子进程并注入代理环境（`NODE_USE_ENV_PROXY=1`，
+  `HTTPS_PROXY` 默认为 `http://127.0.0.1:7897`）
+- `codex-router.ps1` / `install.ps1` — Windows 入口；`bin/` — POSIX 入口
 
-## Rules
+## 规则
 
-- The merged catalog must contain exactly 8 models: native
-  `gpt-5.6-sol/terra/luna`, MiMo `mimo-v2.5-pro` and `mimo-v2.5`, and WLB
-  `gpt-5.6-sol/terra/luna`. Exactly 5 are routed under the two provider
-  namespaces.
-- Run `node --check` on every touched `src/*.mjs`; the whole tree must stay
-  import-clean (`grep -h 'from "./' src/*.mjs` vs existing files).
-- After changing `config/` or catalog code: run `node src/catalog.mjs` and
-  confirm all 8 catalog slugs and all 5 routed slugs still appear; reload the
-  router process and restart Codex if its picker has not reloaded.
-- Run `node test/catalog-metadata.mjs` and `node scripts-check.mjs` for catalog
-  or source changes.
-- Registry edits must keep slug namespacing (`<provider>/<model>`) and pass
-  the validator in `src/model-registry.mjs`.
-- Never log or commit credentials. Persistent provider keys belong in
-  `~/.codex/codex-router/*.secret` via `provider-key set` or
-  `writeProviderCredential`; transient environment keys must not be recorded.
-- Node's fetch ignores the Windows system proxy — anything spawning fetches
-  outside `start.mjs`'s environment must carry the proxy variables too.
+- 合并目录必须固定包含 8 个模型：原生 `gpt-5.6-sol/terra/luna`、MiMo
+  `mimo-v2.5-pro` 和 `mimo-v2.5`，以及 WLB `gpt-5.6-sol/terra/luna`。其中
+  5 个模型必须位于两个服务商的命名空间下并由路由器转发。
+- 每个改动过的 `src/*.mjs` 都必须运行 `node --check`；整个源码树的相对导入必须
+  保持完整（对照 `grep -h 'from "./' src/*.mjs` 与实际文件）。
+- 修改 `config/` 或模型目录代码后，运行 `node src/catalog.mjs`，确认 8 个模型
+  slug 和 5 个路由 slug 全部存在；重载路由器进程，如果模型选择器尚未刷新，再
+  重启 Codex。
+- 修改模型目录或源码后，运行 `node test/catalog-metadata.mjs` 和
+  `node scripts-check.mjs`。
+- 修改注册表时必须保留 slug 命名空间格式（`<provider>/<model>`），并通过
+  `src/model-registry.mjs` 的验证器。
+- 绝不能记录或提交凭据。持久化的服务商密钥只能通过 `provider-key set` 或
+  `writeProviderCredential` 写入 `~/.codex/codex-router/*.secret`；不得记录临时
+  环境变量中的密钥。
+- Node 的 `fetch` 不使用 Windows 系统代理；任何在 `src/start.mjs` 环境之外
+  发起 fetch 的进程也必须携带代理环境变量。

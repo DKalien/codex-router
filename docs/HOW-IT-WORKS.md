@@ -78,7 +78,8 @@ supports_search_tool
 ## 路由和凭据
 
 对于原生 slug，`src/router.mjs` 使用白名单 Codex 请求头将请求转发给原生 Codex
-后端。对于带命名空间的 slug，它会解析服务商，将模型名替换为 `upstreamModel`，
+后端；独立的 `/alpha/search` 搜索请求和图片请求也只会转发给原生后端。对于带命名
+空间的 slug，它会解析服务商，将模型名替换为 `upstreamModel`，
 读取对应密钥，再使用服务商的 `Authorization` 请求头直接发送
 `POST <provider base URL>/responses`。Codex 的账户和安装凭据不会发送给第三方
 服务商。数据流会直接透传；`/responses/compact` 使用相同的直连路径，并在需要时
@@ -100,6 +101,7 @@ supports_search_tool
 ```sh
 node src/catalog.mjs
 node test/catalog-metadata.mjs
+node --test test/router-fixes.mjs
 node scripts-check.mjs
 ```
 
@@ -112,9 +114,11 @@ node scripts-check.mjs
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/router.mjs` | caller 验证、模型分发、直接转发、数据流和压缩摘要 |
+| `src/router.mjs` | caller 验证、模型分发、原生搜索/图片、直接转发、数据流和压缩摘要 |
+| `src/response-usage.mjs` | 从 JSON 或 SSE 响应提取 Token 用量并保持响应透传 |
 | `src/catalog.mjs` | 捕获原生目录并生成 8 条目的合并目录 |
 | `src/model-registry.mjs` | 加载并验证服务商和模型 |
 | `src/start.mjs` | 监督一个路由器子进程并提供代理环境 |
 | `config/mimo/`、`config/wlb/` | 两个服务商的描述文件和模型片段 |
 | `test/catalog-metadata.mjs` | 检查 WLB 精确复制和 MiMo 字段集合 |
+| `test/router-fixes.mjs` | 检查原生 Web Search 转发和无类型 SSE 的 Token 统计 |

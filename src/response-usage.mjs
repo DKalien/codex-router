@@ -3,6 +3,10 @@ import { StringDecoder } from "node:string_decoder";
 
 const MAX_JSON_CAPTURE_BYTES = 8 * 1024 * 1024;
 
+// 当上游没有声明 content-type 时，只检查响应开头是否为 SSE 字段行。
+const SSE_FIELD_LINE = /^(?:event|data):/m;
+const SSE_SNIFF_BYTES = 512;
+
 // Bytes of forwarded request body per prompt token.
 //
 // The familiar rule is four characters per token, which is roughly where plain
@@ -140,13 +144,17 @@ export class ResponseUsageTransform extends Transform {
   // a malformed or non-UTF-8 byte can never be replaced on its way through.
   #pending = Buffer.alloc(0);
   #released = false;
+  #undeclared = false;
 
   // `estimatedInputTokens` arrives only on routed requests large enough that a
   // reported zero cannot be true. Without it this transform observes and
   // forwards the response byte for byte, exactly as it always did.
   constructor(contentType = "", { estimatedInputTokens } = {}) {
     super();
-    this.#eventStream = String(contentType).toLowerCase().includes("text/event-stream");
+    const declared = String(contentType).toLowerCase();
+    this.#eventStream = declared.includes("text/event-stream");
+    // 原生 Codex 后端可能发送 SSE 却省略 content-type；此时由首个 chunk 判定。
+    this.#undeclared = !this.#eventStream && !declared.includes("json");
     this.#estimate =
       Number.isInteger(estimatedInputTokens) && estimatedInputTokens > 0
         ? estimatedInputTokens
@@ -154,6 +162,12 @@ export class ResponseUsageTransform extends Transform {
   }
 
   _transform(chunk, _encoding, callback) {
+    if (this.#undeclared && chunk.length) {
+      this.#undeclared = false;
+      this.#eventStream = SSE_FIELD_LINE.test(
+        chunk.subarray(0, SSE_SNIFF_BYTES).toString("utf8"),
+      );
+    }
     if (this.#estimate === undefined) {
       this.#observeOnly(chunk);
       callback();

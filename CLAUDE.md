@@ -22,6 +22,8 @@
   Xiaomi 元数据
 - `src/model-registry.mjs` — 加载并验证 `config/**`；已列出模型的字段可选，但
   提供时必须通过验证
+- `src/response-usage.mjs` — 从 JSON/SSE 响应提取 Token 用量；上游省略
+  `content-type` 时也必须保持字节级透传和正确统计
 - `src/start.mjs` — 监督唯一的路由器子进程并注入代理环境（`NODE_USE_ENV_PROXY=1`，
   `HTTPS_PROXY` 默认为 `http://127.0.0.1:7897`）
 - `codex-router.ps1` / `install.ps1` — Windows 入口；`bin/` — POSIX 入口
@@ -38,6 +40,8 @@
   重启 Codex。
 - 修改模型目录或源码后，运行 `node test/catalog-metadata.mjs` 和
   `node scripts-check.mjs`。
+- 修改 `src/router.mjs` 或 `src/response-usage.mjs` 后，运行
+  `node --test test/router-fixes.mjs`。
 - 修改注册表时必须保留 slug 命名空间格式（`<provider>/<model>`），并通过
   `src/model-registry.mjs` 的验证器。
 - 绝不能记录或提交凭据。持久化的服务商密钥只能通过 `provider-key set` 或

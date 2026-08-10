@@ -21,7 +21,8 @@ Codex 的模型选择器，并在本地路由它们的请求。
 已移除两个服务商不需要的全部组件：LiteLLM 及其他网关或转发层、Python、OAuth
 流程、服务商预设、托盘/桌面应用和自动更新器。服务仅依赖 Node：`src/start.mjs`
 监督一个 `src/router.mjs` 子进程，不再启动额外的网关或转发进程。仓库保留的检查
-脚本是 `test/catalog-metadata.mjs` 和 `scripts-check.mjs`。
+脚本是 `test/catalog-metadata.mjs`、`test/router-fixes.mjs` 和
+`scripts-check.mjs`。
 
 ## 架构
 
@@ -29,7 +30,7 @@ Codex 的模型选择器，并在本地路由它们的请求。
 
 ```
 Codex ──(config.toml: openai_base_url + model_catalog_json)──▶ router.mjs
-    ├─ 原生 slug            → ChatGPT Codex 后端（透传 Codex 身份验证）
+    ├─ 原生 slug / 搜索 / 图片 → ChatGPT Codex 后端（透传 Codex 身份验证）
     ├─ mimo-token-plan/*    → MiMo Token Plan（注入 MIMO_API_KEY）
     └─ wlb-relay/*          → WLB Relay（注入 WLB_API_KEY）
 ```
@@ -41,6 +42,8 @@ Codex ──(config.toml: openai_base_url + model_catalog_json)──▶ router.
 - **模型元数据**：每个 WLB 条目精确复制其 `upstreamModel` 指定的原生条目，只修改
   带命名空间的 slug 和 WLB 显示名；找不到对应原生条目时构建会失败。MiMo 条目只
   使用 `src/catalog.mjs` 中明确列出的 Xiaomi 字段，不继承 GPT 元数据。
+- **原生辅助请求**：独立的 `/alpha/search` Web Search 和图片请求只转发给原生
+  Codex 后端；上游省略 `content-type` 时，路由器也能识别 SSE 并统计 Token。
 - **代理**：上游请求通过 `NODE_USE_ENV_PROXY` 使用 `HTTPS_PROXY`（默认
   `http://127.0.0.1:7897`，即 Clash 混合端口）。Clash 的 GEOIP 规则会让国内
   服务地址保持 DIRECT。
@@ -70,7 +73,8 @@ POSIX：`bin/install`、`bin/provider-key`、`bin/enable`、`bin/disable`、
 - 添加或修改路由模型：编辑 `config/<provider>/models.json`，运行
   `node src/catalog.mjs`，再用 `node src/service.mjs restart` 重载路由器；模型
   选择器需要重新载入时再重启 Codex。
-- 检查：`node test/catalog-metadata.mjs` 和 `node scripts-check.mjs`。
+- 检查：`node test/catalog-metadata.mjs`、`node --test test/router-fixes.mjs` 和
+  `node scripts-check.mjs`。
 - 请求级调试：使用 `CODEX_ROUTER_REQUEST_LOG=1` 启动。
 
 ## 分支

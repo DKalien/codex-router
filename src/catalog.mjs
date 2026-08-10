@@ -316,9 +316,15 @@ function writeAnnouncedAt(announcedAt) {
 }
 
 function sortCatalogModels(models) {
+  const group = (model) => {
+    const slug = String(model.slug);
+    if (!slug.includes("/")) return 0;
+    return slug.startsWith("mimo-token-plan/") ? 1 : 2;
+  };
   return [...models].sort((left, right) => {
+    const providerGroup = group(left) - group(right);
     const priority = Number(left.priority ?? 999) - Number(right.priority ?? 999);
-    return priority || String(left.slug).localeCompare(String(right.slug));
+    return providerGroup || priority || String(left.slug).localeCompare(String(right.slug));
   });
 }
 

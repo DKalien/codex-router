@@ -27,8 +27,8 @@ const expectedSlugs = [
 ];
 assert.equal(merged.length, expectedSlugs.length);
 assert.deepEqual(
-  merged.map((model) => model.slug).sort(),
-  expectedSlugs.sort(),
+  merged.map((model) => model.slug),
+  expectedSlugs,
 );
 const wlbModels = LISTED_MODELS.filter((item) => item.provider === "wlb-relay");
 assert.deepEqual(

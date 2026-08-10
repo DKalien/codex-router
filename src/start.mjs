@@ -1,5 +1,12 @@
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 
 import { assertCallerSecret } from "./caller-auth.mjs";
@@ -22,6 +29,38 @@ if (!existsSync(CALLER_SECRET_PATH)) {
 const callerKey = assertCallerSecret(
   readFileSync(CALLER_SECRET_PATH, "utf8").trim(),
 );
+
+const servicePidPath =
+  process.env.CODEX_ROUTER_SERVICE_PID_PATH ||
+  (process.platform === "win32" && process.env.CODEX_ROUTER_QUIET === "1"
+    ? path.join(STATE_DIR, "service.pid")
+    : "");
+
+function writeServicePid() {
+  if (!servicePidPath) return;
+  mkdirSync(path.dirname(servicePidPath), { recursive: true });
+  const value = `${process.pid}\n`;
+  const temporary = `${servicePidPath}.tmp.${process.pid}`;
+  try {
+    writeFileSync(temporary, value);
+    renameSync(temporary, servicePidPath);
+  } finally {
+    try {
+      if (existsSync(temporary)) unlinkSync(temporary);
+    } catch {
+      // A failed cleanup must not hide the original write error.
+    }
+  }
+  process.on("exit", () => {
+    try {
+      if (readFileSync(servicePidPath, "utf8") === value) unlinkSync(servicePidPath);
+    } catch {
+      // A replacement service owns a different PID, or the manager removed it.
+    }
+  });
+}
+
+writeServicePid();
 
 // Native GPT traffic is proxied to chatgpt.com, which is unreachable from
 // a direct connection here; Codex itself rides the system proxy, but Node's

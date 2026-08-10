@@ -21,8 +21,8 @@ Codex 的模型选择器，并在本地路由它们的请求。
 已移除两个服务商不需要的全部组件：LiteLLM 及其他网关或转发层、Python、OAuth
 流程、服务商预设、托盘/桌面应用和自动更新器。服务仅依赖 Node：`src/start.mjs`
 监督一个 `src/router.mjs` 子进程，不再启动额外的网关或转发进程。仓库保留的检查
-脚本是 `test/catalog-metadata.mjs`、`test/router-fixes.mjs` 和
-`scripts-check.mjs`。
+脚本是 `test/catalog-metadata.mjs`、`test/router-fixes.mjs`、
+`test/windows-service-process.mjs` 和 `scripts-check.mjs`。
 
 ## 架构
 
@@ -64,7 +64,9 @@ POSIX：`bin/install`、`bin/provider-key`、`bin/enable`、`bin/disable`、
 `bin/uninstall`、`bin/start`。
 
 状态保存在 `~/.codex/codex-router/`（模型目录、密钥和日志）。Windows 通过名为
-“Codex Router”的计划任务在登录时自动启动服务。
+“Codex Router”的计划任务在登录时自动启动服务。后台监督进程会登记
+`service.pid`；停止或重启时会校验 Node 路径和完整的 `src/start.mjs` 命令行后再
+结束该进程树，避免旧路由器继续占用 4102 端口。
 
 ## 维护
 
@@ -73,7 +75,8 @@ POSIX：`bin/install`、`bin/provider-key`、`bin/enable`、`bin/disable`、
 - 添加或修改路由模型：编辑 `config/<provider>/models.json`，运行
   `node src/catalog.mjs`，再用 `node src/service.mjs restart` 重载路由器；模型
   选择器需要重新载入时再重启 Codex。
-- 检查：`node test/catalog-metadata.mjs`、`node --test test/router-fixes.mjs` 和
+- 检查：`node test/catalog-metadata.mjs`、
+  `node --test test/router-fixes.mjs test/windows-service-process.mjs` 和
   `node scripts-check.mjs`。
 - 请求级调试：使用 `CODEX_ROUTER_REQUEST_LOG=1` 启动。
 

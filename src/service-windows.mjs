@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
+  readFileSync,
   renameSync,
   unlinkSync,
   writeFileSync,
@@ -20,9 +21,11 @@ import {
 const effectivePlatform = process.env.CODEX_ROUTER_SERVICE_PLATFORM || process.platform;
 const command = process.argv[2] || "status";
 const renderCommands = new Set(["render", "render-launcher", "render-task"]);
-const taskName = "Codex Router";
+const taskName = process.env.CODEX_ROUTER_TASK_NAME || "Codex Router";
 const wrapperPath = path.join(STATE_DIR, "start-codex-router.cmd");
 const launcherPath = path.join(STATE_DIR, "start-codex-router-hidden.vbs");
+const servicePidPath = path.join(STATE_DIR, "service.pid");
+const startPath = path.join(SOURCE_ROOT, "src", "start.mjs");
 
 if (effectivePlatform !== "win32" && !renderCommands.has(command)) {
   throw new Error("The Task Scheduler service manager runs on Windows only.");
@@ -46,15 +49,15 @@ function serviceEnvironment() {
     CODEX_ROUTER_STATE_DIR: STATE_DIR,
     CODEX_ROUTER_QUIET: "1",
     CODEX_ROUTER_PORT: String(PORTS.router),
+    CODEX_ROUTER_SERVICE_PID_PATH: servicePidPath,
     ...(process.env.KIMI_CODE_HOME ? { KIMI_CODE_HOME: process.env.KIMI_CODE_HOME } : {}),
   };
 }
 
 function wrapper() {
-  const start = path.join(SOURCE_ROOT, "src", "start.mjs");
   return `@echo off\r\n${Object.entries(serviceEnvironment())
     .map(([key, value]) => `set "${key}=${cmdEscape(value)}"`)
-    .join("\r\n")}\r\n"${cmdEscape(process.execPath)}" "${cmdEscape(start)}" >> "${cmdEscape(LOG_PATH)}" 2>&1\r\n`;
+    .join("\r\n")}\r\n"${cmdEscape(process.execPath)}" "${cmdEscape(startPath)}" >> "${cmdEscape(LOG_PATH)}" 2>&1\r\n`;
 }
 
 // The scheduled task launches this script through `wscript.exe //B //NoLogo`,
@@ -72,7 +75,6 @@ function launcher() {
   // hand-edited state directory can never break out of the string literal.
   // Chr(34) supplies the quotes cmd.exe needs around the wrapper path, which
   // keeps this generated source free of stacked quote-doubling.
-  const start = path.join(SOURCE_ROOT, "src", "start.mjs");
   return [
     "Option Explicit",
     "",
@@ -88,7 +90,7 @@ function launcher() {
     // cmd.exe parses its command line as Unicode, but parses batch FILES in
     // the system ANSI code page, and a non-ASCII install location made the
     // .cmd fail with a "path not found" error.
-    `status = shell.Run("cmd.exe /D /C " & quote & quote & "${vbsEscape(process.execPath)}" & quote & " " & quote & "${vbsEscape(start)}" & quote & " >> " & quote & "${vbsEscape(LOG_PATH)}" & quote & " 2>&1" & quote, 0, True)`,
+    `status = shell.Run("cmd.exe /D /C " & quote & quote & "${vbsEscape(process.execPath)}" & quote & " " & quote & "${vbsEscape(startPath)}" & quote & " >> " & quote & "${vbsEscape(LOG_PATH)}" & quote & " 2>&1" & quote, 0, True)`,
     "If Err.Number <> 0 Then",
     "  WScript.Quit 1",
     "End If",
@@ -211,15 +213,129 @@ function waitForTaskToStop() {
   }
 }
 
+function readServicePid() {
+  try {
+    const value = readFileSync(servicePidPath, "utf8").trim();
+    if (!/^\d+$/.test(value)) return undefined;
+    const pid = Number(value);
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function removeServicePid(pid) {
+  try {
+    if (readFileSync(servicePidPath, "utf8").trim() === String(pid)) {
+      unlinkSync(servicePidPath);
+    }
+  } catch {
+    // The process may already have removed its PID file while exiting.
+  }
+}
+
+function findServiceProcess(pid) {
+  const script = [
+    "try {",
+    "  $expectedExe = [IO.Path]::GetFullPath($env:CODEX_ROUTER_NODE_BIN)",
+    "  $expectedStart = [IO.Path]::GetFullPath($env:CODEX_ROUTER_START_SCRIPT)",
+    pid
+      ? "  $processes = @(Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $env:CODEX_ROUTER_SERVICE_PID) -ErrorAction Stop)"
+      : "  $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop)",
+    "  $matches = @($processes | Where-Object {",
+    "    try {",
+    "      $actualExe = [IO.Path]::GetFullPath($_.ExecutablePath)",
+    "      $command = (($_.CommandLine -replace '\\s+', ' ').Trim())",
+    "      $expectedCommands = @((\'\"{0}\" \"{1}\"\' -f $actualExe, $expectedStart), (\'{0} \"{1}\"\' -f $actualExe, $expectedStart), (\'\"{0}\" {1}\' -f $actualExe, $expectedStart), (\'{0} {1}\' -f $actualExe, $expectedStart))",
+    "      ($actualExe -ieq $expectedExe) -and ($expectedCommands -icontains $command)",
+    "    } catch { $false }",
+    "  })",
+    ...(!pid
+      ? [
+          "  $matches = @($matches | Where-Object {",
+          "    try {",
+          "      $parent = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $_.ParentProcessId) -ErrorAction Stop",
+          "      $scriptHost = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $parent.ParentProcessId) -ErrorAction Stop",
+          "      ($parent.Name -ieq 'cmd.exe') -and ($scriptHost.Name -ieq 'wscript.exe') -and ($scriptHost.CommandLine.IndexOf(('\"' + $env:CODEX_ROUTER_LAUNCHER_PATH + '\"'), [StringComparison]::OrdinalIgnoreCase) -ge 0)",
+          "    } catch { $false }",
+          "  })",
+        ]
+      : []),
+    "  if ($matches.Count -gt 1) { exit 6 }",
+    "  if ($matches.Count -eq 1) { [Console]::Out.Write($matches[0].ProcessId) }",
+    "} catch { exit 5 }",
+  ].join("; ");
+  let lastError;
+  for (const executable of ["powershell.exe", "pwsh.exe"]) {
+    try {
+      const output = execFileSync(
+        executable,
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CODEX_ROUTER_NODE_BIN: process.execPath,
+            CODEX_ROUTER_START_SCRIPT: startPath,
+            CODEX_ROUTER_LAUNCHER_PATH: launcherPath,
+            ...(pid ? { CODEX_ROUTER_SERVICE_PID: String(pid) } : {}),
+          },
+          stdio: ["ignore", "pipe", "ignore"],
+          timeout: TASK_STATE_TIMEOUT_MS,
+        },
+      ).trim();
+      return /^\d+$/.test(output) ? Number(output) : undefined;
+    } catch (error) {
+      if (error?.status === 6) {
+        throw new Error("Multiple Codex Router supervisors are running; stop them manually.");
+      }
+      lastError = error;
+    }
+  }
+  throw new Error("Unable to verify the Codex Router service process; refusing to terminate it.", {
+    cause: lastError,
+  });
+}
+
+function serviceProcessPid() {
+  const trackedPid = readServicePid();
+  if (trackedPid) {
+    const verifiedPid = findServiceProcess(trackedPid);
+    if (verifiedPid) return verifiedPid;
+    removeServicePid(trackedPid);
+  }
+  // Older launchers did not set a PID path. The exact wscript -> cmd -> start.mjs
+  // parent chain keeps this one-time fallback from selecting a foreground Node.
+  return findServiceProcess();
+}
+
+function stopServiceProcess(pid) {
+  if (!pid) return;
+  try {
+    execFileSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+  } catch (error) {
+    if (findServiceProcess(pid)) {
+      throw new Error(`Unable to terminate Codex Router service process ${pid}.`, {
+        cause: error,
+      });
+    }
+  }
+  removeServicePid(pid);
+}
+
 function endTask() {
+  const pid = serviceProcessPid();
+  let ended = false;
   try {
     schtasks(["/End", "/TN", taskName], { quiet: true });
+    ended = true;
   } catch {
-    // The task may not exist, or may not be running; either way there is no
-    // instance left to wait for.
-    return;
+    // A missing or already-idle task can still have an orphaned process tree.
   }
-  waitForTaskToStop();
+  if (ended) waitForTaskToStop();
+  stopServiceProcess(pid);
 }
 
 // Only a task that still exists can be started. `Register-ScheduledTask -Force`

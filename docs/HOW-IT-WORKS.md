@@ -33,6 +33,12 @@ sequenceDiagram
 `fetch` 提供代理环境。请求路径中没有网关、API 转发器、Python 进程、OAuth
 流程、托盘应用或更新器。
 
+Windows 后台服务由 `src/service-windows.mjs` 通过计划任务管理。后台启动的
+`src/start.mjs` 会将监督进程 PID 原子写入 `service.pid`；停止或重启时，服务管理器
+先核对 Node 可执行文件和完整的 `src/start.mjs` 命令行，再结束整个进程树。旧启动器
+没有 PID 文件时，只按精确的 `wscript -> cmd -> start.mjs` 父子链查找一次，避免误杀
+无关的 Node 进程，也避免旧路由器继续占用 4102 端口。
+
 ## 构建模型目录
 
 `src/model-registry.mjs` 从 `config/` 加载两个服务商描述文件及其模型片段，并验证
@@ -101,7 +107,7 @@ supports_search_tool
 ```sh
 node src/catalog.mjs
 node test/catalog-metadata.mjs
-node --test test/router-fixes.mjs
+node --test test/router-fixes.mjs test/windows-service-process.mjs
 node scripts-check.mjs
 ```
 
@@ -119,6 +125,8 @@ node scripts-check.mjs
 | `src/catalog.mjs` | 捕获原生目录并生成 8 条目的合并目录 |
 | `src/model-registry.mjs` | 加载并验证服务商和模型 |
 | `src/start.mjs` | 监督一个路由器子进程并提供代理环境 |
+| `src/service-windows.mjs` | 管理 Windows 计划任务并安全停止已验证的监督进程树 |
 | `config/mimo/`、`config/wlb/` | 两个服务商的描述文件和模型片段 |
 | `test/catalog-metadata.mjs` | 检查 WLB 精确复制和 MiMo 字段集合 |
 | `test/router-fixes.mjs` | 检查原生 Web Search 转发和无类型 SSE 的 Token 统计 |
+| `test/windows-service-process.mjs` | 检查 Windows PID 登记、进程树停止和误杀防护 |

@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased
+## Lite 分支（未发布）
+
+- Windows 后台监督进程现在原子登记 `service.pid`；停止和重启会校验进程所有权并
+  结束完整进程树，同时兼容没有 PID 文件的旧启动器，避免遗留进程占用 4102 端口。
+- 原生 Web Search 和图片请求继续转发到 Codex 后端；无 `content-type` 的 SSE 响应
+  仍可保持透传并正确统计 Token。
+- 合并模型目录按原生、MiMo、WLB 分组稳定排序，并为 Codex 模型选择器写入连续的
+  显示优先级。
+
+以下内容保留自完整上游版本的历史快照，其中包含 Lite 分支已经移除的网关、OAuth、
+托盘和自动更新等组件，不代表 Lite 分支的现役功能。现役合同以 `README.md` 和
+`docs/HOW-IT-WORKS.md` 为准。
+
+## 上游 Unreleased（历史快照）
 
 - **An image the model fetched for itself is read too.** The bridge walked user
   messages only, so a pasted screenshot was transcribed and the turn still

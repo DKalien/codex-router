@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 
-import { buildMergedCatalog } from "../src/catalog.mjs";
+import { buildMergedCatalog, withDisplayPriorities } from "../src/catalog.mjs";
 import { LISTED_MODELS } from "../src/model-registry.mjs";
 
 const nativeModels = ["sol", "terra", "luna"].map((name, index) => ({
@@ -29,6 +29,10 @@ assert.equal(merged.length, expectedSlugs.length);
 assert.deepEqual(
   merged.map((model) => model.slug),
   expectedSlugs,
+);
+assert.deepEqual(
+  withDisplayPriorities(merged).map((model) => model.priority),
+  expectedSlugs.map((_, index) => index),
 );
 const wlbModels = LISTED_MODELS.filter((item) => item.provider === "wlb-relay");
 assert.deepEqual(

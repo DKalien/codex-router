@@ -349,6 +349,10 @@ export function buildMergedCatalog(native, routedModelsList, { includeNative = t
   return sortCatalogModels(models.values());
 }
 
+export function withDisplayPriorities(models) {
+  return models.map((model, priority) => ({ ...model, priority }));
+}
+
 function main() {
   // The catalog is what Codex offers in its picker. Writing it from a checkout
   // that does not own this state directory is how the picker ends up
@@ -380,9 +384,11 @@ function main() {
   const openaiAuthenticated = auth.authenticated;
   // Native models join the catalog only when the auth probe says the session
   // can actually spend them; a signed-out session keeps only routed models.
-  const merged = buildMergedCatalog(native, routedModels, {
-    includeNative: openaiAuthenticated,
-  });
+  const merged = withDisplayPriorities(
+    buildMergedCatalog(native, routedModels, {
+      includeNative: openaiAuthenticated,
+    }),
+  );
   atomicJson(MERGED_CATALOG_PATH, { models: merged });
   writeAnnouncedAt(announcedAt);
   process.stdout.write(

@@ -5,7 +5,7 @@ if ($Target -ne "codex") {
   throw "MODEL_ROUTER_TARGET must be codex."
 }
 $Command = if ($args.Count) { [string]$args[0] } else { "" }
-$Arguments = if ($args.Count -gt 1) { @($args[1..($args.Count - 1)]) } else { @() }
+$Arguments = @($args | Select-Object -Skip 1)
 $Commands = @(
   "install", "provider-key", "enable", "disable", "uninstall", "start"
 )

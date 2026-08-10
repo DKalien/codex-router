@@ -1133,6 +1133,12 @@ async function handleResponses(request, response, requestUrl) {
         // list, or the model copies the bare names out of its own transcript.
         input: collaborationFlattened ? flattenCollaborationHistory(input) : input,
       };
+      // Codex adds hosted search from the built-in OpenAI provider capability,
+      // even when the selected MiMo catalog entry says search is unsupported.
+      // Xiaomi rejects the whole turn before the model runs if it sees this tool.
+      if (route.provider === "mimo-token-plan" && Array.isArray(routed.tools)) {
+        routed.tools = routed.tools.filter((tool) => tool?.type !== "web_search");
+      }
       // Native OpenAI traffic keeps client_metadata; routed providers do not
       // consume it and the strict ones reject the unknown field.
       delete routed.client_metadata;

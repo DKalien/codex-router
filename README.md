@@ -44,9 +44,9 @@ Codex ──(config.toml: openai_base_url + model_catalog_json)──▶ router.
   使用 `src/catalog.mjs` 中明确列出的 Xiaomi 字段，不继承 GPT 元数据。
 - **原生辅助请求**：独立的 `/alpha/search` Web Search 和图片请求只转发给原生
   Codex 后端；上游省略 `content-type` 时，路由器也能识别 SSE 并统计 Token。
-- **代理**：上游请求通过 `NODE_USE_ENV_PROXY` 使用 `HTTPS_PROXY`（默认
-  `http://127.0.0.1:7897`，即 Clash 混合端口）。Clash 的 GEOIP 规则会让国内
-  服务地址保持 DIRECT。
+- **代理**：原生上游请求通过 `NODE_USE_ENV_PROXY` 使用 `HTTPS_PROXY`（默认
+  `http://127.0.0.1:7897`，即 Clash 混合端口）；WLB 和 MiMo 域名默认加入
+  `NO_PROXY` 并保持 DIRECT。
 
 ## 安装与日常使用（Windows）
 

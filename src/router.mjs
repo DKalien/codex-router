@@ -48,6 +48,11 @@ import {
   flattenCollaborationHistory,
   flattenCollaborationNamespaceTools,
 } from "./collaboration-namespace.mjs";
+import {
+  MimoCustomToolCallTransform,
+  convertMimoRequestInput,
+  convertMimoRequestTools,
+} from "./mimo-custom-tools.mjs";
 import { activityMetadataFromHeaders } from "./codex-session-names.mjs";
 import { translateGatewayError } from "./error-translation.mjs";
 import { recordUsageEvent } from "./usage-events.mjs";
@@ -870,6 +875,8 @@ async function summarize(request, payload, route, signal) {
     route,
     request,
   );
+  const compactInput =
+    route.provider === "mimo-token-plan" ? convertMimoRequestInput(bridged) : bridged;
   const body = {
     ...payload,
     model: route.upstreamModel,
@@ -878,7 +885,7 @@ async function summarize(request, payload, route, signal) {
     // xAI rejects tool_choice "none" paired with it, so the field is omitted
     // rather than sent redundantly.
     tools: [],
-    input: [...bridged, messageItem(COMPACT_PROMPT)],
+    input: [...compactInput, messageItem(COMPACT_PROMPT)],
   };
   delete body.previous_response_id;
   delete body.client_metadata;
@@ -1111,6 +1118,7 @@ async function handleResponses(request, response, requestUrl) {
     let headers;
     let routedBody;
     let collaborationFlattened = false;
+    let mimoCustomToolNames;
     if (route) {
       const input = await bridgeVisionInput(
         await normalizeRoutedAgentInput(request, payload.input, controller.signal),
@@ -1133,6 +1141,12 @@ async function handleResponses(request, response, requestUrl) {
         // list, or the model copies the bare names out of its own transcript.
         input: collaborationFlattened ? flattenCollaborationHistory(input) : input,
       };
+      if (route.provider === "mimo-token-plan") {
+        const converted = convertMimoRequestTools(routed.tools);
+        routed.tools = converted.tools;
+        routed.input = convertMimoRequestInput(routed.input);
+        mimoCustomToolNames = converted.names;
+      }
       // Codex adds hosted search from the built-in OpenAI provider capability,
       // even when the selected MiMo catalog entry says search is unsupported.
       // Xiaomi rejects the whole turn before the model runs if it sees this tool.
@@ -1252,6 +1266,14 @@ async function handleResponses(request, response, requestUrl) {
     const transforms = [usageTransform];
     if (collaborationFlattened) {
       transforms.push(new CollaborationToolCallTransform());
+    }
+    if (mimoCustomToolNames?.size) {
+      transforms.push(
+        new MimoCustomToolCallTransform(
+          mimoCustomToolNames,
+          upstream.headers.get("content-type") || "",
+        ),
+      );
     }
     await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, transforms);
     const usage = usageTransform?.tokenUsage();

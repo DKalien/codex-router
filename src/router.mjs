@@ -13,12 +13,14 @@ import { promisify } from "node:util";
 import {
   assertCallerSecret,
   authenticatedRoute,
+  redactCallerUrl,
 } from "./caller-auth.mjs";
 import {
   endStreamedResponse,
   HOP_BY_HOP_HEADERS,
   httpErrorStatus,
   pipeResponse,
+  readResponseTextLimited,
   readRequestBody,
   writeJson,
 } from "./http-utils.mjs";
@@ -1221,7 +1223,7 @@ async function handleResponses(request, response, requestUrl) {
         upstream.status,
         translateGatewayError({
           status: upstream.status,
-          bodyText: await upstream.text(),
+          bodyText: await readResponseTextLimited(upstream),
           modelName: route.displayName || route.slug,
           providerName: provider?.ownedBy || provider?.displayName || route.provider,
           providerKind: provider?.kind,
@@ -1275,7 +1277,9 @@ async function handleResponses(request, response, requestUrl) {
         ),
       );
     }
-    await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, transforms);
+    await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, transforms, {
+      eventStream: payload.stream === true,
+    });
     const usage = usageTransform?.tokenUsage();
     const estimatedInputTokens = usageTransform?.substitutedInputTokens();
     // `retries` separates "it never failed" from "it failed and the router
@@ -1469,7 +1473,7 @@ const server = http.createServer((request, response) => {
   if (REQUEST_LOG) {
     response.on("finish", () => {
       console.error(
-        `[req] ${request.method} ${request.url} -> ${response.statusCode} ${Date.now() - startedAt}ms`,
+        `[req] ${request.method} ${redactCallerUrl(request.url)} -> ${response.statusCode} ${Date.now() - startedAt}ms`,
       );
     });
   }
@@ -1500,7 +1504,7 @@ const server = http.createServer((request, response) => {
 });
 
 server.on("upgrade", (_request, socket) => {
-  if (REQUEST_LOG) console.error(`[req] WS upgrade ${_request.url}`);
+  if (REQUEST_LOG) console.error(`[req] WS upgrade ${redactCallerUrl(_request.url)}`);
   socket.on("error", () => {});
   socket.end(
     "HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",

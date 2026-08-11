@@ -72,7 +72,9 @@ const command = process.argv[2] || "status";
 
 function configuredRouterBaseUrl() {
   if (!existsSync(CALLER_SECRET_PATH)) {
-    throw new Error("The local router caller key is missing; run ./bin/doctor --fix.");
+    throw new Error(
+      "The local router caller key is missing; run the status command, then reinstall to repair it.",
+    );
   }
   const secret = assertCallerSecret(readFileSync(CALLER_SECRET_PATH, "utf8").trim());
   return callerBaseUrl(PORTS.router, secret);

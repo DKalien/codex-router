@@ -14,7 +14,9 @@ export function validCallerSecret(value) {
 
 export function assertCallerSecret(value) {
   if (!validCallerSecret(value)) {
-    throw new Error("The local router caller key is missing or invalid; run ./bin/doctor --fix.");
+    throw new Error(
+      "The local router caller key is missing or invalid; run the status command, then reinstall to repair it.",
+    );
   }
   return value;
 }

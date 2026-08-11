@@ -8,7 +8,7 @@ usage() {
 Usage: model-router codex COMMAND [arguments]
 
 Commands:
-  install, provider-key, enable, disable, uninstall, start
+  install, provider-key, enable, disable, uninstall, start, status
 
   ./bin/model-router codex install
   ./bin/model-router codex provider-key mimo-token-plan set
@@ -30,10 +30,13 @@ case "$target" in
 esac
 
 case "$command" in
-  install|provider-key|enable|disable|uninstall|start) ;;
+  install|provider-key|enable|disable|uninstall|start|status) ;;
   *) echo "Unknown command: $command" >&2; usage >&2; exit 2 ;;
 esac
 
 MODEL_ROUTER_TARGET=$target
 export MODEL_ROUTER_TARGET
+if [ "$command" = status ]; then
+  exec node "$repo_dir/src/status.mjs" "$@"
+fi
 exec "$repo_dir/bin/$command" "$@"

@@ -1,4 +1,4 @@
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 import { secretEqual } from "./caller-auth.mjs";
@@ -26,6 +26,58 @@ export const HOP_BY_HOP_HEADERS = new Set([
   "transfer-encoding",
   "upgrade",
 ]);
+
+export const MAX_UPSTREAM_ERROR_BYTES = 64 * 1024;
+export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000;
+export const MIN_STREAM_IDLE_TIMEOUT_MS = 10;
+export const MAX_STREAM_IDLE_TIMEOUT_MS = 15 * 60_000;
+
+function boundedMilliseconds(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0
+    ? Math.min(MAX_STREAM_IDLE_TIMEOUT_MS, Math.max(MIN_STREAM_IDLE_TIMEOUT_MS, Math.floor(parsed)))
+    : fallback;
+}
+
+export function streamIdleTimeoutMs(value) {
+  if (value !== undefined) return boundedMilliseconds(value, DEFAULT_STREAM_IDLE_TIMEOUT_MS);
+  return boundedMilliseconds(
+    process.env.CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS ||
+      process.env.MODEL_ROUTER_STREAM_IDLE_TIMEOUT_MS,
+    DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+  );
+}
+
+export async function readResponseTextLimited(response, maxBytes = MAX_UPSTREAM_ERROR_BYTES) {
+  if (!response?.body) return "";
+  const limit = Math.max(1, Math.floor(maxBytes));
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (total < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = Buffer.from(value);
+      const remaining = limit - total;
+      const selected = chunk.byteLength > remaining ? chunk.subarray(0, remaining) : chunk;
+      chunks.push(selected);
+      total += selected.byteLength;
+      if (selected.byteLength < chunk.byteLength || total >= limit) {
+        try {
+          await reader.cancel("upstream error body limit reached");
+        } catch {
+          // The upstream may already have closed its body.
+        }
+        break;
+      }
+    }
+    return decoder.decode(Buffer.concat(chunks));
+  } finally {
+    reader.releaseLock();
+  }
+}
 
 export async function readRequestBody(request) {
   const chunks = [];
@@ -84,6 +136,38 @@ function finishResponse(response) {
   });
 }
 
+function idleTimeoutTransform(timeoutMs) {
+  let timer;
+  const guard = new Transform({
+    transform(chunk, _encoding, callback) {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        const error = new Error("Upstream response stream idle timeout.");
+        error.code = "ERR_ROUTER_STREAM_IDLE_TIMEOUT";
+        guard.destroy(error);
+      }, timeoutMs);
+      timer.unref?.();
+      callback(null, chunk);
+    },
+    flush(callback) {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      callback();
+    },
+  });
+  timer = setTimeout(() => {
+    const error = new Error("Upstream response stream idle timeout.");
+    error.code = "ERR_ROUTER_STREAM_IDLE_TIMEOUT";
+    guard.destroy(error);
+  }, timeoutMs);
+  timer.unref?.();
+  guard.once("close", () => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+  });
+  return guard;
+}
+
 // Terminate a response whose body is already streaming.
 //
 // `response.destroy()` resets the socket, so an in-flight chunked body loses
@@ -110,9 +194,9 @@ function finishResponse(response) {
 // silent corruption this function exists to avoid. Leading newlines are inert
 // when the stream did end cleanly: a blank line with no buffered fields
 // dispatches nothing.
-export function endStreamedResponse(response) {
+export function endStreamedResponse(response, forceEventStream = false) {
   if (!response || response.writableEnded || response.destroyed) return;
-  if (isEventStream(response)) {
+  if (forceEventStream || isEventStream(response)) {
     try {
       const data = {
         type: "error",
@@ -128,7 +212,7 @@ export function endStreamedResponse(response) {
   response.end();
 }
 
-export async function pipeResponse(upstream, response, denylist, transform) {
+export async function pipeResponse(upstream, response, denylist, transform, options = {}) {
   const transforms = transform === undefined
     ? []
     : Array.isArray(transform)
@@ -141,14 +225,34 @@ export async function pipeResponse(upstream, response, denylist, transform) {
     return;
   }
   const source = Readable.fromWeb(upstream.body);
+  const idleGuard = idleTimeoutTransform(streamIdleTimeoutMs(options.idleTimeoutMs));
   try {
     // `pipeline` forwards errors and destroys every stream in the chain, which
     // `.pipe()` does not: a mid-stream upstream failure used to leave the
     // response half-written and open forever. `end: false` keeps the response
     // itself out of that teardown so the caller can end the body cleanly (see
     // `endStreamedResponse`) instead of resetting the socket.
-    await pipeline(source, ...transforms, response, { end: false });
+    await pipeline(source, idleGuard, ...transforms, response, { end: false });
   } catch (error) {
+    if (error?.code === "ERR_ROUTER_STREAM_IDLE_TIMEOUT" && !response.destroyed) {
+      const eventStream = options.eventStream === true || isEventStream(response);
+      if (eventStream) {
+        if (!response.headersSent && !response.hasHeader("content-type")) {
+          response.setHeader("Content-Type", "text/event-stream");
+        }
+        if (!response.headersSent) response.flushHeaders?.();
+        endStreamedResponse(response, true);
+      } else if (!response.headersSent) {
+        writeJson(response, 504, {
+          error: {
+            type: "local_router_stream_failed",
+            message: "The upstream response stream stopped producing data.",
+          },
+        });
+      } else {
+        response.end();
+      }
+    }
     // A client that disconnects mid-stream destroys the response, which
     // pipeline reports as a premature close. That is not a router failure, and
     // pipeline has already torn the upstream read down, so the in-flight

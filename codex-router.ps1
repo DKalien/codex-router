@@ -7,7 +7,7 @@ if ($Target -ne "codex") {
 $Command = if ($args.Count) { [string]$args[0] } else { "" }
 $Arguments = @($args | Select-Object -Skip 1)
 $Commands = @(
-  "install", "provider-key", "enable", "disable", "uninstall", "start"
+  "install", "provider-key", "enable", "disable", "uninstall", "start", "status"
 )
 if ($Command -notin $Commands) {
   throw "Unknown command '$Command'. Choose: $($Commands -join ', ')."
@@ -32,6 +32,7 @@ switch ($Command) {
     Invoke-RouterNode "src\service.mjs" @("uninstall")
   }
   "start" { Invoke-RouterNode "src\start.mjs" $Arguments }
+  "status" { Invoke-RouterNode "src\status.mjs" $Arguments }
 }
 
 exit 0

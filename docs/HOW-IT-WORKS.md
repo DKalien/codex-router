@@ -91,6 +91,11 @@ supports_search_tool
 服务商。数据流会直接透传；`/responses/compact` 使用相同的直连路径，并在需要时
 生成由路由器管理的续接摘要。
 
+响应流连续 300 秒没有任何数据时，路由器会取消上游请求。SSE 会收到固定的
+terminal error；尚未开始的非 SSE 响应会返回 504。该空闲时限可通过
+`CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS` 在 10 毫秒至 15 分钟之间调整，收到每个
+chunk 后都会重新计时，因此不会限制持续输出请求的总时长。
+
 服务商密钥通常保存在受保护的状态目录中（默认为
 `~/.codex/codex-router/`）。`provider-key set` 会写入密钥并启用该服务商；环境
 变量密钥可供前台进程使用，但后台服务不会自动继承。
@@ -111,6 +116,10 @@ node --test test/router-fixes.mjs test/windows-service-process.mjs
 node scripts-check.mjs
 ```
 
+日常只读检查使用 `codex-router.ps1 status`（Windows）或
+`bin/model-router codex status`（POSIX）；它只读取本地健康端点、Codex 配置、固定
+8 模型目录、Provider 凭据状态、安装清单和后台服务，不会自动修复或请求上游。
+
 模型目录变化后必须重载路由器进程；已安装的服务可运行
 `node src/service.mjs restart`。如果 Codex 的模型选择器仍显示旧的
 `model_catalog_json`，请完全重启 Codex。Codex CLI 版本变化时会自动刷新原生
@@ -125,8 +134,9 @@ node scripts-check.mjs
 | `src/catalog.mjs` | 捕获原生目录并生成 8 条目的合并目录 |
 | `src/model-registry.mjs` | 加载并验证服务商和模型 |
 | `src/start.mjs` | 监督一个路由器子进程并提供代理环境 |
+| `src/status.mjs` | 只读汇总路由器、配置、目录、Provider、安装和服务状态 |
 | `src/service-windows.mjs` | 管理 Windows 计划任务并安全停止已验证的监督进程树 |
 | `config/mimo/`、`config/wlb/` | 两个服务商的描述文件和模型片段 |
 | `test/catalog-metadata.mjs` | 检查 WLB 精确复制和 MiMo 字段集合 |
-| `test/router-fixes.mjs` | 检查原生 Web Search 转发和无类型 SSE 的 Token 统计 |
+| `test/router-fixes.mjs` | 检查路由、统计、脱敏、有界错误和流式 idle timeout |
 | `test/windows-service-process.mjs` | 检查 Windows PID 登记、进程树停止和误杀防护 |

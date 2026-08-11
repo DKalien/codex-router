@@ -3,12 +3,16 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import http from "node:http";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { ResponseUsageTransform } from "../src/response-usage.mjs";
+import { readResponseTextLimited } from "../src/http-utils.mjs";
+import { sanitizeUpstreamText } from "../src/error-translation.mjs";
+import { statusIsReady } from "../src/status.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const callerKey = "test-router-caller-capability-with-sufficient-length";
@@ -28,6 +32,54 @@ async function unusedPort() {
   const port = await listen(server);
   await close(server);
   return port;
+}
+
+async function startRouter(overrides = {}) {
+  const routerPort = await unusedPort();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "codex-router-fixes-"));
+  const router = spawn(process.execPath, [path.join(root, "src", "router.mjs")], {
+    cwd: root,
+    env: {
+      ...process.env,
+      CODEX_HOME: stateDir,
+      MODEL_ROUTER_STATE_DIR: stateDir,
+      CODEX_ROUTER_CALLER_KEY: callerKey,
+      CODEX_ROUTER_PORT: String(routerPort),
+      CODEX_ROUTER_QUIET: "1",
+      NODE_USE_ENV_PROXY: "0",
+      NO_PROXY: "127.0.0.1,localhost",
+      MIMO_API_KEY: "test-mimo-key",
+      ...overrides,
+    },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let stderr = "";
+  const startup = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("router did not start")), 5_000);
+    router.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+      if (stderr.includes("[codex-router] listening")) {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+    router.once("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error(`router exited during startup (${code})`));
+    });
+  });
+  await startup;
+  return {
+    router,
+    routerPort,
+    stateDir,
+    stderr: () => stderr,
+    async close() {
+      router.kill("SIGTERM");
+      if (router.exitCode === null) await once(router, "exit");
+      rmSync(stateDir, { recursive: true, force: true });
+    },
+  };
 }
 
 test("无 content-type 的 SSE 仍能统计 Token 并原样透传", async () => {
@@ -455,5 +507,230 @@ test("MiMo 将 custom tool 历史桥接为 function 并还原流式调用", asyn
     if (router.exitCode === null) await once(router, "exit");
     await close(mimo);
     rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("上游错误读取达到上限后会取消余流", async () => {
+  let cancelReason;
+  const response = new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("x".repeat(128)));
+      },
+      cancel(reason) {
+        cancelReason = reason;
+      },
+    }),
+  );
+
+  const output = await readResponseTextLimited(response, 32);
+  assert.equal(Buffer.byteLength(output), 32);
+  assert.match(cancelReason, /limit reached/);
+});
+
+test("带空格的 quoted secret 脱敏后仍是合法 JSON", () => {
+  const sanitized = sanitizeUpstreamText(
+    JSON.stringify({ password: "abc 123", token: "xyz 789", error: "sk-abc123" }),
+  );
+  assert.deepEqual(JSON.parse(sanitized), {
+    password: "[REDACTED]",
+    token: "[REDACTED]",
+    error: "[REDACTED]",
+  });
+});
+
+test("status 只接受精确目录、配置和 provider 状态", () => {
+  const status = {
+    health: { ok: true },
+    config: { managed: true, catalogConfigured: true },
+    catalog: { readable: true, exact: true },
+    providers: { selection: {} },
+  };
+  assert.equal(statusIsReady(status, true), true);
+  assert.equal(statusIsReady({ ...status, catalog: { readable: true, exact: false } }, true), false);
+  assert.equal(
+    statusIsReady({ ...status, providers: { selection: { degraded: "invalid state" } } }, true),
+    false,
+  );
+  assert.equal(statusIsReady(status, false), false);
+});
+
+test("请求日志会脱敏 HTTP 与 WebSocket caller capability", async () => {
+  const router = await startRouter({ CODEX_ROUTER_REQUEST_LOG: "1" });
+  let socket;
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/models`,
+    );
+    assert.equal(response.status, 200);
+    await response.arrayBuffer();
+
+    socket = net.createConnection({ host: "127.0.0.1", port: router.routerPort });
+    await once(socket, "connect");
+    socket.write(
+      `GET /_codex-router/${callerKey}/v1/realtime HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n`,
+    );
+    socket.resume();
+    await once(socket, "close");
+    for (let attempt = 0; attempt < 20 && !router.stderr().includes("WS upgrade"); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    const logs = router.stderr();
+    assert.equal(logs.includes(callerKey), false);
+    assert.match(logs, /\[REDACTED\]/);
+    assert.match(logs, /WS upgrade .*\[REDACTED\]/);
+  } finally {
+    socket?.destroy();
+    await router.close();
+  }
+});
+
+test("上游巨型错误只读取有界内容并脱敏", async () => {
+  const secret = "super-secret-upstream-token";
+  const body = JSON.stringify({
+    error: {
+      message: `Bearer ${secret}; token=${secret}; insufficient_quota\u0001`,
+    },
+  }) + "x".repeat(200_000);
+  const upstream = http.createServer((_request, response) => {
+    response.writeHead(401, { "Content-Type": "application/json" });
+    response.end(body);
+  });
+  const upstreamPort = await listen(upstream);
+  const router = await startRouter({ MIMO_BASE_URL: `http://127.0.0.1:${upstreamPort}` });
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/responses`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "mimo-token-plan/mimo-v2.5-pro",
+          input: "test",
+          stream: false,
+        }),
+      },
+    );
+    const output = await response.text();
+    assert.equal(response.status, 401);
+    assert.match(output, /billing_error/);
+    assert.equal(output.includes(secret), false);
+    assert.equal(output.includes("x".repeat(1_000)), false);
+    assert.equal(output.includes("\u0001"), false);
+    assert.ok(output.length < 2_000);
+  } finally {
+    await router.close();
+    await close(upstream);
+  }
+});
+
+test("静默 SSE 在 idle timeout 后发送 terminal error", async () => {
+  const upstream = http.createServer((_request, response) => {
+    response.writeHead(200);
+    response.flushHeaders();
+  });
+  const upstreamPort = await listen(upstream);
+  const router = await startRouter({
+    MIMO_BASE_URL: `http://127.0.0.1:${upstreamPort}`,
+    CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS: "100",
+  });
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/responses`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "mimo-token-plan/mimo-v2.5-pro",
+          input: "test",
+          stream: true,
+        }),
+      },
+    );
+    const output = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type"), /text\/event-stream/);
+    assert.match(output, /local_router_stream_failed/);
+    assert.match(output, /event: error/);
+  } finally {
+    await router.close();
+    await close(upstream);
+  }
+});
+
+test("非 SSE 在首字节 idle timeout 后返回 504 JSON", async () => {
+  const upstream = http.createServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.flushHeaders();
+  });
+  const upstreamPort = await listen(upstream);
+  const router = await startRouter({
+    MIMO_BASE_URL: `http://127.0.0.1:${upstreamPort}`,
+    CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS: "100",
+  });
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/responses`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "mimo-token-plan/mimo-v2.5-pro",
+          input: "test",
+          stream: false,
+        }),
+      },
+    );
+    assert.equal(response.status, 504);
+    assert.deepEqual(await response.json(), {
+      error: {
+        type: "local_router_stream_failed",
+        message: "The upstream response stream stopped producing data.",
+      },
+    });
+  } finally {
+    await router.close();
+    await close(upstream);
+  }
+});
+
+test("持续 SSE chunk 会重置 idle timeout", async () => {
+  const upstream = http.createServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    let count = 0;
+    const timer = setInterval(() => {
+      response.write(`data: ${count++}\n\n`);
+      if (count === 5) {
+        clearInterval(timer);
+        response.end();
+      }
+    }, 75);
+  });
+  const upstreamPort = await listen(upstream);
+  const router = await startRouter({
+    MIMO_BASE_URL: `http://127.0.0.1:${upstreamPort}`,
+    CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS: "300",
+  });
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/responses`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "mimo-token-plan/mimo-v2.5-pro",
+          input: "test",
+          stream: true,
+        }),
+      },
+    );
+    const output = await response.text();
+    assert.equal(response.status, 200);
+    assert.match(output, /data: 0/);
+    assert.match(output, /data: 4/);
+    assert.equal(output.includes("local_router_stream_failed"), false);
+  } finally {
+    await router.close();
+    await close(upstream);
   }
 });

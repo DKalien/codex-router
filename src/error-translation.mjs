@@ -4,7 +4,37 @@
 // reads like a router bug. These helpers name the provider that actually
 // failed and keep only the innermost upstream message as detail.
 
+import { redactCallerUrl } from "./caller-auth.mjs";
+
 const DETAIL_LIMIT = 300;
+
+const SENSITIVE_NAME =
+  "(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|key|credential|caller(?:[_-]?key|[_-]?capability)?)";
+const SENSITIVE_DOUBLE_QUOTED_FIELD = new RegExp(
+  `((?:["']?\\b${SENSITIVE_NAME}\\b["']?)\\s*[:=]\\s*)"(?:\\\\.|[^"\\\\])*"`,
+  "gi",
+);
+const SENSITIVE_SINGLE_QUOTED_FIELD = new RegExp(
+  `((?:["']?\\b${SENSITIVE_NAME}\\b["']?)\\s*[:=]\\s*)'(?:\\\\.|[^'\\\\])*'`,
+  "gi",
+);
+const SENSITIVE_UNQUOTED_FIELD = new RegExp(
+  `((?:["']?\\b${SENSITIVE_NAME}\\b["']?)\\s*[:=]\\s*)(?!["']|\\[REDACTED\\])[^,\\s;&}\\]]+`,
+  "gi",
+);
+
+export function sanitizeUpstreamText(value) {
+  if (typeof value !== "string") return "";
+  return redactCallerUrl(value)
+    .replace(/Bearer\s+(?!\[REDACTED\])[^\s,;'"})\]]+/gi, "Bearer [REDACTED]")
+    .replace(/([?&](?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|key|credential|caller(?:[_-]?key|[_-]?capability))=)(?!\[REDACTED\])[^&#\s"']+/gi, "$1[REDACTED]")
+    .replace(SENSITIVE_DOUBLE_QUOTED_FIELD, '$1"[REDACTED]"')
+    .replace(SENSITIVE_SINGLE_QUOTED_FIELD, "$1'[REDACTED]'")
+    .replace(SENSITIVE_UNQUOTED_FIELD, "$1[REDACTED]")
+    .replace(/\bsk-[A-Za-z0-9_-]{6,}\b/g, "[REDACTED]")
+    .replace(/[\u0000-\u001F\u007F]/g, " ")
+    .trim();
+}
 
 // LiteLLM appends its routing state after the upstream message; neither line
 // helps the caller and both leak internal gateway naming.
@@ -27,21 +57,23 @@ const WRAPPER_PREFIXES = [
 // Google status) rides along for quota classification.
 function parseUpstreamError(bodyText) {
   if (typeof bodyText !== "string" || !bodyText) return { message: "", type: undefined };
+  const cleanedBody = bodyText.replace(/[\u0000-\u001F\u007F]/g, " ").trim();
   try {
-    const parsed = JSON.parse(bodyText);
+    const parsed = JSON.parse(cleanedBody);
     const error = parsed?.error;
-    const message =
+    const message = sanitizeUpstreamText(
       (typeof error === "string" && error) ||
       (typeof error?.message === "string" && error.message) ||
       (typeof parsed?.base_resp?.status_msg === "string" && parsed.base_resp.status_msg) ||
       (typeof parsed?.message === "string" && parsed.message) ||
       (typeof parsed?.detail === "string" && parsed.detail) ||
-      bodyText;
+      cleanedBody,
+    );
     const type = [error?.type, error?.status].find((value) => typeof value === "string");
     return { message, type };
   } catch {
     // Non-JSON bodies (HTML gateway pages, plain text) pass through as-is.
-    return { message: bodyText, type: undefined };
+    return { message: sanitizeUpstreamText(cleanedBody), type: undefined };
   }
 }
 

@@ -354,7 +354,7 @@ function taskExists() {
 function taskState() {
   const script =
     "try { [Console]::Out.Write((Get-ScheduledTask -TaskName $env:CODEX_ROUTER_TASK).State.ToString()) } catch { exit 1 }";
-  for (const executable of ["powershell.exe", "pwsh.exe"]) {
+  for (const executable of ["pwsh.exe", "powershell.exe"]) {
     try {
       return execFileSync(
         executable,

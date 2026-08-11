@@ -58,10 +58,13 @@ Codex ──(config.toml: openai_base_url + model_catalog_json)──▶ router.
 .\codex-router.ps1 start
 .\codex-router.ps1 disable
 .\codex-router.ps1 uninstall
+.\codex-router.ps1 status                       # 只读检查路由器、配置、目录和服务
 ```
 
 POSIX：`bin/install`、`bin/provider-key`、`bin/enable`、`bin/disable`、
-`bin/uninstall`、`bin/start`。
+`bin/uninstall`、`bin/start`。状态检查使用
+`bin/model-router codex status`。状态命令只读取本地健康端点和配置，不会自动修复
+或请求上游服务；返回码为 0 表示已就绪，1 表示需要处理，2 表示参数错误。
 
 状态保存在 `~/.codex/codex-router/`（模型目录、密钥和日志）。Windows 通过名为
 “Codex Router”的计划任务在登录时自动启动服务。后台监督进程会登记
@@ -79,6 +82,7 @@ POSIX：`bin/install`、`bin/provider-key`、`bin/enable`、`bin/disable`、
   `node --test test/router-fixes.mjs test/windows-service-process.mjs` 和
   `node scripts-check.mjs`。
 - 请求级调试：使用 `CODEX_ROUTER_REQUEST_LOG=1` 启动。
+- 流式响应默认允许 300 秒无数据；可用 `CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS` 调整（10 毫秒至 15 分钟）。
 
 ## 分支
 

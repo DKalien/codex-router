@@ -44,6 +44,9 @@ Codex ──(config.toml: openai_base_url + model_catalog_json)──▶ router.
   使用 `src/catalog.mjs` 中明确列出的 Xiaomi 字段，不继承 GPT 元数据。
 - **原生辅助请求**：独立的 `/alpha/search` Web Search 和图片请求只转发给原生
   Codex 后端；上游省略 `content-type` 时，路由器也能识别 SSE 并统计 Token。
+- **错误和日志安全**：请求日志默认关闭；启用后会自动遮盖 HTTP/WS caller URL
+  中的 capability。第三方上游错误体最多读取 64 KiB，返回前会遮盖 Bearer、token、
+  key、secret、caller capability、查询参数和控制字符，并保留合法的 JSON 结构。
 - **代理**：原生上游请求通过 `NODE_USE_ENV_PROXY` 使用 `HTTPS_PROXY`（默认
   `http://127.0.0.1:7897`，即 Clash 混合端口）；WLB 和 MiMo 域名默认加入
   `NO_PROXY` 并保持 DIRECT。
@@ -64,7 +67,9 @@ Codex ──(config.toml: openai_base_url + model_catalog_json)──▶ router.
 POSIX：`bin/install`、`bin/provider-key`、`bin/enable`、`bin/disable`、
 `bin/uninstall`、`bin/start`。状态检查使用
 `bin/model-router codex status`。状态命令只读取本地健康端点和配置，不会自动修复
-或请求上游服务；返回码为 0 表示已就绪，1 表示需要处理，2 表示参数错误。
+或请求上游服务；它只有在路由器健康、配置由本安装管理、目录精确包含 8 个模型
+（其中 5 个为路由模型）、选定 Provider 未降级且凭据已配置时才报告 ready。返回码为
+0 表示已就绪，1 表示需要处理，2 表示参数错误；需要脚本处理时可追加 `--json`。
 
 状态保存在 `~/.codex/codex-router/`（模型目录、密钥和日志）。Windows 通过名为
 “Codex Router”的计划任务在登录时自动启动服务。后台监督进程会登记
@@ -81,7 +86,8 @@ POSIX：`bin/install`、`bin/provider-key`、`bin/enable`、`bin/disable`、
 - 检查：`node test/catalog-metadata.mjs`、
   `node --test test/router-fixes.mjs test/windows-service-process.mjs` 和
   `node scripts-check.mjs`。
-- 请求级调试：使用 `CODEX_ROUTER_REQUEST_LOG=1` 启动。
+- 请求级调试：使用 `CODEX_ROUTER_REQUEST_LOG=1` 启动；HTTP/WS caller capability
+  会自动脱敏，仍不要分享包含私有路径的日志。
 - 流式响应默认允许 300 秒无数据；可用 `CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS` 调整（10 毫秒至 15 分钟）。
 
 ## 分支

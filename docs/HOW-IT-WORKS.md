@@ -96,6 +96,11 @@ terminal error；尚未开始的非 SSE 响应会返回 504。该空闲时限可
 `CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS` 在 10 毫秒至 15 分钟之间调整，收到每个
 chunk 后都会重新计时，因此不会限制持续输出请求的总时长。
 
+第三方上游的错误响应体最多读取 64 KiB；路由器会在翻译为 Codex 错误前遮盖
+Bearer、token、key、secret、caller capability、查询参数和控制字符，并把错误详情
+限制为短文本。可解析的 quoted JSON 字段会替换字段值而保留合法 JSON，避免凭据或
+上游内部信息进入客户端响应。
+
 服务商密钥通常保存在受保护的状态目录中（默认为
 `~/.codex/codex-router/`）。`provider-key set` 会写入密钥并启用该服务商；环境
 变量密钥可供前台进程使用，但后台服务不会自动继承。
@@ -119,6 +124,9 @@ node scripts-check.mjs
 日常只读检查使用 `codex-router.ps1 status`（Windows）或
 `bin/model-router codex status`（POSIX）；它只读取本地健康端点、Codex 配置、固定
 8 模型目录、Provider 凭据状态、安装清单和后台服务，不会自动修复或请求上游。
+只有健康检查、受管配置、精确的 8 个目录 slug（包括 5 个路由 slug）、未降级的
+Provider 选择以及所有选定 Provider 的持久化凭据都满足时，退出码才为 0；否则为 1，
+参数错误为 2。脚本读取时可追加 `--json`。
 
 模型目录变化后必须重载路由器进程；已安装的服务可运行
 `node src/service.mjs restart`。如果 Codex 的模型选择器仍显示旧的

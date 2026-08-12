@@ -45,8 +45,9 @@ Codex ──(config.toml: openai_base_url + model_catalog_json)──▶ router.
 - **原生辅助请求**：独立的 `/alpha/search` Web Search 和图片请求只转发给原生
   Codex 后端；上游省略 `content-type` 时，路由器也能识别 SSE 并统计 Token。
 - **错误和日志安全**：请求日志默认关闭；启用后会自动遮盖 HTTP/WS caller URL
-  中的 capability。第三方上游错误体最多读取 64 KiB，返回前会遮盖 Bearer、token、
-  key、secret、caller capability、查询参数和控制字符，并保留合法的 JSON 结构。
+  中的 capability。普通路由请求的第三方上游错误体最多读取 64 KiB，返回前会遮盖 Bearer、token、
+  key、secret、caller capability、查询参数和控制字符；可解析的 quoted JSON 字段仍保留
+  合法的 JSON 结构。
 - **代理**：原生上游请求通过 `NODE_USE_ENV_PROXY` 使用 `HTTPS_PROXY`（默认
   `http://127.0.0.1:7897`，即 Clash 混合端口）；WLB 和 MiMo 域名默认加入
   `NO_PROXY` 并保持 DIRECT。

@@ -38,7 +38,7 @@ Codex Router Lite 是一个本地 Node 服务。它只有一个路由器进程�
 `[REDACTED]`，分享日志前仍应检查私有路径。路由器错误不会记录请求正文、响应正文
 或服务商密钥，但日志仍可能包含模型名称和路径。
 
-第三方上游错误体最多读取 64 KiB，且只在返回前处理；Bearer、token、key、secret、
+普通路由请求的第三方上游错误体最多读取 64 KiB，且只在返回前处理；Bearer、token、key、secret、
 caller capability、查询参数和控制字符会被遮盖或清理，quoted JSON 字段会保留合法
 结构，错误详情还会限制长度。这样既避免巨型错误体占用内存，也避免上游凭据进入
 Codex 响应。

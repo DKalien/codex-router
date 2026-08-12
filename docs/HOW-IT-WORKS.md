@@ -96,7 +96,7 @@ terminal error；尚未开始的非 SSE 响应会返回 504。该空闲时限可
 `CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS` 在 10 毫秒至 15 分钟之间调整，收到每个
 chunk 后都会重新计时，因此不会限制持续输出请求的总时长。
 
-第三方上游的错误响应体最多读取 64 KiB；路由器会在翻译为 Codex 错误前遮盖
+普通路由请求的第三方上游错误响应体最多读取 64 KiB；路由器会在翻译为 Codex 错误前遮盖
 Bearer、token、key、secret、caller capability、查询参数和控制字符，并把错误详情
 限制为短文本。可解析的 quoted JSON 字段会替换字段值而保留合法 JSON，避免凭据或
 上游内部信息进入客户端响应。

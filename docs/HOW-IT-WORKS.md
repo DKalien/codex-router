@@ -91,6 +91,21 @@ supports_search_tool
 服务商。数据流会直接透传；`/responses/compact` 使用相同的直连路径，并在需要时
 生成由路由器管理的续接摘要。
 
+MiMo 的 Responses 网关不接受 Codex 扩展的 `custom_tool_call` 和 `agent_message`。
+路由器因此在 MiMo 路径上增加专属转换：custom tool 定义和历史调用以带单个
+`input` 字符串参数的 function tool 上送，JSON/SSE 中对应的 function call 再还原为
+custom tool 事件；普通 function tool 保持不变。标准协作 envelope 中的 `MESSAGE`
+是未验收的中间进度，跨模型续接时不再回放；`FINAL_ANSWER`、`NEW_TASK`、
+`FOLLOWUP_TASK` 及无法识别的类型仍保留。compact 路径应用同一规则。原生 GPT 和
+WLB 不做这项 MiMo 专属裁剪或 custom-tool 映射。
+
+第三方路由仍需回放的标准原生 `agent_message` envelope 可能只含不可由本地解开的
+`encrypted_content`。路由器使用原生 Codex 后端的受控 function call 取回明文，
+最多 4 路并发并按输入索引回填。明文只放在当前路由器进程的 LRU 缓存中，逻辑 TTL
+为 24 小时，上限为 512 条或 8 MiB；不会主动持久化到模型目录、日志或凭据文件。
+MiMo 裁掉旧 `MESSAGE` 进度后，新设备和服务重启后的首次续接通常无需解密这些
+历史项；仍需解密的载荷由 4 路并发避免串行，LRU 则加速同一进程内的后续续接。
+
 响应流连续 300 秒没有任何数据时，路由器会取消上游请求。SSE 会收到固定的
 terminal error；尚未开始的非 SSE 响应会返回 504。该空闲时限可通过
 `CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS` 在 10 毫秒至 15 分钟之间调整，收到每个
@@ -133,11 +148,18 @@ Provider 选择以及所有选定 Provider 的持久化凭据都满足时，退�
 `model_catalog_json`，请完全重启 Codex。Codex CLI 版本变化时会自动刷新原生
 捕获，但仍需要执行相同的重载/重启步骤。
 
+另一台设备不要复制其他设备的状态目录：先在本机配置 provider key，再运行
+`.\codex-router.ps1 install`（POSIX 使用 `bin/install`），随后完全重启 Codex。
+同一设备更换 checkout 时，POSIX installer 提供显式的所有权转移流程；Windows
+installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新或先人工解决
+冲突。安装会确保本机 caller secret、刷新 Codex endpoint，并重建目录和后台服务。
+
 主要文件如下：
 
 | 文件 | 职责 |
 | --- | --- |
-| `src/router.mjs` | caller 验证、模型分发、原生搜索/图片、直接转发、数据流和压缩摘要 |
+| `src/router.mjs` | caller 验证、模型分发、原生搜索/图片、协作载荷 relay、直接转发、数据流和压缩摘要 |
+| `src/mimo-custom-tools.mjs` | MiMo custom tool/agent message 的请求转换、历史裁剪和 JSON/SSE 响应还原 |
 | `src/response-usage.mjs` | 从 JSON 或 SSE 响应提取 Token 用量并保持响应透传 |
 | `src/catalog.mjs` | 捕获原生目录并生成 8 条目的合并目录 |
 | `src/model-registry.mjs` | 加载并验证服务商和模型 |
@@ -146,5 +168,5 @@ Provider 选择以及所有选定 Provider 的持久化凭据都满足时，退�
 | `src/service-windows.mjs` | 管理 Windows 计划任务并安全停止已验证的监督进程树 |
 | `config/mimo/`、`config/wlb/` | 两个服务商的描述文件和模型片段 |
 | `test/catalog-metadata.mjs` | 检查 WLB 精确复制和 MiMo 字段集合 |
-| `test/router-fixes.mjs` | 检查路由、统计、脱敏、有界错误和流式 idle timeout |
+| `test/router-fixes.mjs` | 检查路由、MiMo 历史兼容、relay 并发/缓存、统计、脱敏、有界错误和流式 idle timeout |
 | `test/windows-service-process.mjs` | 检查 Windows PID 登记、进程树停止和误杀防护 |

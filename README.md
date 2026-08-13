@@ -44,6 +44,12 @@ Codex ──(config.toml: openai_base_url + model_catalog_json)──▶ router.
   使用 `src/catalog.mjs` 中明确列出的 Xiaomi 字段，不继承 GPT 元数据。
 - **原生辅助请求**：独立的 `/alpha/search` Web Search 和图片请求只转发给原生
   Codex 后端；上游省略 `content-type` 时，路由器也能识别 SSE 并统计 Token。
+- **MiMo 长会话兼容**：Codex 的 custom tool 会在请求侧桥接为普通 function tool，
+  JSON/SSE 响应再还原成 custom tool 事件。跨模型续接会保留已经验收的
+  `FINAL_ANSWER`；标准协作 envelope 中的旧 `MESSAGE` 进度不发送给 MiMo，
+  `NEW_TASK` 和 `FOLLOWUP_TASK` 仍保留。第三方路由必须解析原生加密协作载荷时，
+  会按原顺序最多 4 路并发；解密结果保存在进程内 LRU 缓存，逻辑 TTL 为 24 小时，
+  最多 512 条或 8 MiB。
 - **错误和日志安全**：请求日志默认关闭；启用后会自动遮盖 HTTP/WS caller URL
   中的 capability。普通路由请求的第三方上游错误体最多读取 64 KiB，返回前会遮盖 Bearer、token、
   key、secret、caller capability、查询参数和控制字符；可解析的 quoted JSON 字段仍保留
@@ -76,6 +82,15 @@ POSIX：`bin/install`、`bin/provider-key`、`bin/enable`、`bin/disable`、
 “Codex Router”的计划任务在登录时自动启动服务。后台监督进程会登记
 `service.pid`；停止或重启时会校验 Node 路径和完整的 `src/start.mjs` 命令行后再
 结束该进程树，避免旧路由器继续占用 4102 端口。
+
+另一台设备不应复制上述状态目录。拉取 `lite` 后，先在该设备分别运行
+`.\codex-router.ps1 provider-key <provider> set` 配置要使用的服务商，再从当前
+checkout 运行 `.\codex-router.ps1 install`；安装器会确保本机 caller secret、重建
+模型目录、刷新 Codex endpoint，并登记 Windows 计划任务。Windows 目前不支持从
+另一 checkout 无缝接管已有 state owner；请继续从原 checkout 更新，或先人工解决
+owner 冲突。安装完成后完全退出并重新打开 Codex，使新的本地 endpoint 生效。
+`node src/service.mjs restart` 只能重启已经登记的任务；如果 `schtasks /Run` 报错，
+请重新执行 install，Windows 策略拒绝任务登记时改用管理员 PowerShell。
 
 ## 维护
 

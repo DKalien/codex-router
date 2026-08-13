@@ -24,6 +24,8 @@
   提供时必须通过验证
 - `src/response-usage.mjs` — 从 JSON/SSE 响应提取 Token 用量；上游省略
   `content-type` 时也必须保持字节级透传和正确统计
+- `src/mimo-custom-tools.mjs` — 只处理 MiMo 的 custom tool/agent message 兼容、
+  旧 `MESSAGE` 进度裁剪和 JSON/SSE 响应还原
 - `src/start.mjs` — 监督唯一的路由器子进程并注入代理环境（`NODE_USE_ENV_PROXY=1`，
   `HTTPS_PROXY` 默认为 `http://127.0.0.1:7897`）；Windows 后台服务原子登记
   `service.pid`，退出时只清理仍属于自己的 PID
@@ -43,6 +45,9 @@
   `node scripts-check.mjs`。
 - 修改 `src/router.mjs` 或 `src/response-usage.mjs` 后，运行
   `node --test test/router-fixes.mjs`。
+- MiMo 兼容必须保持服务商隔离：标准 envelope 的旧 `MESSAGE` 进度不回放，
+  `FINAL_ANSWER`、`NEW_TASK`、`FOLLOWUP_TASK` 仍保留；原生 GPT 和 WLB 不得应用
+  MiMo 专属的历史裁剪或 custom-tool 映射。
 - 修改 `src/start.mjs` 或 `src/service-windows.mjs` 后，运行
   `node --test test/windows-service-process.mjs`。
 - 修改注册表时必须保留 slug 命名空间格式（`<provider>/<model>`），并通过

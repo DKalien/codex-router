@@ -2,6 +2,10 @@
 
 ## Lite 分支（未发布）
 
+- MiMo 现在桥接 Codex custom tool 和协作历史：请求/响应在 custom tool 与 function
+  之间双向转换，旧 `MESSAGE` 进度不再回放，已验收的 `FINAL_ANSWER` 继续保留。
+  必须解析的原生协作载荷改为保序 4 路并发，并使用 24 小时、512 条/8 MiB 的进程内
+  缓存；旧进度裁剪和有界并发共同消除长会话续接的数十分钟等待。
 - Windows 后台监督进程现在原子登记 `service.pid`；停止和重启会校验进程所有权并
   结束完整进程树，同时兼容没有 PID 文件的旧启动器，避免遗留进程占用 4102 端口。
 - 原生 Web Search 和图片请求继续转发到 Codex 后端；无 `content-type` 的 SSE 响应

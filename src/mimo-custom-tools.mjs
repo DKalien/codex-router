@@ -11,6 +11,32 @@ const CUSTOM_PARAMETERS = {
 const SSE_FIELD_LINE = /^(?:event|data):/m;
 const SSE_SNIFF_BYTES = 512;
 const MAX_JSON_CAPTURE_BYTES = 8 * 1024 * 1024;
+const NATIVE_ENCRYPTED_CONTENT = /^gAAAAA[A-Za-z0-9_-]+={0,2}$/;
+
+function isOpaqueNativeEncryptedContent(value) {
+  return typeof value === "string" && NATIVE_ENCRYPTED_CONTENT.test(value);
+}
+
+function collaborationMessageType(item) {
+  if (!Array.isArray(item?.content)) return undefined;
+  const visible = item.content
+    .filter(
+      (part) =>
+        ["input_text", "text"].includes(part?.type) && typeof part.text === "string",
+    )
+    .map((part) => part.text)
+    .join("");
+  return visible.match(/(?:^|\n)\s*Message Type:\s*(NEW_TASK|MESSAGE|FOLLOWUP_TASK|FINAL_ANSWER)\b/i)?.[1]?.toUpperCase();
+}
+
+export function pruneMimoAgentProgress(input) {
+  if (!Array.isArray(input)) return input;
+  // ponytail: MiMo replays accepted handoffs, not transient progress; restore
+  // MESSAGE when Xiaomi accepts agent_message or native batch relay is reliable.
+  return input.filter((item) =>
+    item?.type !== "agent_message" || collaborationMessageType(item) !== "MESSAGE",
+  );
+}
 
 function customParameters() {
   return {
@@ -87,7 +113,28 @@ export function convertMimoRequestTools(tools) {
 
 export function convertMimoRequestInput(input) {
   if (!Array.isArray(input)) return input;
-  return input.map((item) => {
+  return input.flatMap((item) => {
+    if (item?.type === "agent_message") {
+      if (!Array.isArray(item.content)) return [];
+      const content = [];
+      for (const part of item.content) {
+        if (
+          part?.type === "input_text" &&
+          typeof part.text === "string" &&
+          part.text.trim() !== ""
+        ) {
+          content.push({ type: "input_text", text: part.text });
+        } else if (
+          part?.type === "encrypted_content" &&
+          typeof part.encrypted_content === "string" &&
+          part.encrypted_content.trim() !== "" &&
+          !isOpaqueNativeEncryptedContent(part.encrypted_content)
+        ) {
+          content.push({ type: "input_text", text: part.encrypted_content });
+        }
+      }
+      return content.length ? [{ type: "message", role: "user", content }] : [];
+    }
     if (item?.type === "custom_tool_call") {
       const { input: value, type: _type, ...rest } = item;
       return {
@@ -99,7 +146,7 @@ export function convertMimoRequestInput(input) {
     if (item?.type === "custom_tool_call_output") {
       return { ...item, type: "function_call_output" };
     }
-    return item;
+    return [item];
   });
 }
 

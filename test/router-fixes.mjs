@@ -389,6 +389,27 @@ test("MiMo 将 custom tool 历史桥接为 function 并还原流式调用", asyn
               output: "C:/work",
             },
             {
+              type: "agent_message",
+              id: "hist_agent",
+              status: "completed",
+              author: "agent-a",
+              recipient: "agent-b",
+              internal_chat_message_metadata_passthrough: { trace: "drop-me" },
+              content: [
+                {
+                  type: "input_text",
+                  text: "Message Type: FINAL_ANSWER\nPayload:",
+                },
+                { type: "encrypted_content", encrypted_content: "visible handoff" },
+                { type: "output_text", text: "drop this extension content" },
+              ],
+            },
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "ordinary message" }],
+            },
+            {
               type: "function_call",
               id: "hist_plain",
               status: "completed",
@@ -502,11 +523,197 @@ test("MiMo 将 custom tool 历史桥接为 function 并还原流式调用", asyn
       name: "ordinary",
       arguments: '{"value":"old"}',
     });
+    assert.equal(upstreamBody.input.some((item) => item.type === "agent_message"), false);
+    assert.deepEqual(
+      upstreamBody.input.find((item) =>
+        item.type === "message" &&
+        item.content?.some((part) => part.text === "visible handoff"),
+      ),
+      {
+        type: "message",
+        role: "user",
+        content: [
+          { type: "input_text", text: "Message Type: FINAL_ANSWER\nPayload:" },
+          { type: "input_text", text: "visible handoff" },
+        ],
+      },
+    );
+    assert.deepEqual(
+      upstreamBody.input.find((item) =>
+        item.type === "message" &&
+        item.content?.some((part) => part.text === "ordinary message"),
+      ),
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "ordinary message" }],
+      },
+    );
+    assert.equal(
+      upstreamBody.input.some((item) =>
+        item.type === "message" &&
+        item.content?.some((part) => part.type === "encrypted_content"),
+      ),
+      false,
+    );
   } finally {
     router.kill("SIGTERM");
     if (router.exitCode === null) await once(router, "exit");
     await close(mimo);
     rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("agent_message relay 有界并发、按序保留并命中缓存", async () => {
+  let activeRelays = 0;
+  let maxInFlight = 0;
+  let relayCount = 0;
+  const native = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    activeRelays += 1;
+    maxInFlight = Math.max(maxInFlight, activeRelays);
+    relayCount += 1;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    activeRelays -= 1;
+    const itemId = body.input?.[0]?.id;
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({
+      output: [{
+        type: "function_call",
+        name: "relay_external_agent_payload",
+        arguments: JSON.stringify({ payload: `plain-${itemId}` }),
+      }],
+    }));
+  });
+  const nativePort = await listen(native);
+  const mimoBodies = [];
+  const mimo = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    mimoBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end('{"status":"completed","output":[]}');
+  });
+  const mimoPort = await listen(mimo);
+  const router = await startRouter({
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${nativePort}/backend-api/codex`,
+    MIMO_BASE_URL: `http://127.0.0.1:${mimoPort}`,
+  });
+  const payloadCount = 263;
+  const input = Array.from({ length: payloadCount }, (_, index) => ({
+    type: "agent_message",
+    id: `agent-${index}`,
+    content: [
+      { type: "input_text", text: "Message Type: NEW_TASK\nPayload:" },
+      { type: "encrypted_content", encrypted_content: `gAAAAA${index}` },
+    ],
+  }));
+  const expected = input.map((item) => `plain-${item.id}`);
+  async function send(items) {
+    const response = await fetch(
+      `http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/responses`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "mimo-token-plan/mimo-v2.5-pro",
+          input: items,
+          stream: false,
+        }),
+      },
+    );
+    const body = await response.text();
+    assert.equal(response.status, 200, body);
+  }
+
+  try {
+    await send(input);
+    assert.ok(maxInFlight > 1, `expected concurrent relays, got ${maxInFlight}`);
+    assert.ok(maxInFlight <= 4, `relay concurrency exceeded limit: ${maxInFlight}`);
+    assert.equal(relayCount, payloadCount);
+    assert.deepEqual(
+      mimoBodies[0].input.map((item) => item.content?.at(-1)?.text),
+      expected,
+    );
+
+    await send(input);
+    assert.equal(relayCount, payloadCount);
+    assert.deepEqual(
+      mimoBodies[1].input.map((item) => item.content?.at(-1)?.text),
+      expected,
+    );
+
+    const completed = [0, 1].map((index) => ({
+      type: "agent_message",
+      id: `completed-${index}`,
+      author: "agent-completed",
+      content: [
+        { type: "input_text", text: "Message Type: MESSAGE\nPayload:" },
+        { type: "encrypted_content", encrypted_content: `gAAAAAcompleted${index}` },
+      ],
+    }));
+    completed.push({
+      type: "agent_message",
+      id: "completed-final",
+      author: "agent-completed",
+      content: [
+        { type: "input_text", text: "Message Type: FINAL_ANSWER\nPayload:" },
+        { type: "encrypted_content", encrypted_content: "gAAAAAcompleted-final" },
+      ],
+    });
+    await send(completed);
+    assert.equal(relayCount, payloadCount + 1);
+    assert.deepEqual(
+      mimoBodies[2].input.map((item) => item.content?.at(-1)?.text),
+      ["plain-completed-final"],
+    );
+
+    const latest = [completed[2], {
+      type: "agent_message",
+      id: "completed-latest",
+      author: "agent-completed",
+      content: [
+        { type: "input_text", text: "Message Type: MESSAGE\nPayload:" },
+        { type: "encrypted_content", encrypted_content: "gAAAAAcompleted-latest" },
+      ],
+    }];
+    await send(latest);
+    assert.equal(relayCount, payloadCount + 1);
+    assert.deepEqual(mimoBodies[3].input.map((item) => item.content?.at(-1)?.text), [
+      "plain-completed-final",
+    ]);
+
+    const retained = [
+      {
+        type: "agent_message",
+        id: "retained-new-task",
+        content: [{ type: "input_text", text: "Message Type: NEW_TASK\nPayload:" }, { type: "encrypted_content", encrypted_content: "gAAAAAretained-new-task" }],
+      },
+      {
+        type: "agent_message",
+        id: "retained-followup",
+        content: [{ type: "input_text", text: "Message Type: FOLLOWUP_TASK\nPayload:" }, { type: "encrypted_content", encrypted_content: "gAAAAAretained-followup" }],
+      },
+      {
+        type: "agent_message",
+        id: "retained-unknown",
+        content: [{ type: "input_text", text: "handoff without recognized type" }, { type: "encrypted_content", encrypted_content: "gAAAAAretained-unknown" }],
+      },
+    ];
+    await send(retained);
+    assert.equal(relayCount, payloadCount + 3);
+    assert.equal(mimoBodies[4].input.length, retained.length);
+    assert.deepEqual(mimoBodies[4].input.slice(0, 2).map((item) => item.content?.at(-1)?.text), [
+      "plain-retained-new-task",
+      "plain-retained-followup",
+    ]);
+    assert.match(mimoBodies[4].input[2].content?.[0]?.text || "", /handoff without recognized type/);
+  } finally {
+    await router.close();
+    await close(native);
+    await close(mimo);
   }
 });
 

@@ -54,6 +54,7 @@ import {
   MimoCustomToolCallTransform,
   convertMimoRequestInput,
   convertMimoRequestTools,
+  pruneMimoAgentProgress,
 } from "./mimo-custom-tools.mjs";
 import { activityMetadataFromHeaders } from "./codex-session-names.mjs";
 import { translateGatewayError } from "./error-translation.mjs";
@@ -109,9 +110,10 @@ const NATIVE_IMAGE_PATHS = new Set([
 ]);
 const NATIVE_SEARCH_PATHS = new Set(["/alpha/search", "/v1/alpha/search"]);
 const AGENT_PAYLOAD_RELAY_TOOL = "relay_external_agent_payload";
-const AGENT_PAYLOAD_CACHE_TTL_MS = 15 * 60 * 1_000;
+const AGENT_PAYLOAD_RELAY_CONCURRENCY = 4;
+const AGENT_PAYLOAD_CACHE_TTL_MS = 24 * 60 * 60 * 1_000;
 const AGENT_PAYLOAD_CACHE_MAX_BYTES = 8 * 1024 * 1024;
-const AGENT_PAYLOAD_CACHE_MAX_ENTRIES = 256;
+const AGENT_PAYLOAD_CACHE_MAX_ENTRIES = 512;
 const agentPayloadCache = new Map();
 let agentPayloadCacheBytes = 0;
 
@@ -684,27 +686,54 @@ async function relayEncryptedAgentPayload(request, item, encrypted, signal) {
   return plaintext;
 }
 
+function withAgentPayload(item, plaintext) {
+  return {
+    ...item,
+    content: [
+      ...item.content.filter((part) => part?.type !== "encrypted_content"),
+      { type: "input_text", text: plaintext },
+    ],
+  };
+}
+
 async function normalizeRoutedAgentInput(request, input, signal) {
   const normalized = normalizeRoutedInput(input);
   if (!Array.isArray(normalized)) return normalized;
-  const output = [];
-  for (const item of normalized) {
-    const payload = encryptedAgentPayload(item);
-    if (!payload) {
-      output.push(item);
-      continue;
+  const output = new Array(normalized.length);
+  let nextIndex = 0;
+  let stopped = false;
+  let firstError;
+  async function worker() {
+    while (!stopped) {
+      const index = nextIndex++;
+      if (index >= normalized.length) return;
+      const item = normalized[index];
+      try {
+        const payload = encryptedAgentPayload(item);
+        if (!payload) {
+          output[index] = item;
+          continue;
+        }
+        const plaintext = payload.native
+          ? await relayEncryptedAgentPayload(request, item, payload.content, signal)
+          : payload.content;
+        output[index] = withAgentPayload(item, plaintext);
+      } catch (error) {
+        if (!stopped) {
+          stopped = true;
+          firstError = error;
+        }
+        return;
+      }
     }
-    const plaintext = payload.native
-      ? await relayEncryptedAgentPayload(request, item, payload.content, signal)
-      : payload.content;
-    output.push({
-      ...item,
-      content: [
-        ...item.content.filter((part) => part?.type !== "encrypted_content"),
-        { type: "input_text", text: plaintext },
-      ],
-    });
   }
+  await Promise.all(
+    Array.from(
+      { length: Math.min(AGENT_PAYLOAD_RELAY_CONCURRENCY, normalized.length) },
+      worker,
+    ),
+  );
+  if (stopped) throw firstError;
   return output;
 }
 
@@ -862,7 +891,12 @@ function extractResponseText(payload) {
 }
 
 async function summarize(request, payload, route, signal) {
-  const originalInput = Array.isArray(payload.input) ? payload.input : [];
+  const originalInput =
+    route.provider === "mimo-token-plan" && Array.isArray(payload.input)
+      ? pruneMimoAgentProgress(payload.input)
+      : Array.isArray(payload.input)
+        ? payload.input
+        : [];
   // Compaction replays the whole conversation, so any image still in it would
   // reach the text-only model unbridged and fail the compaction rather than
   // the turn. The evidence is already cached from the turn that pasted it.
@@ -1122,8 +1156,12 @@ async function handleResponses(request, response, requestUrl) {
     let collaborationFlattened = false;
     let mimoCustomToolNames;
     if (route) {
+      const routedInput =
+        route.provider === "mimo-token-plan" && Array.isArray(payload.input)
+          ? pruneMimoAgentProgress(payload.input)
+          : payload.input;
       const input = await bridgeVisionInput(
-        await normalizeRoutedAgentInput(request, payload.input, controller.signal),
+        await normalizeRoutedAgentInput(request, routedInput, controller.signal),
         route,
         request,
       );

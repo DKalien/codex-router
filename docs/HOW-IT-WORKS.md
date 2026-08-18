@@ -29,9 +29,10 @@ sequenceDiagram
   R-->>C: 响应或数据流
 ```
 
-`src/start.mjs` 监督这一个路由器子进程，并等待其健康检查通过。它还为 Node 的
-`fetch` 提供代理环境。请求路径中没有网关、API 转发器、Python 进程、OAuth
-流程、托盘应用或更新器。
+`src/start.mjs` 监督这一个路由器子进程，并等待其健康检查通过。健康探针会排空
+响应体以保持连接可复用；路由器对客户端连接池使用 120 秒 keep-alive，并为中途
+断流写入独立的 usage 标记。它还为 Node 的 `fetch` 提供代理环境。请求路径中没有
+网关、API 转发器、Python 进程、OAuth 流程、托盘应用或更新器。
 
 Windows 后台服务由 `src/service-windows.mjs` 通过计划任务管理。后台启动的
 `src/start.mjs` 会将监督进程 PID 原子写入 `service.pid`；停止或重启时，服务管理器
@@ -169,4 +170,5 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | `config/mimo/`、`config/wlb/` | 两个服务商的描述文件和模型片段 |
 | `test/catalog-metadata.mjs` | 检查 WLB 精确复制和 MiMo 字段集合 |
 | `test/router-fixes.mjs` | 检查路由、MiMo 历史兼容、relay 并发/缓存、统计、脱敏、有界错误和流式 idle timeout |
+| `test/upstream-hardening.mjs` | 检查健康响应排空、keep-alive 参数、错误 cause 链和断流 usage 标记 |
 | `test/windows-service-process.mjs` | 检查 Windows PID 登记、进程树停止和误杀防护 |

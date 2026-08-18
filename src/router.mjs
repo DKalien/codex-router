@@ -16,7 +16,9 @@ import {
   redactCallerUrl,
 } from "./caller-auth.mjs";
 import {
+  applyKeepAliveTimeouts,
   endStreamedResponse,
+  formatErrorChain,
   HOP_BY_HOP_HEADERS,
   httpErrorStatus,
   pipeResponse,
@@ -1064,12 +1066,15 @@ async function handleResponses(request, response, requestUrl) {
   const startedAt = Date.now();
   const activity = beginRequestActivity();
   let clientGone = false;
+  let requestedModel = "";
+  let route;
+  let upstreamRetries;
   try {
     if (!requireCodexTransport(request, response)) return;
     const encoded = await readRequestBody(request);
     const body = decodeBody(encoded, request.headers["content-encoding"]);
     const payload = parseBody(body);
-    const requestedModel = typeof payload.model === "string" ? payload.model : "";
+    requestedModel = typeof payload.model === "string" ? payload.model : "";
     let registeredRoute =
       MODEL_BY_SLUG.get(requestedModel) ??
       MODEL_BY_SLUG.get(readNativeAliases()[requestedModel]);
@@ -1085,7 +1090,7 @@ async function handleResponses(request, response, requestUrl) {
         registeredRoute = redirect;
       }
     }
-    const route = registeredRoute && readProviderSelection().includes(registeredRoute.provider)
+    route = registeredRoute && readProviderSelection().includes(registeredRoute.provider)
       ? registeredRoute
       : undefined;
     if (registeredRoute && !route) {
@@ -1234,7 +1239,7 @@ async function handleResponses(request, response, requestUrl) {
     // attempt replays the identical bytes under the identical encoding. Nothing
     // here consumes a stream, which is what makes the request replayable at
     // all.
-    const { response: upstream, retries: upstreamRetries } = await fetchWithRetry(
+    const { response: upstream, retries } = await fetchWithRetry(
       target,
       {
         method: "POST",
@@ -1248,6 +1253,7 @@ async function handleResponses(request, response, requestUrl) {
         onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
       },
     );
+    upstreamRetries = retries;
     // Gateway error bodies leak LiteLLM's internal exception chain, which
     // reads like a router bug. Rewrite them to name the provider that failed.
     // Native traffic passes through untouched: OpenAI errors are already clear.
@@ -1320,6 +1326,7 @@ async function handleResponses(request, response, requestUrl) {
     });
     const usage = usageTransform?.tokenUsage();
     const estimatedInputTokens = usageTransform?.substitutedInputTokens();
+    const clientWalkedAway = clientGone || (response.destroyed && !response.writableFinished);
     // `retries` separates "it never failed" from "it failed and the router
     // absorbed it", both of which otherwise record a plain 200;
     // `estimatedInputTokens` separates a count the provider sent from one the
@@ -1327,7 +1334,7 @@ async function handleResponses(request, response, requestUrl) {
     recordUsageEvent({
       model: route?.slug || requestedModel,
       provider: route ? canonicalProviderId(route.provider) : "openai",
-      status: upstream.status,
+      status: clientWalkedAway ? 0 : upstream.status,
       durationMs: Date.now() - startedAt,
       retries: upstreamRetries,
       ...usage,
@@ -1337,7 +1344,7 @@ async function handleResponses(request, response, requestUrl) {
       // The substitution is named in the log line as well as the usage event:
       // a router that quietly invents token counts is its own trap.
       console.error(
-        `[codex-router] model=${requestedModel || "unknown"} provider=${route?.provider || "openai"} status=${upstream.status}${
+        `[codex-router] model=${requestedModel || "unknown"} provider=${route?.provider || "openai"} status=${clientWalkedAway ? 0 : upstream.status}${
           upstreamRetries ? ` retries=${upstreamRetries}` : ""
         }${estimatedInputTokens ? ` estimated-input-tokens=${estimatedInputTokens}` : ""}`,
       );
@@ -1345,9 +1352,27 @@ async function handleResponses(request, response, requestUrl) {
   } catch (error) {
     // A client that walked away (canceled generation, closed stream) is not
     // a router failure; only surface errors the router or upstream produced.
-    if (clientGone) {
+    const clientWalkedAway = clientGone || (response.destroyed && !response.writableFinished);
+    if (clientWalkedAway) {
+      recordUsageEvent({
+        model: route?.slug || requestedModel,
+        provider: route ? canonicalProviderId(route.provider) : "openai",
+        status: 0,
+        durationMs: Date.now() - startedAt,
+        retries: upstreamRetries,
+      });
       activity.finish(0);
       return;
+    }
+    if (response.headersSent && response.statusCode < 400) {
+      recordUsageEvent({
+        model: route?.slug || requestedModel,
+        provider: route ? canonicalProviderId(route.provider) : "openai",
+        status: 502,
+        durationMs: Date.now() - startedAt,
+        retries: upstreamRetries,
+        streamAborted: true,
+      });
     }
     activity.finish(500);
     throw error;
@@ -1360,12 +1385,14 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
   const startedAt = Date.now();
   const activity = beginRequestActivity();
   let clientGone = false;
+  let requestedModel = defaultModel;
+  let upstreamRetries;
   try {
     if (!requireCodexTransport(request, response)) return;
     const encoded = await readRequestBody(request);
     const body = decodeBody(encoded, request.headers["content-encoding"]);
     const payload = parseBody(body);
-    const requestedModel =
+    requestedModel =
       typeof payload.model === "string" ? payload.model : defaultModel;
     activity.setRoute({
       provider: "openai",
@@ -1389,7 +1416,7 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
     // Same replayable-Buffer rule as the turn path: encode once, outside the
     // retry, so every attempt carries identical bytes under identical headers.
     const imageBody = await compressedNativeBody(body, headers);
-    const { response: upstream, retries: upstreamRetries } = await fetchWithRetry(
+    const { response: upstream, retries } = await fetchWithRetry(
       nativeTarget(requestUrl.pathname, requestUrl.search),
       {
         method: "POST",
@@ -1411,24 +1438,45 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
         onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
       },
     );
+    upstreamRetries = retries;
     await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS);
+    const clientWalkedAway = clientGone || (response.destroyed && !response.writableFinished);
     recordUsageEvent({
       model: requestedModel,
       provider: "openai",
-      status: upstream.status,
+      status: clientWalkedAway ? 0 : upstream.status,
       durationMs: Date.now() - startedAt,
       retries: upstreamRetries,
     });
     if (!QUIET) {
       console.error(
-        `[codex-router] model=${requestedModel} provider=openai status=${upstream.status}${upstreamRetries ? ` retries=${upstreamRetries}` : ""}`,
+        `[codex-router] model=${requestedModel} provider=openai status=${clientWalkedAway ? 0 : upstream.status}${upstreamRetries ? ` retries=${upstreamRetries}` : ""}`,
       );
     }
   } catch (error) {
-    if (clientGone) {
+    const clientWalkedAway = clientGone || (response.destroyed && !response.writableFinished);
+    if (clientWalkedAway) {
+      recordUsageEvent({
+        model: requestedModel,
+        provider: "openai",
+        status: 0,
+        durationMs: Date.now() - startedAt,
+        retries: upstreamRetries,
+      });
       activity.finish(0);
       return;
     }
+    const status = response.headersSent && response.statusCode < 400
+      ? 502
+      : httpErrorStatus(error);
+    recordUsageEvent({
+      model: requestedModel,
+      provider: "openai",
+      status,
+      durationMs: Date.now() - startedAt,
+      retries: upstreamRetries,
+      ...(response.headersSent && response.statusCode < 400 ? { streamAborted: true } : {}),
+    });
     activity.finish(500);
     throw error;
   } finally {
@@ -1517,14 +1565,9 @@ const server = http.createServer((request, response) => {
   }
   handleRequest(request, response).catch((error) => {
     const status = httpErrorStatus(error);
-    // The bare string this used to log made every mid-stream failure
-    // indistinguishable in production. The cause belongs in the log; response
-    // bodies never do, so only the error's own message and code are recorded.
-    console.error(
-      `[codex-router] request failed: ${
-        error instanceof Error ? `${error.name}: ${error.message}` : String(error)
-      }${error?.code ? ` (${error.code})` : ""}`,
-    );
+    // Keep the cause chain for transport diagnosis; response bodies never enter
+    // this formatter, and the bounded chain avoids runaway nested errors.
+    console.error(`[codex-router] request failed: ${formatErrorChain(error, { messages: false })}`);
     if (!response.headersSent) {
       writeJson(response, status, {
         error: {
@@ -1565,15 +1608,19 @@ server.on("error", (error) => {
     );
     process.exit(97);
   }
-  console.error(
-    `[codex-router] server error: ${
-      error instanceof Error ? `${error.name}: ${error.message}` : String(error)
-    }${error?.code ? ` (${error.code})` : ""}`,
-  );
+  console.error(`[codex-router] server error: ${formatErrorChain(error, { messages: false })}`);
   process.exit(96);
 });
+process.on("uncaughtException", (error) => {
+  console.error(`[codex-router] uncaught exception: ${formatErrorChain(error, { messages: false })}`);
+  process.exit(95);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error(`[codex-router] unhandled rejection: ${formatErrorChain(reason, { messages: false })}`);
+  process.exit(94);
+});
 server.requestTimeout = 0;
-server.headersTimeout = 65_000;
+applyKeepAliveTimeouts(server);
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.error("[codex-router] listening");
 });

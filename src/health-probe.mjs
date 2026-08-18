@@ -38,6 +38,14 @@ function hasExited(child) {
   return Boolean(child) && (child.exitCode !== null || child.signalCode !== null);
 }
 
+async function drainResponse(response) {
+  if (typeof response?.arrayBuffer === "function") {
+    await response.arrayBuffer().catch(() => {});
+  } else if (typeof response?.body?.cancel === "function") {
+    await response.body.cancel().catch(() => {});
+  }
+}
+
 /**
  * Poll `url` until the service behind it is healthy.
  *
@@ -97,11 +105,15 @@ export async function waitForHealth({
           signal: AbortSignal.timeout(windowMs),
         });
         if (response.ok) {
-          if (!expectedService) return;
+          if (!expectedService) {
+            await drainResponse(response);
+            return;
+          }
           const payload = await response.json().catch(() => ({}));
           if (payload.service === expectedService) return;
           lastFailure = `the health response did not identify ${expectedService}`;
         } else {
+          await drainResponse(response);
           lastFailure = `the service answered HTTP ${response.status}`;
         }
       } catch (error) {

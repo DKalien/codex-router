@@ -27,6 +27,15 @@ export const HOP_BY_HOP_HEADERS = new Set([
   "upgrade",
 ]);
 
+export const KEEPALIVE_TIMEOUT_MS = 120_000;
+export const HEADERS_TIMEOUT_MS = KEEPALIVE_TIMEOUT_MS + 5_000;
+
+export function applyKeepAliveTimeouts(server) {
+  server.keepAliveTimeout = KEEPALIVE_TIMEOUT_MS;
+  server.headersTimeout = HEADERS_TIMEOUT_MS;
+  return server;
+}
+
 export const MAX_UPSTREAM_ERROR_BYTES = 64 * 1024;
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000;
 export const MIN_STREAM_IDLE_TIMEOUT_MS = 10;
@@ -101,6 +110,28 @@ export function writeJson(response, status, payload) {
     "Content-Length": String(body.length),
   });
   response.end(body);
+}
+
+const MAX_ERROR_CHAIN_DEPTH = 8;
+
+export function formatErrorChain(error, { messages = true } = {}) {
+  const parts = [];
+  let current = error;
+  for (let depth = 0; current != null && depth < MAX_ERROR_CHAIN_DEPTH; depth += 1) {
+    if (typeof current !== "object") {
+      parts.push(String(current));
+      break;
+    }
+    const name = typeof current.name === "string" && current.name ? current.name : "Error";
+    const message =
+      messages && typeof current.message === "string" && current.message
+        ? `: ${current.message}`
+        : "";
+    const code = current.code === undefined ? "" : ` (${String(current.code)})`;
+    parts.push(`${name}${message}${code}`);
+    current = current.cause ?? (Array.isArray(current.errors) ? current.errors[0] : undefined);
+  }
+  return parts.length ? parts.join(" <- ") : String(error);
 }
 
 export function httpErrorStatus(error, fallback = 502) {

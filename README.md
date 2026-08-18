@@ -22,7 +22,7 @@ Codex 的模型选择器，并在本地路由它们的请求。
 流程、服务商预设、托盘/桌面应用和自动更新器。服务仅依赖 Node：`src/start.mjs`
 监督一个 `src/router.mjs` 子进程，不再启动额外的网关或转发进程。仓库保留的检查
 脚本是 `test/catalog-metadata.mjs`、`test/router-fixes.mjs`、
-`test/windows-service-process.mjs` 和 `scripts-check.mjs`。
+`test/upstream-hardening.mjs`、`test/windows-service-process.mjs` 和 `scripts-check.mjs`。
 
 ## 架构
 
@@ -100,7 +100,7 @@ owner 冲突。安装完成后完全退出并重新打开 Codex，使新的本�
   `node src/catalog.mjs`，再用 `node src/service.mjs restart` 重载路由器；模型
   选择器需要重新载入时再重启 Codex。
 - 检查：`node test/catalog-metadata.mjs`、
-  `node --test test/router-fixes.mjs test/windows-service-process.mjs` 和
+  `node --test test/router-fixes.mjs test/upstream-hardening.mjs test/windows-service-process.mjs` 和
   `node scripts-check.mjs`。
 - 请求级调试：使用 `CODEX_ROUTER_REQUEST_LOG=1` 启动；HTTP/WS caller capability
   会自动脱敏，仍不要分享包含私有路径的日志。

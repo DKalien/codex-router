@@ -40,6 +40,7 @@ export function recordUsageEvent({
   // for the provider having recovered -- and a run of these events is the
   // signal that it has not.
   estimatedInputTokens,
+  streamAborted,
   at = Date.now(),
 }) {
   const event = {
@@ -49,6 +50,7 @@ export function recordUsageEvent({
     provider: safeText(provider, "unknown"),
     status: Number.isInteger(status) ? status : 0,
     durationMs: Number.isFinite(durationMs) ? Math.max(0, Math.round(durationMs)) : 0,
+    ...(streamAborted === true ? { streamAborted: true } : {}),
     ...(safeRetryCount(retries) !== undefined ? { retries: safeRetryCount(retries) } : {}),
     ...(safeTokenCount(inputTokens) !== undefined
       ? { inputTokens: safeTokenCount(inputTokens) }
@@ -116,6 +118,7 @@ export function recentUsageEvents({ sinceMs = 24 * 60 * 60 * 1000, limit = 1_000
           durationMs: Number.isFinite(event.durationMs)
             ? Math.max(0, Math.round(event.durationMs))
             : 0,
+          ...(event.streamAborted === true ? { streamAborted: true } : {}),
           ...(retries !== undefined ? { retries } : {}),
           ...(inputTokens !== undefined ? { inputTokens } : {}),
           ...(outputTokens !== undefined ? { outputTokens } : {}),

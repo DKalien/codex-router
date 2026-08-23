@@ -31,8 +31,12 @@ sequenceDiagram
 
 `src/start.mjs` 监督这一个路由器子进程，并等待其健康检查通过。健康探针会排空
 响应体以保持连接可复用；路由器对客户端连接池使用 120 秒 keep-alive，并为中途
-断流写入独立的 usage 标记。它还为 Node 的 `fetch` 提供代理环境。请求路径中没有
-网关、API 转发器、Python 进程、OAuth 流程、托盘应用或更新器。
+断流写入独立的 usage 标记。收到 `SIGINT`/`SIGTERM` 时，路由器停止接收新请求，
+在途请求最多 drain 2 秒；已开始的 SSE 会收到本地重启 terminal error 后 clean EOF，
+尚未发送响应头的请求返回 503。`src/start.mjs` 的强杀 backstop 会覆盖 drain 和 flush
+窗口；`MODEL_ROUTER_SHUTDOWN_DRAIN_MS` 可调整 drain 时长。它还为 Node 的 `fetch`
+提供代理环境。请求路径中没有网关、API 转发器、Python 进程、OAuth 流程、托盘应用
+或更新器。
 
 Windows 后台服务由 `src/service-windows.mjs` 通过计划任务管理。后台启动的
 `src/start.mjs` 会将监督进程 PID 原子写入 `service.pid`；停止或重启时，服务管理器
@@ -85,7 +89,11 @@ supports_search_tool
 ## 路由和凭据
 
 对于原生 slug，`src/router.mjs` 使用白名单 Codex 请求头将请求转发给原生 Codex
-后端；独立的 `/alpha/search` 搜索请求和图片请求也只会转发给原生后端。对于带命名
+后端；独立的 `/alpha/search` 搜索请求和图片请求也只会转发给原生后端。原生 SSE
+已经观察到 `response.completed` 后，即使客户端紧接着关闭连接，也按 upstream status
+和 Token usage 记录，不再误记为客户端取消或 `0`；尚未完成的 native 流仍记为客户端
+取消。GPT-5.6 原生请求会删除旧兼容字段 `prompt_cache_retention`，不影响
+`prompt_cache_options`。对于带命名
 空间的 slug，它会解析服务商，将模型名替换为 `upstreamModel`，
 读取对应密钥，再使用服务商的 `Authorization` 请求头直接发送
 `POST <provider base URL>/responses`。Codex 的账户和安装凭据不会发送给第三方
@@ -133,7 +141,7 @@ Bearer、token、key、secret、caller capability、查询参数和控制字符�
 ```sh
 node src/catalog.mjs
 node test/catalog-metadata.mjs
-node --test test/router-fixes.mjs test/windows-service-process.mjs
+node --test test/router-fixes.mjs test/graceful-shutdown.mjs test/windows-service-process.mjs
 node scripts-check.mjs
 ```
 
@@ -170,5 +178,6 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | `config/mimo/`、`config/wlb/` | 两个服务商的描述文件和模型片段 |
 | `test/catalog-metadata.mjs` | 检查 WLB 精确复制和 MiMo 字段集合 |
 | `test/router-fixes.mjs` | 检查路由、MiMo 历史兼容、relay 并发/缓存、统计、脱敏、有界错误和流式 idle timeout |
+| `test/graceful-shutdown.mjs` | 检查重启 drain、SSE terminal error、503 fallback 和 idle keep-alive 快速退出 |
 | `test/upstream-hardening.mjs` | 检查健康响应排空、keep-alive 参数、错误 cause 链和断流 usage 标记 |
 | `test/windows-service-process.mjs` | 检查 Windows PID 登记、进程树停止和误杀防护 |

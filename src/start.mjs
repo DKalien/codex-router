@@ -18,6 +18,7 @@ import {
   TARGET,
   loopback,
 } from "./paths.mjs";
+import { SHUTDOWN_DRAIN_MS, SHUTDOWN_FLUSH_MS } from "./http-utils.mjs";
 import { waitForHealth as pollHealth } from "./health-probe.mjs";
 
 // Lite: the router is the whole service. Routed providers speak the Responses
@@ -93,6 +94,7 @@ const commonEnv = {
 
 const children = [];
 let shuttingDown = false;
+const SIGKILL_AFTER_MS = SHUTDOWN_DRAIN_MS + SHUTDOWN_FLUSH_MS + 2_000;
 
 function run(command, args, extraEnv = {}) {
   const child = spawn(command, args, {
@@ -123,7 +125,7 @@ function stopChildren() {
     for (const child of children) {
       if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     }
-  }, 3_000).unref();
+  }, SIGKILL_AFTER_MS).unref();
 }
 
 for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, stopChildren);

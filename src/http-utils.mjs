@@ -36,6 +36,86 @@ export function applyKeepAliveTimeouts(server) {
   return server;
 }
 
+export const SHUTDOWN_DRAIN_MS = (() => {
+  const configured = Number(process.env.MODEL_ROUTER_SHUTDOWN_DRAIN_MS || 2_000);
+  return Number.isFinite(configured) && configured >= 0 ? configured : 2_000;
+})();
+export const SHUTDOWN_FLUSH_MS = 1_000;
+const SHUTDOWN_MESSAGE = "The local router is restarting; retry the request.";
+
+export function installGracefulShutdown(
+  server,
+  {
+    label = "codex-router",
+    signals = ["SIGINT", "SIGTERM"],
+    drainMs = SHUTDOWN_DRAIN_MS,
+    flushMs = SHUTDOWN_FLUSH_MS,
+    exit = (code) => process.exit(code),
+  } = {},
+) {
+  const live = new Set();
+  server.on("request", (_request, response) => {
+    live.add(response);
+    response.once("close", () => live.delete(response));
+  });
+
+  let shuttingDown = false;
+  let exited = false;
+  let drainTimer;
+  let flushTimer;
+  const finish = () => {
+    if (exited) return;
+    exited = true;
+    if (drainTimer) clearTimeout(drainTimer);
+    if (flushTimer) clearTimeout(flushTimer);
+    exit(0);
+  };
+
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    server.close(finish);
+    server.closeIdleConnections?.();
+    if (exited) return;
+    drainTimer = setTimeout(() => {
+      for (const response of live) {
+        if (response.writableEnded || response.destroyed) continue;
+        try {
+          if (response.headersSent) {
+            endStreamedResponse(response, {
+              message: SHUTDOWN_MESSAGE,
+            });
+          } else {
+            writeJson(response, 503, {
+              error: {
+                type: "local_router_restarting",
+                message: SHUTDOWN_MESSAGE,
+              },
+            });
+          }
+        } catch {
+          // The client may close the socket while the drain timer is firing.
+        }
+      }
+      if (exited) return;
+      flushTimer = setTimeout(() => {
+        server.closeAllConnections?.();
+        finish();
+      }, flushMs);
+      flushTimer.unref?.();
+    }, drainMs);
+    drainTimer.unref?.();
+    if (live.size > 0) {
+      console.error(
+        `[${label}] shutting down with ${live.size} request(s) in flight; draining for up to ${drainMs}ms`,
+      );
+    }
+  };
+
+  for (const signal of signals) process.on(signal, shutdown);
+  return server;
+}
+
 export const MAX_UPSTREAM_ERROR_BYTES = 64 * 1024;
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000;
 export const MIN_STREAM_IDLE_TIMEOUT_MS = 10;
@@ -227,12 +307,16 @@ function idleTimeoutTransform(timeoutMs) {
 // dispatches nothing.
 export function endStreamedResponse(response, forceEventStream = false) {
   if (!response || response.writableEnded || response.destroyed) return;
-  if (forceEventStream || isEventStream(response)) {
+  const options =
+    forceEventStream && typeof forceEventStream === "object"
+      ? { forceEventStream: true, ...forceEventStream }
+      : { forceEventStream };
+  if (options.forceEventStream || isEventStream(response)) {
     try {
       const data = {
         type: "error",
         code: "local_router_stream_failed",
-        message: "The local router lost the upstream response stream.",
+        message: options.message || "The local router lost the upstream response stream.",
         param: null,
       };
       response.write(`\n\nevent: error\ndata: ${JSON.stringify(data)}\n\n`);

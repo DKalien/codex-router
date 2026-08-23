@@ -21,6 +21,7 @@ import {
   formatErrorChain,
   HOP_BY_HOP_HEADERS,
   httpErrorStatus,
+  installGracefulShutdown,
   pipeResponse,
   readResponseTextLimited,
   readRequestBody,
@@ -829,6 +830,13 @@ function normalizeNativeInput(input) {
   });
 }
 
+function normalizeNativePromptCacheCompatibility(payload) {
+  if (/^gpt-5\.6(?:-|$)/.test(String(payload.model || ""))) {
+    delete payload.prompt_cache_retention;
+  }
+  return payload;
+}
+
 function extractUserMessages(input) {
   if (!Array.isArray(input)) return [];
   const messages = [];
@@ -1069,6 +1077,10 @@ async function handleResponses(request, response, requestUrl) {
   let requestedModel = "";
   let route;
   let upstreamRetries;
+  let upstreamStatus;
+  let usageTransform;
+  let usage;
+  let estimatedInputTokens;
   try {
     if (!requireCodexTransport(request, response)) return;
     const encoded = await readRequestBody(request);
@@ -1221,6 +1233,7 @@ async function handleResponses(request, response, requestUrl) {
       routedBody = Buffer.from(JSON.stringify(routed), "utf8");
     } else {
       const native = { ...payload };
+      normalizeNativePromptCacheCompatibility(native);
       if (Array.isArray(payload.input)) {
         native.input = normalizeNativeInput(payload.input);
       }
@@ -1254,6 +1267,7 @@ async function handleResponses(request, response, requestUrl) {
       },
     );
     upstreamRetries = retries;
+    upstreamStatus = upstream.status;
     // Gateway error bodies leak LiteLLM's internal exception chain, which
     // reads like a router bug. Rewrite them to name the provider that failed.
     // Native traffic passes through untouched: OpenAI errors are already clear.
@@ -1300,7 +1314,7 @@ async function handleResponses(request, response, requestUrl) {
     // predicate is structural (this request, these bytes, an explicit zero),
     // so it cannot fire on a provider that reports correctly and it disables
     // itself the moment the upstream starts reporting again.
-    const usageTransform = new ResponseUsageTransform(
+    usageTransform = new ResponseUsageTransform(
       upstream.headers.get("content-type") || "",
       {
         estimatedInputTokens:
@@ -1324,9 +1338,13 @@ async function handleResponses(request, response, requestUrl) {
     await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, transforms, {
       eventStream: payload.stream === true,
     });
-    const usage = usageTransform?.tokenUsage();
-    const estimatedInputTokens = usageTransform?.substitutedInputTokens();
-    const clientWalkedAway = clientGone || (response.destroyed && !response.writableFinished);
+    usage = usageTransform?.tokenUsage();
+    estimatedInputTokens = usageTransform?.substitutedInputTokens();
+    const nativeCompletedBeforeClose =
+      !route && usageTransform?.completedResponseObserved() === true;
+    const clientWalkedAway =
+      (clientGone || (response.destroyed && !response.writableFinished)) &&
+      !nativeCompletedBeforeClose;
     // `retries` separates "it never failed" from "it failed and the router
     // absorbed it", both of which otherwise record a plain 200;
     // `estimatedInputTokens` separates a count the provider sent from one the
@@ -1353,6 +1371,22 @@ async function handleResponses(request, response, requestUrl) {
     // A client that walked away (canceled generation, closed stream) is not
     // a router failure; only surface errors the router or upstream produced.
     const clientWalkedAway = clientGone || (response.destroyed && !response.writableFinished);
+    usage = usageTransform?.tokenUsage();
+    estimatedInputTokens = usageTransform?.substitutedInputTokens();
+    if (!route && clientGone && usageTransform?.completedResponseObserved() === true) {
+      const status = upstreamStatus ?? response.statusCode;
+      recordUsageEvent({
+        model: requestedModel,
+        provider: "openai",
+        status,
+        durationMs: Date.now() - startedAt,
+        retries: upstreamRetries,
+        ...usage,
+        estimatedInputTokens,
+      });
+      activity.finish(status);
+      return;
+    }
     if (clientWalkedAway) {
       recordUsageEvent({
         model: route?.slug || requestedModel,
@@ -1625,6 +1659,4 @@ server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.error("[codex-router] listening");
 });
 
-for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, () => server.close(() => process.exit(0)));
-}
+installGracefulShutdown(server, { label: "codex-router" });

@@ -50,6 +50,8 @@
   MiMo 专属的历史裁剪或 custom-tool 映射。
 - 修改 `src/start.mjs` 或 `src/service-windows.mjs` 后，运行
   `node --test test/windows-service-process.mjs`。
+- 修改 `src/http-utils.mjs` 的 graceful shutdown 路径后，运行
+  `node --test test/graceful-shutdown.mjs`。
 - 修改注册表时必须保留 slug 命名空间格式（`<provider>/<model>`），并通过
   `src/model-registry.mjs` 的验证器。
 - 绝不能记录或提交凭据。持久化的服务商密钥只能通过 `provider-key set` 或

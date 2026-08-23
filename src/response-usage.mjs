@@ -139,6 +139,7 @@ export class ResponseUsageTransform extends Transform {
   #usage;
   #estimate;
   #substituted;
+  #completedResponseObserved = false;
   // Rewrite mode holds the raw bytes rather than decoded text: everything the
   // router is not rewriting has to leave as the exact buffer that arrived, so
   // a malformed or non-UTF-8 byte can never be replaced on its way through.
@@ -325,7 +326,12 @@ export class ResponseUsageTransform extends Transform {
   }
 
   #observe(payload) {
+    if (payload?.type === "response.completed") this.#completedResponseObserved = true;
     const usage = tokenUsageFromPayload(payload);
     if (usage) this.#usage = usage;
+  }
+
+  completedResponseObserved() {
+    return this.#completedResponseObserved;
   }
 }

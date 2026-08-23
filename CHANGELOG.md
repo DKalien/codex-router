@@ -2,6 +2,12 @@
 
 ## Lite 分支（未发布）
 
+- 路由器重启现在会先停止接收新请求并 drain 在途请求；SSE 流收到明确的本地重启
+  terminal error 后 clean EOF，尚未发送响应头的请求返回 503，避免 `SIGKILL` 将
+  重启误报为网络 reset。`MODEL_ROUTER_SHUTDOWN_DRAIN_MS` 可调整 drain 时长。
+- 原生流在已经收到 `response.completed` 后客户端关闭时仍按 upstream status 和
+  Token usage 记录，不再误记为取消或 `0`；未完成的 native 流仍记录为取消。原生
+  GPT-5.6 请求会删除旧兼容字段 `prompt_cache_retention`，保留 `prompt_cache_options`。
 - MiMo 现在桥接 Codex custom tool 和协作历史：请求/响应在 custom tool 与 function
   之间双向转换，旧 `MESSAGE` 进度不再回放，已验收的 `FINAL_ANSWER` 继续保留。
   必须解析的原生协作载荷改为保序 4 路并发，并使用 24 小时、512 条/8 MiB 的进程内

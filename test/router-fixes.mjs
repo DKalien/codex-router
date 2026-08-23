@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -32,6 +32,24 @@ async function unusedPort() {
   const port = await listen(server);
   await close(server);
   return port;
+}
+
+function usageEvents(stateDir) {
+  const file = path.join(stateDir, "usage-events.jsonl");
+  if (!existsSync(file)) return [];
+  return readFileSync(file, "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+async function waitUntil(predicate, message, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(message);
 }
 
 async function startRouter(overrides = {}) {
@@ -97,6 +115,138 @@ test("无 content-type 的 SSE 仍能统计 Token 并原样透传", async () => 
     outputTokens: 3,
     totalTokens: 10,
   });
+  assert.equal(transform.completedResponseObserved(), true);
+});
+
+test("原生 GPT-5.6 删除旧 prompt_cache_retention 并保留 prompt_cache_options", async () => {
+  let upstreamBody;
+  const native = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    upstreamBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end('{"output":[]}');
+  });
+  const nativePort = await listen(native);
+  const router = await startRouter({
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${nativePort}/backend-api/codex`,
+  });
+
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/responses`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.6-sol",
+          input: "cache compatibility",
+          prompt_cache_retention: "24h",
+          prompt_cache_options: { retention: "24h" },
+          stream: false,
+        }),
+      },
+    );
+    assert.equal(response.status, 200, await response.text());
+    assert.equal(upstreamBody.prompt_cache_retention, undefined);
+    assert.deepEqual(upstreamBody.prompt_cache_options, { retention: "24h" });
+  } finally {
+    await router.close();
+    await close(native);
+  }
+});
+
+function cancelNativeTurnAfterMarker(port, body, marker) {
+  return new Promise((resolve) => {
+    const request = http.request(
+      {
+        host: "127.0.0.1",
+        port,
+        path: `/_codex-router/${callerKey}/v1/responses`,
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      },
+      (response) => {
+        let received = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          received += chunk;
+          if (received.includes(marker)) {
+            request.destroy();
+            resolve(received);
+          }
+        });
+      },
+    );
+    request.once("error", () => resolve(""));
+    request.end(JSON.stringify(body));
+  });
+}
+
+test("native 在 response.completed 后断开仍按上游状态和用量成功计量", async () => {
+  const native = http.createServer((_request, response) => {
+    response.writeHead(200);
+    response.write(
+      [
+        "event: response.completed",
+        `data: ${JSON.stringify({
+          type: "response.completed",
+          response: { usage: { input_tokens: 40, output_tokens: 4, total_tokens: 44 } },
+        })}`,
+        "",
+        "",
+      ].join("\n"),
+    );
+  });
+  const nativePort = await listen(native);
+  const router = await startRouter({
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${nativePort}/backend-api/codex`,
+    CODEX_ROUTER_NATIVE_RETRIES: "0",
+  });
+
+  try {
+    await cancelNativeTurnAfterMarker(
+      router.routerPort,
+      { model: "gpt-5.6-sol", input: "complete", stream: true },
+      '"type":"response.completed"',
+    );
+    await waitUntil(() => usageEvents(router.stateDir).length > 0, "未记录 native 用量");
+    const event = usageEvents(router.stateDir).at(-1);
+    assert.equal(event.provider, "openai");
+    assert.equal(event.status, 200);
+    assert.equal(event.inputTokens, 40);
+    assert.equal(event.outputTokens, 4);
+  } finally {
+    await router.close();
+    await close(native);
+  }
+});
+
+test("native 在 response.completed 前断开仍计量为 0", async () => {
+  const native = http.createServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.write(
+      'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"partial"}\n\n',
+    );
+  });
+  const nativePort = await listen(native);
+  const router = await startRouter({
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${nativePort}/backend-api/codex`,
+    CODEX_ROUTER_NATIVE_RETRIES: "0",
+  });
+
+  try {
+    await cancelNativeTurnAfterMarker(
+      router.routerPort,
+      { model: "gpt-5.6-sol", input: "cancel", stream: true },
+      "partial",
+    );
+    await waitUntil(() => usageEvents(router.stateDir).length > 0, "未记录 native 用量");
+    assert.equal(usageEvents(router.stateDir).at(-1).status, 0);
+  } finally {
+    await router.close();
+    await close(native);
+  }
 });
 
 test("独立 Web Search 请求只转发给原生后端", async () => {

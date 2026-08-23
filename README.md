@@ -20,9 +20,12 @@ Codex 的模型选择器，并在本地路由它们的请求。
 
 已移除两个服务商不需要的全部组件：LiteLLM 及其他网关或转发层、Python、OAuth
 流程、服务商预设、托盘/桌面应用和自动更新器。服务仅依赖 Node：`src/start.mjs`
-监督一个 `src/router.mjs` 子进程，不再启动额外的网关或转发进程。仓库保留的检查
-脚本是 `test/catalog-metadata.mjs`、`test/router-fixes.mjs`、
-`test/upstream-hardening.mjs`、`test/windows-service-process.mjs` 和 `scripts-check.mjs`。
+监督一个 `src/router.mjs` 子进程，不再启动额外的网关或转发进程。收到重启信号时，
+路由器先停止接收新请求，在途请求最多 drain 2 秒；流式请求收到 terminal error 后
+clean EOF，未发出响应头的请求返回 503。可用 `MODEL_ROUTER_SHUTDOWN_DRAIN_MS`
+调整 drain 时长。仓库保留的检查脚本是 `test/catalog-metadata.mjs`、
+`test/router-fixes.mjs`、`test/graceful-shutdown.mjs`、`test/upstream-hardening.mjs`、
+`test/windows-service-process.mjs` 和 `scripts-check.mjs`。
 
 ## 架构
 
@@ -42,8 +45,11 @@ Codex ──(config.toml: openai_base_url + model_catalog_json)──▶ router.
 - **模型元数据**：每个 WLB 条目精确复制其 `upstreamModel` 指定的原生条目，只修改
   带命名空间的 slug 和 WLB 显示名；找不到对应原生条目时构建会失败。MiMo 条目只
   使用 `src/catalog.mjs` 中明确列出的 Xiaomi 字段，不继承 GPT 元数据。
-- **原生辅助请求**：独立的 `/alpha/search` Web Search 和图片请求只转发给原生
+- **原生请求**：独立的 `/alpha/search` Web Search 和图片请求只转发给原生
   Codex 后端；上游省略 `content-type` 时，路由器也能识别 SSE 并统计 Token。
+  原生流在 `response.completed` 后才断开时仍按 upstream status/usage 记录，不再误记
+  为取消或 `0`；原生 GPT-5.6 请求会移除旧兼容字段 `prompt_cache_retention`，保留
+  `prompt_cache_options`。
 - **MiMo 长会话兼容**：Codex 的 custom tool 会在请求侧桥接为普通 function tool，
   JSON/SSE 响应再还原成 custom tool 事件。跨模型续接会保留已经验收的
   `FINAL_ANSWER`；标准协作 envelope 中的旧 `MESSAGE` 进度不发送给 MiMo，
@@ -100,7 +106,7 @@ owner 冲突。安装完成后完全退出并重新打开 Codex，使新的本�
   `node src/catalog.mjs`，再用 `node src/service.mjs restart` 重载路由器；模型
   选择器需要重新载入时再重启 Codex。
 - 检查：`node test/catalog-metadata.mjs`、
-  `node --test test/router-fixes.mjs test/upstream-hardening.mjs test/windows-service-process.mjs` 和
+  `node --test test/router-fixes.mjs test/graceful-shutdown.mjs test/upstream-hardening.mjs test/windows-service-process.mjs` 和
   `node scripts-check.mjs`。
 - 请求级调试：使用 `CODEX_ROUTER_REQUEST_LOG=1` 启动；HTTP/WS caller capability
   会自动脱敏，仍不要分享包含私有路径的日志。

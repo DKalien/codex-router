@@ -1423,6 +1423,16 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
   let upstreamRetries;
   try {
     if (!requireCodexTransport(request, response)) return;
+    const headers = nativeHeaders(request);
+    if (typeof headers.authorization !== "string" || !headers.authorization.trim()) {
+      writeJson(response, 401, {
+        error: {
+          type: "native_session_required",
+          message: "This native OpenAI route requires an active ChatGPT/Codex session.",
+        },
+      });
+      return;
+    }
     const encoded = await readRequestBody(request);
     const body = decodeBody(encoded, request.headers["content-encoding"]);
     const payload = parseBody(body);
@@ -1446,7 +1456,6 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
       }
     });
 
-    const headers = nativeHeaders(request);
     // Same replayable-Buffer rule as the turn path: encode once, outside the
     // retry, so every attempt carries identical bytes under identical headers.
     const imageBody = await compressedNativeBody(body, headers);

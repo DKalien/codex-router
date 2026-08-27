@@ -77,7 +77,7 @@ Codex ──(config.toml: openai_base_url + model_catalog_json)──▶ router.
 .\codex-router.ps1 status                       # 只读检查路由器、配置、目录和服务
 ```
 
-POSIX：`bin/install`、`bin/provider-key`、`bin/enable`、`bin/disable`、
+POSIX：`bin/install`（兼容入口 `install.sh`）、`bin/provider-key`、`bin/enable`、`bin/disable`、
 `bin/uninstall`、`bin/start`。状态检查使用
 `bin/model-router codex status`。状态命令只读取本地健康端点和配置，不会自动修复
 或请求上游服务；它只有在路由器健康、配置由本安装管理、目录精确包含 8 个模型
@@ -97,6 +97,9 @@ checkout 运行 `.\codex-router.ps1 install`；安装器会确保本机 caller s
 owner 冲突。安装完成后完全退出并重新打开 Codex，使新的本地 endpoint 生效。
 `node src/service.mjs restart` 只能重启已经登记的任务；如果 `schtasks /Run` 报错，
 请重新执行 install，Windows 策略拒绝任务登记时改用管理员 PowerShell。
+
+原生 Web Search 和图片请求必须携带当前 ChatGPT/Codex 会话的 `Authorization`；缺少
+该请求头时路由器直接返回 `401`，不会访问原生上游。
 
 ## 维护
 

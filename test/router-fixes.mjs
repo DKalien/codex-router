@@ -287,6 +287,43 @@ test("独立 Web Search 请求只转发给原生后端", async () => {
     });
     assert.match(startup.toString("utf8"), /\[codex-router\] listening/);
 
+    const unauthenticated = await fetch(
+      `http://127.0.0.1:${routerPort}/_codex-router/${callerKey}/v1/alpha/search?source=test`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.6-sol",
+          commands: { search_query: [{ q: "should not reach upstream" }] },
+        }),
+      },
+    );
+    assert.equal(unauthenticated.status, 401);
+    assert.deepEqual(await unauthenticated.json(), {
+      error: {
+        type: "native_session_required",
+        message: "This native OpenAI route requires an active ChatGPT/Codex session.",
+      },
+    });
+    assert.deepEqual(requests, []);
+
+    const unauthenticatedImage = await fetch(
+      `http://127.0.0.1:${routerPort}/_codex-router/${callerKey}/v1/images/generations`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: "should not reach upstream" }),
+      },
+    );
+    assert.equal(unauthenticatedImage.status, 401);
+    assert.deepEqual(await unauthenticatedImage.json(), {
+      error: {
+        type: "native_session_required",
+        message: "This native OpenAI route requires an active ChatGPT/Codex session.",
+      },
+    });
+    assert.deepEqual(requests, []);
+
     const response = await fetch(
       `http://127.0.0.1:${routerPort}/_codex-router/${callerKey}/v1/alpha/search?source=test`,
       {

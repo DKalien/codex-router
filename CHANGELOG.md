@@ -2,6 +2,11 @@
 
 ## Lite 分支（未发布）
 
+- Windows 启动失败后的监督进程退出改为等待 Node 自然排空句柄；原生 Search/Image
+  在缺少 ChatGPT/Codex `Authorization` 时本地 `401` 且不出网；Windows 服务状态现在
+  只有在计划任务为 Running 且 `service.pid` 对应进程通过路径校验时才报告运行中。
+- `install.sh` 收敛为 Lite `bin/install` 的兼容入口，移除已不存在的上游 `bin/setup`
+  及旧 provider/托盘参数。
 - 路由器重启现在会先停止接收新请求并 drain 在途请求；SSE 流收到明确的本地重启
   terminal error 后 clean EOF，尚未发送响应头的请求返回 503，避免 `SIGKILL` 将
   重启误报为网络 reset。`MODEL_ROUTER_SHUTDOWN_DRAIN_MS` 可调整 drain 时长。

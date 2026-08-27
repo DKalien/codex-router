@@ -89,7 +89,8 @@ supports_search_tool
 ## 路由和凭据
 
 对于原生 slug，`src/router.mjs` 使用白名单 Codex 请求头将请求转发给原生 Codex
-后端；独立的 `/alpha/search` 搜索请求和图片请求也只会转发给原生后端。原生 SSE
+后端；独立的 `/alpha/search` 搜索请求和图片请求也只会转发给原生后端，并且必须
+携带非空的 `Authorization`，否则本地直接返回 `401`，不访问上游。原生 SSE
 已经观察到 `response.completed` 后，即使客户端紧接着关闭连接，也按 upstream status
 和 Token usage 记录，不再误记为客户端取消或 `0`；尚未完成的 native 流仍记为客户端
 取消。GPT-5.6 原生请求会删除旧兼容字段 `prompt_cache_retention`，不影响

@@ -446,15 +446,24 @@ if (command === "render") {
 } else if (command === "status") {
   let installed = false;
   let state = "stopped";
+  let loaded = false;
   try {
     schtasks(["/Query", "/TN", taskName, "/FO", "LIST", "/V"]);
     installed = true;
-    state = taskState() || "ready";
+    state = "ready";
+    if (taskState() === "running") {
+      try {
+        loaded = Boolean(serviceProcessPid());
+      } catch {
+        // An unavailable or failed process query is not proof that the service is alive.
+      }
+      if (loaded) state = "running";
+    }
   } catch {
     // Missing task.
   }
   process.stdout.write(
-    `${JSON.stringify({ installed, loaded: state === "running", state })}\n`,
+    `${JSON.stringify({ installed, loaded, state })}\n`,
   );
 } else if (command === "stop") {
   // Stopping is idempotent, like uninstall and restart: a task that is missing

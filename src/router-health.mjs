@@ -19,8 +19,12 @@ export async function waitForRouterHealth({
   let lastError = "service unavailable";
   do {
     try {
+      const remainingMs = deadline - Date.now();
+      const probeTimeoutMs = timeoutMs <= 0
+        ? requestTimeoutMs
+        : Math.min(requestTimeoutMs, Math.max(0, remainingMs));
       const response = await fetchImpl(url, {
-        signal: AbortSignal.timeout(requestTimeoutMs),
+        signal: AbortSignal.timeout(probeTimeoutMs),
       });
       const body = await response.text();
       let payload = {};

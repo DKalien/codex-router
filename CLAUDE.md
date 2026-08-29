@@ -24,6 +24,8 @@
   提供时必须通过验证
 - `src/response-usage.mjs` — 从 JSON/SSE 响应提取 Token 用量；上游省略
   `content-type` 时也必须保持字节级透传和正确统计
+- `src/sse-prefix.mjs` — 有界识别省略 `content-type` 的 SSE 前缀，并按原顺序交还
+  探测期间缓存的字节
 - `src/mimo-custom-tools.mjs` — 只处理 MiMo 的 custom tool/agent message 兼容、
   旧 `MESSAGE` 进度裁剪和 JSON/SSE 响应还原
 - `src/start.mjs` — 监督唯一的路由器子进程并注入代理环境（`NODE_USE_ENV_PROXY=1`，
@@ -45,6 +47,13 @@
   `node scripts-check.mjs`。
 - 修改 `src/router.mjs` 或 `src/response-usage.mjs` 后，运行
   `node --test test/router-fixes.mjs`。
+- 修改 `src/response-usage.mjs`、`src/sse-prefix.mjs` 或
+  `src/mimo-custom-tools.mjs` 后，运行
+  `node --test test/response-usage-hardening.mjs`。
+- 修改 `src/http-utils.mjs`、`src/router.mjs` 或 `src/router-health.mjs` 的请求/响应
+  有界读取或健康 deadline 路径后，运行 `node --test test/http-health-bounds.mjs`。
+- 修改 `src/file-security.mjs` 或 `src/provider-credentials.mjs` 后，运行
+  `node --test test/credential-file-security.mjs`。
 - MiMo 兼容必须保持服务商隔离：标准 envelope 的旧 `MESSAGE` 进度不回放，
   `FINAL_ANSWER`、`NEW_TASK`、`FOLLOWUP_TASK` 仍保留；原生 GPT 和 WLB 不得应用
   MiMo 专属的历史裁剪或 custom-tool 映射。

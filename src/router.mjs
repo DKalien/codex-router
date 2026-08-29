@@ -23,6 +23,7 @@ import {
   httpErrorStatus,
   installGracefulShutdown,
   pipeResponse,
+  readResponseBody,
   readResponseTextLimited,
   readRequestBody,
   writeJson,
@@ -655,16 +656,14 @@ async function relayEncryptedAgentPayload(request, item, encrypted, signal) {
     body: JSON.stringify(body),
     signal,
   });
-  const bytes = Buffer.from(await upstream.arrayBuffer());
+  const bytes = await readResponseBody(upstream, {
+    maxBytes: 4 * 1024 * 1024,
+    signal,
+  });
   if (!upstream.ok) {
     const error = new Error(
       `Native collaboration payload relay failed with HTTP ${upstream.status}.`,
     );
-    error.status = 502;
-    throw error;
-  }
-  if (bytes.length > 4 * 1024 * 1024) {
-    const error = new Error("Native collaboration payload relay response is too large.");
     error.status = 502;
     throw error;
   }
@@ -954,9 +953,21 @@ async function summarize(request, payload, route, signal) {
     body: JSON.stringify(body),
     signal,
   });
-  const bytes = Buffer.from(await upstream.arrayBuffer());
-  if (bytes.length > 32 * 1024 * 1024) {
-    return { ok: false, status: 502, payload: { error: { message: "Compact response is too large." } } };
+  let bytes;
+  try {
+    bytes = await readResponseBody(upstream, {
+      maxBytes: 32 * 1024 * 1024,
+      signal,
+    });
+  } catch (error) {
+    if (error?.code === "ERR_UPSTREAM_RESPONSE_TOO_LARGE") {
+      return {
+        ok: false,
+        status: 502,
+        payload: { error: { message: "Compact response is too large." } },
+      };
+    }
+    throw error;
   }
   const parsed = JSON.parse(bytes.toString("utf8"));
   // Compaction is a plain non-streaming call, so the usage block (when the
@@ -1073,6 +1084,7 @@ function requireCodexTransport(request, response) {
 async function handleResponses(request, response, requestUrl) {
   const startedAt = Date.now();
   const activity = beginRequestActivity();
+  const controller = new AbortController();
   let clientGone = false;
   let requestedModel = "";
   let route;
@@ -1081,9 +1093,19 @@ async function handleResponses(request, response, requestUrl) {
   let usageTransform;
   let usage;
   let estimatedInputTokens;
+  request.once("aborted", () => {
+    clientGone = true;
+    controller.abort();
+  });
+  response.once("close", () => {
+    if (!response.writableEnded) {
+      clientGone = true;
+      controller.abort();
+    }
+  });
   try {
     if (!requireCodexTransport(request, response)) return;
-    const encoded = await readRequestBody(request);
+    const encoded = await readRequestBody(request, { signal: controller.signal });
     const body = decodeBody(encoded, request.headers["content-encoding"]);
     const payload = parseBody(body);
     requestedModel = typeof payload.model === "string" ? payload.model : "";
@@ -1127,18 +1149,6 @@ async function handleResponses(request, response, requestUrl) {
       route &&
       Array.isArray(payload.input) &&
       payload.input.at(-1)?.type === "compaction_trigger";
-
-    const controller = new AbortController();
-    request.once("aborted", () => {
-      clientGone = true;
-      controller.abort();
-    });
-    response.once("close", () => {
-      if (!response.writableEnded) {
-        clientGone = true;
-        controller.abort();
-      }
-    });
 
     if (route && (compactV1 || compactV2)) {
       const compaction = await handleRoutedCompaction(
@@ -1418,9 +1428,20 @@ async function handleResponses(request, response, requestUrl) {
 async function handleNativeRequest(request, response, requestUrl, defaultModel) {
   const startedAt = Date.now();
   const activity = beginRequestActivity();
+  const controller = new AbortController();
   let clientGone = false;
   let requestedModel = defaultModel;
   let upstreamRetries;
+  request.once("aborted", () => {
+    clientGone = true;
+    controller.abort();
+  });
+  response.once("close", () => {
+    if (!response.writableEnded) {
+      clientGone = true;
+      controller.abort();
+    }
+  });
   try {
     if (!requireCodexTransport(request, response)) return;
     const headers = nativeHeaders(request);
@@ -1433,7 +1454,7 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
       });
       return;
     }
-    const encoded = await readRequestBody(request);
+    const encoded = await readRequestBody(request, { signal: controller.signal });
     const body = decodeBody(encoded, request.headers["content-encoding"]);
     const payload = parseBody(body);
     requestedModel =
@@ -1442,18 +1463,6 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
       provider: "openai",
       model: requestedModel,
       ...activityMetadataFromHeaders(request.headers),
-    });
-
-    const controller = new AbortController();
-    request.once("aborted", () => {
-      clientGone = true;
-      controller.abort();
-    });
-    response.once("close", () => {
-      if (!response.writableEnded) {
-        clientGone = true;
-        controller.abort();
-      }
     });
 
     // Same replayable-Buffer rule as the turn path: encode once, outside the

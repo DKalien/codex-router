@@ -11,8 +11,9 @@ Codex Router Lite 是一个本地 Node 服务。它只有一个路由器进程�
   `~/.codex/codex-router/mimo-api-key.secret` 和
   `~/.codex/codex-router/wlb-api-key.secret`。可以通过
   `CODEX_ROUTER_STATE_DIR` 或 `MODEL_ROUTER_STATE_DIR` 指定其他状态目录。
-- 文件权限仅授予当前用户（POSIX 使用 `600`，Windows 使用当前用户 ACL）。前台
-  运行可以使用环境变量；后台服务应使用受保护的密钥文件。
+- 只从普通文件读取持久化密钥；符号链接、目录和读取失败的候选会被忽略。文件权限
+  仅授予当前用户：POSIX 使用 `600`，Windows 使用非继承 DACL，且只保留当前用户的
+  `FullControl` Allow 规则。前台运行可以使用环境变量；后台服务应使用受保护的密钥文件。
 - 密钥只用于创建上游 `Authorization` 请求头，不会写入模型目录、Codex 配置或
   日志。绝不能提交或粘贴密钥、完整的 caller URL 或真实状态目录中的文件。
 - 路由请求不会向第三方服务商转发 Codex 传入的账户或身份验证请求头。原生 GPT
@@ -49,6 +50,10 @@ MiMo 长会话中的 custom tool 和协作历史会先在本地转换为其支�
 caller capability、查询参数和控制字符会被遮盖或清理，quoted JSON 字段会保留合法
 结构，错误详情还会限制长度。这样既避免巨型错误体占用内存，也避免上游凭据进入
 Codex 响应。
+
+请求正文达到配置上限后不再保留后续字节，但会排空请求以保持 HTTP framing，并可由
+客户端断开信号终止。协作载荷 relay 和 compact 响应分别最多缓冲 4 MiB 与 32 MiB；
+超限时立即取消上游流，避免由上游控制的响应无界占用内存。
 
 ## 支持的运行环境和更新
 

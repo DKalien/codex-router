@@ -1,6 +1,8 @@
 import { Transform } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 
+import { HeaderlessSseDetector, stripLeadingBom } from "./sse-prefix.mjs";
+
 const CUSTOM_PARAMETERS = {
   type: "object",
   properties: { input: { type: "string" } },
@@ -8,8 +10,6 @@ const CUSTOM_PARAMETERS = {
   additionalProperties: false,
 };
 
-const SSE_FIELD_LINE = /^(?:event|data):/m;
-const SSE_SNIFF_BYTES = 512;
 const MAX_JSON_CAPTURE_BYTES = 8 * 1024 * 1024;
 const NATIVE_ENCRYPTED_CONTENT = /^gAAAAA[A-Za-z0-9_-]+={0,2}$/;
 
@@ -189,6 +189,7 @@ export function convertMimoResponseJson(payload, names) {
 function parseSseData(block) {
   const data = block
     .split(/\r?\n/)
+    .map((line) => stripLeadingBom(line))
     .filter((line) => line.startsWith("data:"))
     .map((line) => line.slice(5).trimStart())
     .join("\n")
@@ -206,13 +207,15 @@ function renderSseEvent(block, event) {
   const rendered = [];
   let dataWritten = false;
   for (const line of lines) {
-    if (line.startsWith("event:")) {
-      rendered.push(`event: ${event.type}`);
+    const bom = line.startsWith("\uFEFF") ? "\uFEFF" : "";
+    const content = stripLeadingBom(line);
+    if (content.startsWith("event:")) {
+      rendered.push(`${bom}event: ${event.type}`);
       continue;
     }
-    if (line.startsWith("data:")) {
+    if (content.startsWith("data:")) {
       if (!dataWritten) {
-        rendered.push(`data: ${JSON.stringify(event)}`);
+        rendered.push(`${bom}data: ${JSON.stringify(event)}`);
         dataWritten = true;
       }
       continue;
@@ -231,7 +234,7 @@ export class MimoCustomToolCallTransform extends Transform {
   #names;
   #eventStream;
   #json;
-  #undecided;
+  #headerlessDetector;
   #decoder = new StringDecoder("utf8");
   #sseBuffer = "";
   #jsonBuffer = Buffer.alloc(0);
@@ -244,26 +247,42 @@ export class MimoCustomToolCallTransform extends Transform {
     const declared = String(contentType).toLowerCase();
     this.#eventStream = declared.includes("text/event-stream");
     this.#json = declared.includes("json");
-    this.#undecided = !this.#eventStream && !this.#json;
+    this.#headerlessDetector =
+      !this.#eventStream && !this.#json && this.#names.size
+        ? new HeaderlessSseDetector()
+        : undefined;
   }
 
   _transform(chunk, _encoding, callback) {
-    if (this.#undecided && chunk.length) {
-      const text = chunk.subarray(0, SSE_SNIFF_BYTES).toString("utf8");
-      this.#undecided = false;
-      if (SSE_FIELD_LINE.test(text)) this.#eventStream = true;
-      else if (/^\s*[\[{]/.test(text)) this.#json = true;
-      else this.#passthrough = true;
+    if (this.#headerlessDetector) {
+      const detected = this.#headerlessDetector.write(chunk);
+      if (detected.decision === "pending") {
+        callback();
+        return;
+      }
+      this.#headerlessDetector = undefined;
+      this.#eventStream = detected.decision === "event-stream";
+      if (!this.#eventStream) {
+        const prefix = detected.chunks[0] || Buffer.alloc(0);
+        this.#json = /^\s*[\[{]/.test(prefix.subarray(0, 512).toString("utf8"));
+        this.#passthrough = !this.#json;
+      }
+      for (const buffered of detected.chunks) this.#transformChunk(buffered);
+      callback();
+      return;
     }
+    this.#transformChunk(chunk);
+    callback();
+  }
+
+  #transformChunk(chunk) {
     if (this.#passthrough || !this.#names.size) {
       this.push(chunk);
-      callback();
       return;
     }
     if (this.#eventStream) {
       this.#sseBuffer += this.#decoder.write(chunk);
       this.#emitSseEvents();
-      callback();
       return;
     }
     if (this.#json) {
@@ -275,14 +294,23 @@ export class MimoCustomToolCallTransform extends Transform {
         this.#jsonBuffer = Buffer.alloc(0);
         this.#passthrough = true;
       }
-      callback();
       return;
     }
     this.push(chunk);
-    callback();
   }
 
   _flush(callback) {
+    if (this.#headerlessDetector) {
+      const detected = this.#headerlessDetector.end();
+      this.#headerlessDetector = undefined;
+      this.#eventStream = detected.decision === "event-stream";
+      if (!this.#eventStream) {
+        const prefix = detected.chunks[0] || Buffer.alloc(0);
+        this.#json = /^\s*[\[{]/.test(prefix.subarray(0, 512).toString("utf8"));
+        this.#passthrough = !this.#json;
+      }
+      for (const buffered of detected.chunks) this.#transformChunk(buffered);
+    }
     if (this.#passthrough || !this.#names.size) {
       callback();
       return;

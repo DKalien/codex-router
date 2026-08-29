@@ -24,7 +24,9 @@ Codex 的模型选择器，并在本地路由它们的请求。
 路由器先停止接收新请求，在途请求最多 drain 2 秒；流式请求收到 terminal error 后
 clean EOF，未发出响应头的请求返回 503。可用 `MODEL_ROUTER_SHUTDOWN_DRAIN_MS`
 调整 drain 时长。仓库保留的检查脚本是 `test/catalog-metadata.mjs`、
-`test/router-fixes.mjs`、`test/graceful-shutdown.mjs`、`test/upstream-hardening.mjs`、
+`test/router-fixes.mjs`、`test/response-usage-hardening.mjs`、
+`test/http-health-bounds.mjs`、`test/credential-file-security.mjs`、
+`test/graceful-shutdown.mjs`、`test/upstream-hardening.mjs`、
 `test/windows-service-process.mjs` 和 `scripts-check.mjs`。
 
 ## 架构
@@ -46,7 +48,8 @@ Codex ──(config.toml: openai_base_url + model_catalog_json)──▶ router.
   带命名空间的 slug 和 WLB 显示名；找不到对应原生条目时构建会失败。MiMo 条目只
   使用 `src/catalog.mjs` 中明确列出的 Xiaomi 字段，不继承 GPT 元数据。
 - **原生请求**：独立的 `/alpha/search` Web Search 和图片请求只转发给原生
-  Codex 后端；上游省略 `content-type` 时，路由器也能识别 SSE 并统计 Token。
+  Codex 后端；上游省略 `content-type` 时，即使 SSE 字段被拆到多个 chunk，或前面
+  带 BOM、注释和空行，路由器也能识别并统计 Token，同时保持原始字节不变。
   原生流在 `response.completed` 后才断开时仍按 upstream status/usage 记录，不再误记
   为取消或 `0`；原生 GPT-5.6 请求会移除旧兼容字段 `prompt_cache_retention`，保留
   `prompt_cache_options`。
@@ -55,11 +58,15 @@ Codex ──(config.toml: openai_base_url + model_catalog_json)──▶ router.
   `FINAL_ANSWER`；标准协作 envelope 中的旧 `MESSAGE` 进度不发送给 MiMo，
   `NEW_TASK` 和 `FOLLOWUP_TASK` 仍保留。第三方路由必须解析原生加密协作载荷时，
   会按原顺序最多 4 路并发；解密结果保存在进程内 LRU 缓存，逻辑 TTL 为 24 小时，
-  最多 512 条或 8 MiB。
+  最多 512 条或 8 MiB。路由器估算第三方输入 Token 时不再把不会发送给模型的
+  `encrypted_content` 密文计入提示词大小。
 - **错误和日志安全**：请求日志默认关闭；启用后会自动遮盖 HTTP/WS caller URL
   中的 capability。普通路由请求的第三方上游错误体最多读取 64 KiB，返回前会遮盖 Bearer、token、
   key、secret、caller capability、查询参数和控制字符；可解析的 quoted JSON 字段仍保留
-  合法的 JSON 结构。
+  合法的 JSON 结构。请求正文超限后会停止缓存、排空余流，并允许客户端断开信号
+  终止读取；协作载荷 relay 和 compact 响应分别最多缓冲 4 MiB 与 32 MiB。
+- **凭据文件**：持久化密钥只从普通文件读取，符号链接和目录会被忽略。Windows
+  写入时会用仅包含当前用户 `FullControl` 的非继承 DACL 替换旧 ACL。
 - **代理**：原生上游请求通过 `NODE_USE_ENV_PROXY` 使用 `HTTPS_PROXY`（默认
   `http://127.0.0.1:7897`，即 Clash 混合端口）；WLB 和 MiMo 域名默认加入
   `NO_PROXY` 并保持 DIRECT。
@@ -109,7 +116,7 @@ owner 冲突。安装完成后完全退出并重新打开 Codex，使新的本�
   `node src/catalog.mjs`，再用 `node src/service.mjs restart` 重载路由器；模型
   选择器需要重新载入时再重启 Codex。
 - 检查：`node test/catalog-metadata.mjs`、
-  `node --test test/router-fixes.mjs test/graceful-shutdown.mjs test/upstream-hardening.mjs test/windows-service-process.mjs` 和
+  `node --test test/router-fixes.mjs test/response-usage-hardening.mjs test/http-health-bounds.mjs test/credential-file-security.mjs test/graceful-shutdown.mjs test/upstream-hardening.mjs test/windows-service-process.mjs` 和
   `node scripts-check.mjs`。
 - 请求级调试：使用 `CODEX_ROUTER_REQUEST_LOG=1` 启动；HTTP/WS caller capability
   会自动脱敏，仍不要分享包含私有路径的日志。

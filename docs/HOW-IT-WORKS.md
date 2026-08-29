@@ -29,8 +29,8 @@ sequenceDiagram
   R-->>C: 响应或数据流
 ```
 
-`src/start.mjs` 监督这一个路由器子进程，并等待其健康检查通过。健康探针会排空
-响应体以保持连接可复用；路由器对客户端连接池使用 120 秒 keep-alive，并为中途
+`src/start.mjs` 监督这一个路由器子进程，并等待其健康检查通过。每次健康探针的超时
+不会超过整体等待 deadline，成功响应会排空响应体以保持连接可复用；路由器对客户端连接池使用 120 秒 keep-alive，并为中途
 断流写入独立的 usage 标记。收到 `SIGINT`/`SIGTERM` 时，路由器停止接收新请求，
 在途请求最多 drain 2 秒；已开始的 SSE 会收到本地重启 terminal error 后 clean EOF，
 尚未发送响应头的请求返回 503。`src/start.mjs` 的强杀 backstop 会覆盖 drain 和 flush
@@ -101,6 +101,12 @@ supports_search_tool
 服务商。数据流会直接透传；`/responses/compact` 使用相同的直连路径，并在需要时
 生成由路由器管理的续接摘要。
 
+上游省略 `content-type` 时，`src/sse-prefix.mjs` 会在最多 512 bytes 的前缀内识别
+SSE。字段名可跨 chunk，开头允许 UTF-8 BOM、注释和空行；探测期间缓存的原始字节会
+按顺序交回响应处理器。Token 用量统计和 MiMo custom tool 还原共用该判定，非 SSE
+响应则保持原路径。第三方输入 Token 的兜底估算会扣除 `encrypted_content` 字符串值，
+因为这些密文不是模型可见提示词；未知字段仍默认计入，保持向上估算。
+
 MiMo 的 Responses 网关不接受 Codex 扩展的 `custom_tool_call` 和 `agent_message`。
 路由器因此在 MiMo 路径上增加专属转换：custom tool 定义和历史调用以带单个
 `input` 字符串参数的 function tool 上送，JSON/SSE 中对应的 function call 再还原为
@@ -128,7 +134,13 @@ Bearer、token、key、secret、caller capability、查询参数和控制字符�
 
 服务商密钥通常保存在受保护的状态目录中（默认为
 `~/.codex/codex-router/`）。`provider-key set` 会写入密钥并启用该服务商；环境
-变量密钥可供前台进程使用，但后台服务不会自动继承。
+变量密钥可供前台进程使用，但后台服务不会自动继承。持久化凭据只从普通文件读取，
+符号链接、目录和读取失败的候选会被忽略；Windows 写入会用仅含当前用户
+`FullControl` 的非继承 DACL 替换现有 ACL。
+
+请求正文超限后，路由器停止缓存新字节并排空剩余请求，客户端断开仍可中止读取。
+协作载荷 relay 和 compact 响应分别最多缓冲 4 MiB 与 32 MiB，超限会立即取消上游
+流；这些限制在数据到达时执行，不会先由 `arrayBuffer()` 无界收集。
 
 路由器只监听回环地址，并在读取请求前检查每次安装生成的 caller 凭据。
 `src/start.mjs` 设置 `NODE_USE_ENV_PROXY=1` 并将 `HTTP_PROXY`/`HTTPS_PROXY`
@@ -142,7 +154,7 @@ Bearer、token、key、secret、caller capability、查询参数和控制字符�
 ```sh
 node src/catalog.mjs
 node test/catalog-metadata.mjs
-node --test test/router-fixes.mjs test/graceful-shutdown.mjs test/windows-service-process.mjs
+node --test test/router-fixes.mjs test/response-usage-hardening.mjs test/http-health-bounds.mjs test/credential-file-security.mjs test/graceful-shutdown.mjs test/upstream-hardening.mjs test/windows-service-process.mjs
 node scripts-check.mjs
 ```
 
@@ -171,6 +183,7 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | `src/router.mjs` | caller 验证、模型分发、原生搜索/图片、协作载荷 relay、直接转发、数据流和压缩摘要 |
 | `src/mimo-custom-tools.mjs` | MiMo custom tool/agent message 的请求转换、历史裁剪和 JSON/SSE 响应还原 |
 | `src/response-usage.mjs` | 从 JSON 或 SSE 响应提取 Token 用量并保持响应透传 |
+| `src/sse-prefix.mjs` | 有界识别无 `content-type` 的 SSE 并保持探测字节顺序 |
 | `src/catalog.mjs` | 捕获原生目录并生成 8 条目的合并目录 |
 | `src/model-registry.mjs` | 加载并验证服务商和模型 |
 | `src/start.mjs` | 监督一个路由器子进程并提供代理环境 |
@@ -179,6 +192,9 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | `config/mimo/`、`config/wlb/` | 两个服务商的描述文件和模型片段 |
 | `test/catalog-metadata.mjs` | 检查 WLB 精确复制和 MiMo 字段集合 |
 | `test/router-fixes.mjs` | 检查路由、MiMo 历史兼容、relay 并发/缓存、统计、脱敏、有界错误和流式 idle timeout |
+| `test/response-usage-hardening.mjs` | 检查 split/BOM SSE、字节透传、MiMo 还原和密文 Token 估算 |
+| `test/http-health-bounds.mjs` | 检查请求 drain/中止、响应超限取消和健康 deadline |
+| `test/credential-file-security.mjs` | 检查凭据 symlink/非文件拒绝和 Windows ACL 规范化 |
 | `test/graceful-shutdown.mjs` | 检查重启 drain、SSE terminal error、503 fallback 和 idle keep-alive 快速退出 |
 | `test/upstream-hardening.mjs` | 检查健康响应排空、keep-alive 参数、错误 cause 链和断流 usage 标记 |
 | `test/windows-service-process.mjs` | 检查 Windows PID 登记、进程树停止和误杀防护 |

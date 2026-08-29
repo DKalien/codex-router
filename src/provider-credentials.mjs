@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -141,10 +142,20 @@ export function resolveProviderCredential(providerOrId, options = {}) {
     }
   }
   for (const candidate of credentialPaths(provider)) {
-    if (!existsSync(candidate)) continue;
-    const value = readFileSync(candidate, "utf8").trim();
-    if (value) {
-      return { value, source: `protected file (${candidate})`, persistent: true };
+    let candidateStat;
+    try {
+      candidateStat = lstatSync(candidate);
+    } catch {
+      continue;
+    }
+    if (candidateStat.isSymbolicLink() || !candidateStat.isFile()) continue;
+    try {
+      const value = readFileSync(candidate, "utf8").trim();
+      if (value) {
+        return { value, source: `protected file (${candidate})`, persistent: true };
+      }
+    } catch {
+      // An unreadable or non-text file is not a usable credential source.
     }
   }
   const keychain = keyFromKeychain(provider);

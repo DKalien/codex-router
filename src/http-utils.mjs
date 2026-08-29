@@ -117,6 +117,7 @@ export function installGracefulShutdown(
 }
 
 export const MAX_UPSTREAM_ERROR_BYTES = 64 * 1024;
+export const MAX_BUFFERED_RESPONSE_BYTES = 8 * 1024 * 1024;
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000;
 export const MIN_STREAM_IDLE_TIMEOUT_MS = 10;
 export const MAX_STREAM_IDLE_TIMEOUT_MS = 15 * 60_000;
@@ -168,19 +169,116 @@ export async function readResponseTextLimited(response, maxBytes = MAX_UPSTREAM_
   }
 }
 
-export async function readRequestBody(request) {
+function abortReason(signal) {
+  if (signal?.reason instanceof Error) return signal.reason;
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
+  return error;
+}
+
+function readWithAbort(reader, signal) {
+  if (!signal) return reader.read();
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      void reader.cancel().catch(() => {});
+      cleanup();
+      reject(abortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    reader.read().then(
+      (result) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(result);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
+export async function readResponseBody(
+  response,
+  { maxBytes = MAX_BUFFERED_RESPONSE_BYTES, signal } = {},
+) {
+  if (!response?.body) return Buffer.alloc(0);
+  const configuredLimit = Number(maxBytes);
+  const limit = Number.isFinite(configuredLimit) && configuredLimit >= 0
+    ? Math.floor(configuredLimit)
+    : MAX_BUFFERED_RESPONSE_BYTES;
+  const reader = response.body.getReader();
   const chunks = [];
   let total = 0;
-  for await (const chunk of request) {
-    total += chunk.length;
-    if (total > MAX_BODY_BYTES) {
-      const error = new Error(`Request body exceeds ${MAX_BODY_BYTES} bytes.`);
-      error.status = 413;
-      throw error;
+  try {
+    while (true) {
+      const result = await readWithAbort(reader, signal);
+      if (result.done) break;
+      const chunk = result.value instanceof Uint8Array
+        ? result.value
+        : new Uint8Array(result.value || []);
+      total += chunk.byteLength;
+      if (total > limit) {
+        await reader.cancel("upstream response body limit reached").catch(() => {});
+        const error = new Error(`Upstream response exceeds ${limit} bytes.`);
+        error.status = 502;
+        error.code = "ERR_UPSTREAM_RESPONSE_TOO_LARGE";
+        throw error;
+      }
+      chunks.push(Buffer.from(chunk));
     }
-    chunks.push(chunk);
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock?.();
   }
-  return Buffer.concat(chunks);
+  return Buffer.concat(chunks, total);
+}
+
+export async function readRequestBody(
+  request,
+  { maxBytes = MAX_BODY_BYTES, signal } = {},
+) {
+  const chunks = [];
+  let total = 0;
+  const configuredLimit = Number(maxBytes);
+  const limit = Number.isFinite(configuredLimit) && configuredLimit >= 0
+    ? Math.floor(configuredLimit)
+    : MAX_BODY_BYTES;
+  let overflow;
+  const onAbort = () => request?.destroy?.(abortReason(signal));
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    for await (const chunk of request) {
+      if (overflow) continue;
+      const bytes = chunk instanceof Uint8Array ? chunk : Buffer.from(chunk);
+      total += bytes.byteLength;
+      if (total > limit) {
+        // Stop retaining caller-controlled bytes immediately, but keep consuming
+        // the stream so the response can stay keep-alive and the next request
+        // cannot be parsed out of the rejected body's tail.
+        overflow = new Error(`Request body exceeds ${limit} bytes.`);
+        overflow.status = 413;
+        continue;
+      }
+      chunks.push(bytes);
+    }
+    if (overflow) throw overflow;
+    if (signal?.aborted) throw abortReason(signal);
+    return Buffer.concat(chunks);
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+  }
 }
 
 export function writeJson(response, status, payload) {

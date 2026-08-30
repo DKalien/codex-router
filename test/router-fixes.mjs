@@ -156,6 +156,81 @@ test("原生 GPT-5.6 删除旧 prompt_cache_retention 并保留 prompt_cache_opt
   }
 });
 
+test("native 丢弃不可回放 reasoning 并保留合法 reasoning 和普通消息", async () => {
+  let upstreamBody;
+  const native = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    upstreamBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end('{"output":[]}');
+  });
+  const nativePort = await listen(native);
+  const router = await startRouter({
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${nativePort}/backend-api/codex`,
+  });
+  const opaqueEncryptedContent = "gAAAAABnative-opaque";
+
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/responses`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "gpt-5.6-sol",
+          input: [
+            {
+              type: "reasoning",
+              id: "rs_mimo",
+              summary: [],
+              content: [{ type: "reasoning_text", text: "MiMo reasoning" }],
+              encrypted_content: null,
+            },
+            { type: "reasoning", id: "rs_missing", summary: [] },
+            {
+              type: "reasoning",
+              id: "rs_plain",
+              summary: [],
+              encrypted_content: "plaintext-token",
+            },
+            {
+              type: "reasoning",
+              id: "rs_native",
+              summary: [{ type: "summary_text", text: "Native summary" }],
+              content: [{ type: "reasoning_text", text: "output-only content" }],
+              encrypted_content: opaqueEncryptedContent,
+            },
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "ordinary user message" }],
+            },
+          ],
+          stream: false,
+        }),
+      },
+    );
+    assert.equal(response.status, 200, await response.text());
+    assert.deepEqual(upstreamBody.input, [
+      {
+        type: "reasoning",
+        id: "rs_native",
+        summary: [{ type: "summary_text", text: "Native summary" }],
+        encrypted_content: opaqueEncryptedContent,
+      },
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "ordinary user message" }],
+      },
+    ]);
+  } finally {
+    await router.close();
+    await close(native);
+  }
+});
+
 function cancelNativeTurnAfterMarker(port, body, marker) {
   return new Promise((resolve) => {
     const request = http.request(

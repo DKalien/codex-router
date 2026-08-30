@@ -57,6 +57,9 @@
 - MiMo 兼容必须保持服务商隔离：标准 envelope 的旧 `MESSAGE` 进度不回放，
   `FINAL_ANSWER`、`NEW_TASK`、`FOLLOWUP_TASK` 仍保留；原生 GPT 和 WLB 不得应用
   MiMo 专属的历史裁剪或 custom-tool 映射。
+- 切回原生 GPT 时，只能回放 `encrypted_content` 符合原生 `gAAAAA...` token
+  形状的 `reasoning`；其他服务商的 reasoning 必须整项丢弃，合法项也必须移除仅
+  用于输出的 `content`，避免 `store=false` 下引用未持久化的外部 item。
 - 修改 `src/start.mjs` 或 `src/service-windows.mjs` 后，运行
   `node --test test/windows-service-process.mjs`。
 - 修改 `src/http-utils.mjs` 的 graceful shutdown 路径后，运行

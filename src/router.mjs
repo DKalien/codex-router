@@ -749,17 +749,13 @@ async function bridgeVisionInput(input, _route, _request) {
 // plain-text reasoning summary. Codex stores those items, and when the
 // conversation is later replayed to OpenAI's native Responses API, OpenAI
 // rejects the undecryptable blob with "Encrypted content could not be decrypted
-// or parsed." Strip the non-opaque value before sending to native; the item's
-// `summary` still carries the readable reasoning.
-function isOpaqueEncryptedContent(value) {
-  return typeof value === "string" && value.length > 0 && !/\s/.test(value);
-}
-
+// or parsed." Reasoning without a valid opaque token cannot be replayed and is
+// dropped; valid items keep `summary` but lose output-only `content`.
 function sanitizeReasoningForNative(item) {
-  if (item?.encrypted_content === undefined) return item;
-  if (isOpaqueEncryptedContent(item.encrypted_content)) return item;
-  const { encrypted_content, ...rest } = item;
-  return rest;
+  if (!isNativeEncryptedToken(item?.encrypted_content)) return undefined;
+  const sanitized = { ...item };
+  delete sanitized.content;
+  return sanitized;
 }
 
 // The mirror of normalizeRoutedAgentInput. When the parent agent is routed, its
@@ -819,14 +815,16 @@ function sanitizeCollaborationForNative(item) {
 
 function normalizeNativeInput(input) {
   if (!Array.isArray(input)) return input;
-  return input.map((item) => {
-    if (item?.type === "reasoning") return sanitizeReasoningForNative(item);
-    if (item?.type !== "compaction") return sanitizeCollaborationForNative(item);
-    const summary = decodeSummary(item.encrypted_content);
-    return summary === undefined
-      ? item
-      : messageItem(`${SUMMARY_PREFIX}\n\n${summary}`);
-  });
+  return input
+    .map((item) => {
+      if (item?.type === "reasoning") return sanitizeReasoningForNative(item);
+      if (item?.type !== "compaction") return sanitizeCollaborationForNative(item);
+      const summary = decodeSummary(item.encrypted_content);
+      return summary === undefined
+        ? item
+        : messageItem(`${SUMMARY_PREFIX}\n\n${summary}`);
+    })
+    .filter((item) => item !== undefined);
 }
 
 function normalizeNativePromptCacheCompatibility(payload) {

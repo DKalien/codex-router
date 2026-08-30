@@ -59,7 +59,8 @@ Codex ──(config.toml: openai_base_url + model_catalog_json)──▶ router.
   `NEW_TASK` 和 `FOLLOWUP_TASK` 仍保留。第三方路由必须解析原生加密协作载荷时，
   会按原顺序最多 4 路并发；解密结果保存在进程内 LRU 缓存，逻辑 TTL 为 24 小时，
   最多 512 条或 8 MiB。路由器估算第三方输入 Token 时不再把不会发送给模型的
-  `encrypted_content` 密文计入提示词大小。
+  `encrypted_content` 密文计入提示词大小。切回原生 GPT 时，没有原生加密上下文的
+  第三方 reasoning 会被丢弃，不会作为未持久化的 `rs_*` item 继续回放。
 - **错误和日志安全**：请求日志默认关闭；启用后会自动遮盖 HTTP/WS caller URL
   中的 capability。普通路由请求的第三方上游错误体最多读取 64 KiB，返回前会遮盖 Bearer、token、
   key、secret、caller capability、查询参数和控制字符；可解析的 quoted JSON 字段仍保留

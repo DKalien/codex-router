@@ -94,7 +94,10 @@ supports_search_tool
 已经观察到 `response.completed` 后，即使客户端紧接着关闭连接，也按 upstream status
 和 Token usage 记录，不再误记为客户端取消或 `0`；尚未完成的 native 流仍记为客户端
 取消。GPT-5.6 原生请求会删除旧兼容字段 `prompt_cache_retention`，不影响
-`prompt_cache_options`。对于带命名
+`prompt_cache_options`。当会话从第三方模型切回原生 GPT 时，路由器只保留
+`encrypted_content` 符合原生 `gAAAAA...` token 形状的 reasoning，并移除仅用于
+输出的 `content`；没有原生加密上下文的外部 reasoning 会整项丢弃，避免
+`store=false` 请求引用并未在 OpenAI 持久化的外部 `rs_*` item。对于带命名
 空间的 slug，它会解析服务商，将模型名替换为 `upstreamModel`，
 读取对应密钥，再使用服务商的 `Authorization` 请求头直接发送
 `POST <provider base URL>/responses`。Codex 的账户和安装凭据不会发送给第三方

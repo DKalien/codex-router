@@ -2,6 +2,9 @@
 
 ## Lite 分支（未发布）
 
+- 从 MiMo 等第三方模型切回原生 GPT 时，只回放带符合原生 token 形状加密上下文的
+  reasoning；其他 reasoning 整项丢弃，合法项移除 output-only `content`，避免
+  `store=false` 下的 schema 拒绝和未持久化 `rs_*` item 404。
 - 无 `content-type` 的 SSE 现在使用共享的有界前缀探测：支持跨 chunk 字段、UTF-8
   BOM、注释和空行，并在 Token 统计及 MiMo custom tool 还原路径保持原始字节顺序。
   第三方输入 Token 兜底估算不再把模型不可见的 `encrypted_content` 密文计入提示词。

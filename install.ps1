@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   [switch]$PrepareOnly,
   [switch]$ForceDeps,
@@ -49,10 +49,6 @@ try {
   New-Item -ItemType Directory -Force -Path $CodexHome | Out-Null
   & node src/legacy-migration.mjs assert-clear | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "Resolve the detected older router before installing." }
-  if (-not $PrepareOnly) {
-    & node src/provider-selection.mjs ensure-configured | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "Configure at least one provider before installing." }
-  }
 
   # Lite: dependency steps are skipped when their output directories already
   # exist; -ForceDeps rebuilds them.
@@ -66,19 +62,9 @@ try {
 
   & node src/secret.mjs ensure
   if ($LASTEXITCODE -ne 0) { throw "Local router-key setup failed." }
-  $StateRoot = if ($env:MODEL_ROUTER_STATE_DIR) { $env:MODEL_ROUTER_STATE_DIR }
-    elseif ($env:CODEX_ROUTER_STATE_DIR) { $env:CODEX_ROUTER_STATE_DIR }
-    elseif ($env:CODEX_HOME) { Join-Path $env:CODEX_HOME "codex-router" }
-    else { Join-Path $HOME ".codex\codex-router" }
-  if (Test-Path (Join-Path $StateRoot "native-models.json")) {
-    & node src/catalog.mjs
-  } else {
-    & node src/catalog.mjs --refresh-native
-  }
-  if ($LASTEXITCODE -ne 0) { throw "Codex model-catalog generation failed." }
 
   if ($PrepareOnly) {
-    Write-Host "Dependencies and generated files are prepared; application configuration was not changed."
+    Write-Host "依赖和本地路由器文件已准备好；未修改应用配置。"
     exit 0
   }
 
@@ -101,9 +87,9 @@ try {
     if ($ConfigEnabled) { & node $ConfigManager disable 2>$null | Out-Null }
     throw
   }
-  Write-Host "Installed the selected external model routes. Fully quit and reopen Codex."
-  Write-Host "MiMo API key: .\codex-router.ps1 provider-key mimo-token-plan set"
-  Write-Host "WLB API key:  .\codex-router.ps1 provider-key wlb-relay set"
+  Write-Host "路由器已安装；Codex 默认继续使用官方模型目录。请完全退出并重新打开 Codex，以加载受管理的本地 endpoint。"
+  Write-Host "MiMo API 密钥：.\codex-router.ps1 provider-key mimo-token-plan set"
+  Write-Host "WLB API 密钥： .\codex-router.ps1 provider-key wlb-relay set"
 } finally {
   Pop-Location
 }

@@ -2,6 +2,13 @@
 
 ## Lite 分支（未发布）
 
+- 默认安装改用 Codex 官方模型目录，不再构建或写入 `model_catalog_json`；
+  `/models` 透传官方身份、查询参数和完整元数据，旧命名空间目录保留为手动工具。
+- 新增全局 `route official|wlb|status`：GPT 请求可热切换官方或 WLB 同名模型，
+  WLB 未注册的模型返回 `409`，不自动回退官方。
+- 修复安装时漏识别 `[features.multi_agent_v2]` 子表而重复注入配置的问题，
+  保留用户已有设置，避免 Codex 重启后因 TOML duplicate key 无法加载配置。
+
 - 从 MiMo 等第三方模型切回原生 GPT 时，只回放带符合原生 token 形状加密上下文的
   reasoning；其他 reasoning 整项丢弃，合法项移除 output-only `content`，避免
   `store=false` 下的 schema 拒绝和未持久化 `rs_*` item 404。

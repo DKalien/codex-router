@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -99,6 +99,87 @@ async function startRouter(overrides = {}) {
     },
   };
 }
+
+test("官方目录的 GPT 路由可热切换并保持模型对应，错误不回退官方", async () => {
+  const received = [];
+  const catalog = { models: [{ slug: "gpt-new-model", context_window: 123456, future_capability: true }] };
+  const upstream = (provider) => http.createServer(async (request, response) => {
+    if (request.method === "GET") {
+      received.push({ provider, url: request.url, authorization: request.headers.authorization });
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify(catalog));
+      return;
+    }
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    received.push({ provider, model: body.model, authorization: request.headers.authorization });
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "摘要" }] }],
+      usage: { input_tokens: 5, output_tokens: 2 },
+    }));
+  });
+  const official = upstream("official");
+  const wlb = upstream("wlb");
+  const officialPort = await listen(official);
+  const wlbPort = await listen(wlb);
+  const router = await startRouter({
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${officialPort}`,
+    WLB_BASE_URL: `http://127.0.0.1:${wlbPort}`,
+    WLB_API_KEY: "test-wlb-key",
+  });
+  const cli = (command, extraEnv = {}) => spawnSync(process.execPath, [path.join(root, "src/gpt-route.mjs"), command], {
+    encoding: "utf8",
+    env: { ...process.env, CODEX_HOME: router.stateDir, MODEL_ROUTER_STATE_DIR: router.stateDir, WLB_API_KEY: "test-wlb-key", ...extraEnv },
+  });
+  const request = async (model, endpoint = "responses") => {
+    const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/${endpoint}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer test-official-key" },
+      body: JSON.stringify({ model, input: [{ role: "user", content: "你好" }], stream: false }),
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  try {
+    assert.match(cli("status").stdout, /official/);
+    assert.equal((await request("gpt-5.6-sol")).status, 200);
+    assert.equal(received.at(-1).provider, "official");
+    assert.equal(received.at(-1).authorization, "Bearer test-official-key");
+    assert.equal(cli("wlb", { WLB_API_KEY: "" }).status, 1);
+    assert.match(cli("status").stdout, /official/);
+    const switched = cli("wlb");
+    assert.equal(switched.status, 0, switched.stderr);
+    const models = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/models?client_version=test`, {
+      headers: { Authorization: "Bearer test-official-key" },
+    });
+    assert.equal(models.status, 200);
+    assert.deepEqual(await models.json(), catalog);
+    assert.deepEqual(received.at(-1), { provider: "official", url: "/models?client_version=test", authorization: "Bearer test-official-key" });
+    for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+      assert.equal((await request(model)).status, 200);
+      assert.deepEqual(received.at(-1), { provider: "wlb", model, authorization: "Bearer test-wlb-key" });
+    }
+    assert.equal((await request("gpt-5.6-sol", "responses/compact")).status, 200);
+    assert.equal(received.at(-1).provider, "wlb");
+    const beforeFailure = received.length;
+    assert.equal((await request("gpt-unregistered")).status, 409);
+    writeFileSync(path.join(router.stateDir, "gpt-route.json"), "broken");
+    assert.equal((await request("gpt-5.6-sol")).status, 503);
+    assert.equal(received.length, beforeFailure);
+    assert.equal(cli("official").status, 0);
+    assert.equal((await request("gpt-unregistered")).status, 200);
+    assert.equal(received.at(-1).provider, "official");
+    assert.equal((await request("wlb-relay/gpt-5.6-sol")).status, 200);
+    assert.equal(received.at(-1).provider, "wlb");
+    assert.equal(cli("invalid").status, 2);
+    assert.match(cli("status").stdout, /official/);
+  } finally {
+    await router.close();
+    await close(official);
+    await close(wlb);
+  }
+});
 
 test("无 content-type 的 SSE 仍能统计 Token 并原样透传", async () => {
   const body =
@@ -1031,7 +1112,7 @@ test("请求日志会脱敏 HTTP 与 WebSocket caller capability", async () => {
     const response = await fetch(
       `http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/models`,
     );
-    assert.equal(response.status, 200);
+    assert.equal(response.status, 401);
     await response.arrayBuffer();
 
     socket = net.createConnection({ host: "127.0.0.1", port: router.routerPort });

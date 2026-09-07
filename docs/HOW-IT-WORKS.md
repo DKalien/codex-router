@@ -1,9 +1,9 @@
 # Codex Router 工作原理
 
 Codex Router Lite 只包含一个本地 Node 路由器。Codex 继续使用内置的 `openai`
-服务商，但由路由器管理的 `openai_base_url` 指向本地路由器，
-`model_catalog_json` 指向生成的模型目录。路由器根据请求中的模型 slug 选择原生
-处理或第三方路由处理。
+服务商，但由路由器管理的 `openai_base_url` 指向本地路由器。默认安装不写入
+`model_catalog_json`，因此 Codex 继续使用并自行更新官方模型目录。路由器根据请求
+中的模型 slug 和全局 GPT 路由设置选择官方处理或第三方路由处理。
 
 ## 请求流程
 
@@ -16,13 +16,16 @@ sequenceDiagram
   participant W as WLB Relay
 
   C->>R: 携带 caller URL 的 Responses 请求
-  alt gpt-5.6-sol/terra/luna
+  alt 官方 GPT + route official
     R->>N: 白名单 Codex 请求头和原生模型
     N-->>R: Responses 响应或数据流
-  else mimo-token-plan/*
+  else 官方 GPT + route wlb
+    R->>W: 同名 GPT 模型和 WLB 密钥
+    W-->>R: Responses 响应或数据流
+  else mimo-token-plan/*（旧命名空间）
     R->>M: /responses、MiMo 模型和 MiMo 密钥
     M-->>R: Responses 响应或数据流
-  else wlb-relay/*
+  else wlb-relay/*（旧命名空间）
     R->>W: /responses、上游 GPT 模型和 WLB 密钥
     W-->>R: Responses 响应或数据流
   end
@@ -44,7 +47,7 @@ Windows 后台服务由 `src/service-windows.mjs` 通过计划任务管理。后
 没有 PID 文件时，只按精确的 `wscript -> cmd -> start.mjs` 父子链查找一次，避免误杀
 无关的 Node 进程，也避免旧路由器继续占用 4102 端口。
 
-## 构建模型目录
+## 官方目录与旧模型目录
 
 `src/model-registry.mjs` 从 `config/` 加载两个服务商描述文件及其模型片段，并验证
 服务商 ID、带命名空间的 slug、上游模型名称和已列出的元数据。仅支持以下服务商：
@@ -54,9 +57,9 @@ Windows 后台服务由 `src/service-windows.mjs` 通过计划任务管理。后
 | `mimo-token-plan` | `config/mimo/mimo.json` | `mimo-api-key.secret` |
 | `wlb-relay` | `config/wlb/wlb.json` | `wlb-api-key.secret` |
 
-`src/catalog.mjs` 将 `codex debug models` 返回的原生目录保存到
-`native-models.json`，再生成 `merged-models.json`。登录状态下的目录固定包含
-8 个条目：
+默认安装不构建静态目录，也不向 Codex 写入 `model_catalog_json`；官方模型选择器
+由 Codex 自己维护。`src/catalog.mjs` 仍保留给需要旧命名空间目录的手动构建，且
+只有这种手动旧目录构建才固定包含 8 个条目：
 
 | 类型 | 条目 | 数量 |
 | --- | --- | ---: |
@@ -65,11 +68,13 @@ Windows 后台服务由 `src/service-windows.mjs` 通过计划任务管理。后
 | WLB | `wlb-relay/gpt-5.6-sol`、`wlb-relay/gpt-5.6-terra`、`wlb-relay/gpt-5.6-luna` | 3 |
 
 5 个带命名空间的条目由路由器转发；3 个原生条目来自官方原生捕获。其他被捕获的
-原生模型只保留为查找数据，不会输出到合并目录。
+原生模型只保留为查找数据，不会输出到这个旧合并目录。旧目录不会成为默认官方
+模型选择器的来源。
 
-WLB 的元数据通过构建规则保证兼容。每个 WLB 模型的 `upstreamModel` 必须精确匹配
-一个原生 slug。目录生成器复制该原生对象，只修改带命名空间的 `slug` 和 WLB
-`display_name`；找不到精确匹配时构建会失败。
+手动构建旧目录时，WLB 条目以捕获的官方目录中其 `upstreamModel` 对应条目为元数据
+基线，保持字段和能力描述一致；这不保证 WLB 上游实际支持官方目录声明的全部能力。
+每个 WLB 模型的 `upstreamModel` 必须精确匹配一个原生 slug；找不到对应官方条目时
+构建会失败。目录生成器只修改带命名空间的 `slug` 和 WLB `display_name`。
 
 MiMo 不复制原生模板。其模型目录对象只由 Xiaomi 明确指定的以下字段组成：
 
@@ -88,8 +93,15 @@ supports_search_tool
 
 ## 路由和凭据
 
-对于原生 slug，`src/router.mjs` 使用白名单 Codex 请求头将请求转发给原生 Codex
-后端；独立的 `/alpha/search` 搜索请求和图片请求也只会转发给原生后端，并且必须
+`src/gpt-route.mjs` 将 `official` 或 `wlb` 写入状态目录；文件不存在时默认使用
+`official`。这是全局设置，不绑定线程，从下一次 GPT 请求起对所有任务生效。使用
+`wlb` 时，`src/router.mjs` 只查找与官方请求模型同名、且已在 WLB 注册的模型；没有
+对应模型时直接返回 `409`，不会回退到官方。正在执行的任务中途切换服务商可能带来
+历史上下文兼容风险。`route status` 只读；`--json` 仅由总状态命令支持。
+
+对于官方 GPT slug，`official` 路由使用白名单 Codex 请求头将请求转发给原生 Codex
+后端；`wlb` 路由注入 WLB 密钥并使用同名的 WLB 模型。独立的 `/alpha/search` 搜索
+请求和图片请求也只会转发给原生后端，并且必须
 携带非空的 `Authorization`，否则本地直接返回 `401`，不访问上游。原生 SSE
 已经观察到 `response.completed` 后，即使客户端紧接着关闭连接，也按 upstream status
 和 Token usage 记录，不再误记为客户端取消或 `0`；尚未完成的 native 流仍记为客户端
@@ -98,11 +110,15 @@ supports_search_tool
 `encrypted_content` 符合原生 `gAAAAA...` token 形状的 reasoning，并移除仅用于
 输出的 `content`；没有原生加密上下文的外部 reasoning 会整项丢弃，避免
 `store=false` 请求引用并未在 OpenAI 持久化的外部 `rs_*` item。对于带命名
-空间的 slug，它会解析服务商，将模型名替换为 `upstreamModel`，
+空间的旧 slug，它会解析服务商，将模型名替换为 `upstreamModel`，
 读取对应密钥，再使用服务商的 `Authorization` 请求头直接发送
 `POST <provider base URL>/responses`。Codex 的账户和安装凭据不会发送给第三方
 服务商。数据流会直接透传；`/responses/compact` 使用相同的直连路径，并在需要时
 生成由路由器管理的续接摘要。
+
+`GET /models` 和 `GET /v1/models` 始终使用官方身份透传到官方上游，并保留请求查询
+参数和官方完整响应元数据；WLB 路由不会把模型列表替换成本地简化目录。没有当前
+Codex 登录身份时，这两个端点返回 `401`。
 
 上游省略 `content-type` 时，`src/sse-prefix.mjs` 会在最多 512 bytes 的前缀内识别
 SSE。字段名可跨 chunk，开头允许 UTF-8 BOM、注释和空行；探测期间缓存的原始字节会
@@ -152,32 +168,35 @@ Bearer、token、key、secret、caller capability、查询参数和控制字符�
 
 ## 维护和检查
 
-修改模型片段后运行：
+修改模型片段或手动旧目录构建逻辑后运行：
 
 ```sh
 node src/catalog.mjs
 node test/catalog-metadata.mjs
+node --test test/official-catalog.mjs
 node --test test/router-fixes.mjs test/response-usage-hardening.mjs test/http-health-bounds.mjs test/credential-file-security.mjs test/graceful-shutdown.mjs test/upstream-hardening.mjs test/windows-service-process.mjs
 node scripts-check.mjs
 ```
 
 日常只读检查使用 `codex-router.ps1 status`（Windows）或
-`bin/model-router codex status`（POSIX）；它只读取本地健康端点、Codex 配置、固定
-8 模型目录、Provider 凭据状态、安装清单和后台服务，不会自动修复或请求上游。
-只有健康检查、受管配置、精确的 8 个目录 slug（包括 5 个路由 slug）、未降级的
-Provider 选择以及所有选定 Provider 的持久化凭据都满足时，退出码才为 0；否则为 1，
-参数错误为 2。脚本读取时可追加 `--json`。
+`bin/model-router codex status`（POSIX）；它只读取本地健康端点、Codex 配置、官方或
+旧模型目录模式、Provider 凭据状态、安装清单和后台服务，不会自动修复或请求上游。
+默认官方目录模式不要求静态 8 模型目录；手动旧目录模式才要求精确的 8 个目录 slug
+（包括 5 个路由 slug）。健康检查、受管配置、未降级的 Provider 选择以及相应凭据
+满足时，退出码才为 0；否则为 1，参数错误为 2。只有总状态命令支持 `--json`，即
+`status --json`；`route status` 是只读文本查询，不接受 `--json`。
 
-模型目录变化后必须重载路由器进程；已安装的服务可运行
-`node src/service.mjs restart`。如果 Codex 的模型选择器仍显示旧的
-`model_catalog_json`，请完全重启 Codex。Codex CLI 版本变化时会自动刷新原生
-捕获，但仍需要执行相同的重载/重启步骤。
+默认官方模型目录无需运行 `src/catalog.mjs`；Codex 会自行更新官方目录。需要维护
+旧命名空间目录时才手动运行 `node src/catalog.mjs`，并按需要重载路由器；如果模型
+选择器仍显示旧的手动目录，完全重启 Codex。
 
-另一台设备不要复制其他设备的状态目录：先在本机配置 provider key，再运行
-`.\codex-router.ps1 install`（POSIX 使用 `bin/install`），随后完全重启 Codex。
+另一台设备不要复制其他设备的状态目录：仅使用官方路由时可直接运行
+`.\codex-router.ps1 install`（POSIX 使用 `bin/install`）；需要第三方路由时再在本机
+配置对应的 provider key，随后完全重启 Codex。
 同一设备更换 checkout 时，POSIX installer 提供显式的所有权转移流程；Windows
 installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新或先人工解决
-冲突。安装会确保本机 caller secret、刷新 Codex endpoint，并重建目录和后台服务。
+冲突。安装会确保本机 caller secret、配置 Codex endpoint，并登记后台服务，不会默认
+写入 `model_catalog_json` 或构建静态目录。
 
 主要文件如下：
 
@@ -187,13 +206,15 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | `src/mimo-custom-tools.mjs` | MiMo custom tool/agent message 的请求转换、历史裁剪和 JSON/SSE 响应还原 |
 | `src/response-usage.mjs` | 从 JSON 或 SSE 响应提取 Token 用量并保持响应透传 |
 | `src/sse-prefix.mjs` | 有界识别无 `content-type` 的 SSE 并保持探测字节顺序 |
-| `src/catalog.mjs` | 捕获原生目录并生成 8 条目的合并目录 |
+| `src/catalog.mjs` | 为需要旧命名空间目录的手动流程捕获官方目录并生成 8 条目的合并目录 |
+| `src/gpt-route.mjs` | 读写全局 GPT 路由状态，默认官方路由 |
 | `src/model-registry.mjs` | 加载并验证服务商和模型 |
 | `src/start.mjs` | 监督一个路由器子进程并提供代理环境 |
-| `src/status.mjs` | 只读汇总路由器、配置、目录、Provider、安装和服务状态 |
+| `src/status.mjs` | 只读汇总路由器、配置、目录模式、GPT 路由、Provider、安装和服务状态 |
 | `src/service-windows.mjs` | 管理 Windows 计划任务并安全停止已验证的监督进程树 |
 | `config/mimo/`、`config/wlb/` | 两个服务商的描述文件和模型片段 |
-| `test/catalog-metadata.mjs` | 检查 WLB 精确复制和 MiMo 字段集合 |
+| `test/catalog-metadata.mjs` | 检查 WLB 元数据基线和 MiMo 字段集合 |
+| `test/official-catalog.mjs` | 检查官方目录状态、配置迁移及多代理子表去重 |
 | `test/router-fixes.mjs` | 检查路由、MiMo 历史兼容、relay 并发/缓存、统计、脱敏、有界错误和流式 idle timeout |
 | `test/response-usage-hardening.mjs` | 检查 split/BOM SSE、字节透传、MiMo 还原和密文 Token 估算 |
 | `test/http-health-bounds.mjs` | 检查请求 drain/中止、响应超限取消和健康 deadline |

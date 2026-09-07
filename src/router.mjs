@@ -29,7 +29,6 @@ import {
   writeJson,
 } from "./http-utils.mjs";
 import {
-  MERGED_CATALOG_PATH,
   NATIVE_CATALOG_PATH,
   PORTS,
   loopback,
@@ -37,6 +36,7 @@ import {
 import { MODEL_BY_SLUG, PROVIDERS, providerForModel } from "./model-registry.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
 import { readNativeRedirect } from "./native-redirect.mjs";
+import { readGptRoute } from "./gpt-route.mjs";
 import {
   canonicalProviderId,
   readProviderSelection,
@@ -82,8 +82,6 @@ function providerBaseUrl(provider) {
       provider.baseUrl,
   ).replace(/\/+$/, "");
 }
-const CATALOG_PATH =
-  process.env.CODEX_ROUTER_CATALOG || process.env.KIMI_ROUTER_CATALOG || MERGED_CATALOG_PATH;
 const CALLER_KEY = process.env.CODEX_ROUTER_CALLER_KEY;
 const QUIET =
   process.env.CODEX_ROUTER_QUIET === "1" || process.env.KIMI_PROXY_QUIET === "1";
@@ -369,15 +367,6 @@ function logUpstreamRetry({ attempt, retries, status, error, delayMs }, model, r
     `[codex-router] native upstream retry ${attempt}/${retries} ${cause} ` +
       `model=${model || "unknown"} path=${routePath} delayMs=${delayMs}`,
   );
-}
-
-function catalogModels() {
-  try {
-    const parsed = JSON.parse(readFileSync(CATALOG_PATH, "utf8"));
-    return Array.isArray(parsed.models) ? parsed.models : [];
-  } catch {
-    return [];
-  }
 }
 
 // Lite: no sidecar services remain, so health is the router process itself.
@@ -1042,17 +1031,6 @@ async function handleRoutedCompaction(request, response, payload, route, signal,
   return { status: 200, usage: result.usage };
 }
 
-async function handleModels(response) {
-  const data = catalogModels().map((model) => ({
-    id: model.slug,
-    object: "model",
-    owned_by: MODEL_BY_SLUG.has(model.slug)
-      ? providerForModel(MODEL_BY_SLUG.get(model.slug)).ownedBy
-      : "openai",
-  }));
-  writeJson(response, 200, { object: "list", data });
-}
-
 function requireCodexTransport(request, response) {
   if (request.headers.origin || request.headers["sec-fetch-site"]) {
     writeJson(response, 403, {
@@ -1067,7 +1045,7 @@ function requireCodexTransport(request, response) {
     .split(";", 1)[0]
     .trim()
     .toLowerCase();
-  if (contentType !== "application/json") {
+  if (request.method !== "GET" && contentType !== "application/json") {
     writeJson(response, 415, {
       error: {
         type: "unsupported_media_type",
@@ -1107,16 +1085,32 @@ async function handleResponses(request, response, requestUrl) {
     const body = decodeBody(encoded, request.headers["content-encoding"]);
     const payload = parseBody(body);
     requestedModel = typeof payload.model === "string" ? payload.model : "";
-    let registeredRoute =
-      MODEL_BY_SLUG.get(requestedModel) ??
-      MODEL_BY_SLUG.get(readNativeAliases()[requestedModel]);
-    // An unregistered model on this endpoint is native GPT traffic -- Codex's
-    // background agent sessions arrive here hardwired to a native slug no
-    // matter which model the user picked. With the redirect opted in, send
-    // them to the configured routed model; a target that is unknown or whose
-    // provider is hidden leaves the turn native rather than trading a quota
-    // failure for a routing error.
-    if (!registeredRoute && requestedModel) {
+    const nativeGpt = requestedModel.startsWith("gpt-") && !MODEL_BY_SLUG.has(requestedModel);
+    let registeredRoute = MODEL_BY_SLUG.get(requestedModel);
+    if (nativeGpt) {
+      let gptRoute;
+      try {
+        gptRoute = readGptRoute();
+      } catch (error) {
+        writeJson(response, 503, { error: { type: "invalid_gpt_route", message: error.message } });
+        return;
+      }
+      if (gptRoute === "wlb") {
+        registeredRoute = MODEL_BY_SLUG.get(`wlb-relay/${requestedModel}`);
+        if (!registeredRoute) {
+          writeJson(response, 409, { error: {
+            type: "wlb_model_not_configured",
+            message: "WLB 未配置所选模型，请切换至官方路由或选择 WLB 已配置的模型。",
+          } });
+          return;
+        }
+      }
+    } else {
+      registeredRoute ??= MODEL_BY_SLUG.get(readNativeAliases()[requestedModel]);
+    }
+    // GPT 请求统一使用新开关；旧 alias/redirect 仅保留给其他模型，
+    // 避免选择 official 后仍被历史配置转发到第三方。
+    if (!nativeGpt && !registeredRoute && requestedModel) {
       const redirect = MODEL_BY_SLUG.get(readNativeRedirect());
       if (redirect && readProviderSelection().includes(redirect.provider)) {
         registeredRoute = redirect;
@@ -1452,11 +1446,16 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
       });
       return;
     }
-    const encoded = await readRequestBody(request, { signal: controller.signal });
-    const body = decodeBody(encoded, request.headers["content-encoding"]);
-    const payload = parseBody(body);
-    requestedModel =
-      typeof payload.model === "string" ? payload.model : defaultModel;
+    let upstreamBody;
+    if (request.method !== "GET") {
+      const encoded = await readRequestBody(request, { signal: controller.signal });
+      const body = decodeBody(encoded, request.headers["content-encoding"]);
+      const payload = parseBody(body);
+      requestedModel = typeof payload.model === "string" ? payload.model : defaultModel;
+      upstreamBody = await compressedNativeBody(body, headers);
+    } else if (request.headers["if-none-match"]) {
+      headers["if-none-match"] = request.headers["if-none-match"];
+    }
     activity.setRoute({
       provider: "openai",
       model: requestedModel,
@@ -1465,13 +1464,12 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
 
     // Same replayable-Buffer rule as the turn path: encode once, outside the
     // retry, so every attempt carries identical bytes under identical headers.
-    const imageBody = await compressedNativeBody(body, headers);
     const { response: upstream, retries } = await fetchWithRetry(
       nativeTarget(requestUrl.pathname, requestUrl.search),
       {
-        method: "POST",
+        method: request.method,
         headers,
-        body: imageBody,
+        body: upstreamBody,
         signal: controller.signal,
       },
       {
@@ -1571,7 +1569,8 @@ async function handleRequest(request, response) {
     return;
   }
   if (request.method === "GET" && ["/models", "/v1/models"].includes(requestUrl.pathname)) {
-    await handleModels(response);
+    // 模型目录始终取自官方；GPT 的上游切换不改变客户端的能力元数据。
+    await handleNativeRequest(request, response, requestUrl, "models");
     return;
   }
   if (request.method === "OPTIONS") {

@@ -51,13 +51,6 @@ const routerProviderId = "codex-router";
 const defaultChatgptBaseUrl = "https://chatgpt.com/backend-api";
 const defaultRealtimeWebsocketBaseUrl = "https://api.openai.com/v1";
 
-// Renders a string as a TOML basic string. JSON escaping is valid TOML
-// escaping, and unlike TOML literal strings it supports apostrophes anywhere
-// in a Windows path. The legacy-migration detector unescapes basic strings
-// before comparing catalog paths.
-function tomlValue(value) {
-  return JSON.stringify(value);
-}
 const realtimeCallBaseUrlKey = "experimental_realtime_webrtc_call_base_url";
 const realtimeWebsocketBaseUrlKey = "experimental_realtime_ws_base_url";
 const markerPairs = [
@@ -189,6 +182,8 @@ function withoutManagedMultiAgentV2(input) {
 
 function hasModernMultiAgentConfig(input) {
   const lines = input.split("\n");
+  // Codex 也会把该功能保存成独立 TOML 子表，不能再注入同名内联表。
+  if (lines.some((line) => /^\s*\[\s*(?:features|"features"|'features')\s*\.\s*(?:multi_agent_v2|"multi_agent_v2"|'multi_agent_v2')\s*\]\s*(?:#.*)?$/.test(line))) return true;
   if (lines.some((line) => /^\s*features\.multi_agent_v2\s*=/.test(line))) return true;
   if (lines.some((line) => /^\s*\[agents\.[^\]]+\]\s*(?:#.*)?$/.test(line))) return true;
   const featuresHeader = lines.findIndex((line) =>
@@ -552,10 +547,7 @@ function snapshot(contents) {
   const baseUrl = rootValue(rootLines, "openai_base_url");
   const catalog = rootValue(rootLines, "model_catalog_json");
   return {
-    mode:
-      isManagedRouterBaseUrl(baseUrl) && catalog === MERGED_CATALOG_PATH
-        ? "router"
-        : "native",
+    mode: isManagedRouterBaseUrl(baseUrl) ? "router" : "native",
     model: rootValue(rootLines, "model") || null,
     model_provider: rootValue(rootLines, "model_provider") || "openai",
     login_free: rootValue(rootLines, "model_provider") === routerProviderId,
@@ -614,7 +606,6 @@ function enabledContents(contents) {
     "",
     startMarker,
     `openai_base_url = ${JSON.stringify(routerBaseUrl)}`,
-    `model_catalog_json = ${tomlValue(MERGED_CATALOG_PATH)}`,
     ...managedRealtimeOverrides,
     endMarker,
   );

@@ -48,9 +48,6 @@ cd "$repo_dir"
 codex_home=${CODEX_HOME:-$HOME/.codex}
 mkdir -p "$codex_home"
 node src/legacy-migration.mjs assert-clear >/dev/null
-if [ "$prepare_only" != true ]; then
-  node src/provider-selection.mjs ensure-configured >/dev/null
-fi
 # Lite: dependency steps are skipped when their output directories already
 # exist; --force-deps rebuilds them.
 if [ "$force_deps" != true ] && [ -d node_modules ]; then
@@ -60,15 +57,9 @@ else
 fi
 
 node src/secret.mjs ensure
-state_dir=${MODEL_ROUTER_STATE_DIR:-${CODEX_ROUTER_STATE_DIR:-${CODEX_HOME:-$HOME/.codex}/codex-router}}
-if [ -s "$state_dir/native-models.json" ]; then
-  node src/catalog.mjs
-else
-  node src/catalog.mjs --refresh-native
-fi
 
 if [ "$prepare_only" = true ]; then
-  echo "Dependencies and local Codex router files are prepared. Application configuration was not changed."
+  echo "依赖和本地路由器文件已准备好；未修改应用配置。"
   exit 0
 fi
 
@@ -95,7 +86,7 @@ config_enabled=false
 service_installed=false
 trap - EXIT HUP INT TERM
 
-echo "Installed the selected external model routes for Codex."
-echo "Fully quit and reopen Codex, then start a new task."
-echo "MiMo API key: $repo_dir/bin/provider-key mimo-token-plan set"
-echo "WLB API key:  $repo_dir/bin/provider-key wlb-relay set"
+echo "路由器已安装；Codex 默认继续使用官方模型目录。"
+echo "请完全退出并重新打开 Codex，以加载受管理的本地 endpoint。"
+echo "MiMo API 密钥：$repo_dir/bin/provider-key mimo-token-plan set"
+echo "WLB API 密钥： $repo_dir/bin/provider-key wlb-relay set"

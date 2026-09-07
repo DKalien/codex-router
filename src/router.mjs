@@ -6,7 +6,7 @@ import {
   gunzipSync,
   inflateSync,
   zstdCompress,
-  zstdDecompressSync,
+  zstdDecompress,
 } from "node:zlib";
 import { promisify } from "node:util";
 
@@ -27,6 +27,7 @@ import {
   readResponseTextLimited,
   readRequestBody,
   writeJson,
+  zstdFrameContentSize,
 } from "./http-utils.mjs";
 import {
   NATIVE_CATALOG_PATH,
@@ -233,7 +234,10 @@ function parseBody(buffer) {
   }
 }
 
-function decodeBody(body, contentEncoding) {
+// 将 zstd 解压移出请求线程，并在进入原生解码器前拒绝声明尺寸超限的帧。
+const decompressZstd = promisify(zstdDecompress);
+
+async function decodeBody(body, contentEncoding) {
   const value = Array.isArray(contentEncoding)
     ? contentEncoding.join(",")
     : String(contentEncoding || "");
@@ -246,8 +250,15 @@ function decodeBody(body, contentEncoding) {
   try {
     for (const encoding of encodings) {
       const options = { maxOutputLength: MAX_DECODED_BODY_BYTES };
-      if (encoding === "zstd") decoded = zstdDecompressSync(decoded, options);
-      else if (encoding === "gzip" || encoding === "x-gzip") {
+      if (encoding === "zstd") {
+        const declared = zstdFrameContentSize(decoded);
+        if (declared !== undefined && declared > MAX_DECODED_BODY_BYTES) {
+          const error = new Error(`解压后的请求正文超过 ${MAX_DECODED_BODY_BYTES} 字节。`);
+          error.status = 413;
+          throw error;
+        }
+        decoded = await decompressZstd(decoded, options);
+      } else if (encoding === "gzip" || encoding === "x-gzip") {
         decoded = gunzipSync(decoded, options);
       } else if (encoding === "deflate") decoded = inflateSync(decoded, options);
       else if (encoding === "br") decoded = brotliDecompressSync(decoded, options);
@@ -405,6 +416,18 @@ function normalizeRoutedInput(input) {
   if (!Array.isArray(input)) return input;
   return input
     .filter((item) => item?.type !== "compaction_trigger")
+    .map((item) => {
+      // 仅恢复具名 codex_app 孤立结果，不伪造没有对应调用的 call_id。
+      if (
+        item?.type !== "function_call_output" ||
+        item.namespace !== "codex_app" ||
+        typeof item.name !== "string" || !item.name ||
+        (typeof item.call_id === "string" && item.call_id) ||
+        item.output === undefined
+      ) return item;
+      const output = typeof item.output === "string" ? item.output : JSON.stringify(item.output);
+      return messageItem(`[Codex app 工具结果：codex_app.${item.name}]\n${output}`);
+    })
     .map((item) => {
       if (item?.type !== "compaction") return item;
       const summary = decodeSummary(item.encrypted_content);
@@ -1082,7 +1105,7 @@ async function handleResponses(request, response, requestUrl) {
   try {
     if (!requireCodexTransport(request, response)) return;
     const encoded = await readRequestBody(request, { signal: controller.signal });
-    const body = decodeBody(encoded, request.headers["content-encoding"]);
+    const body = await decodeBody(encoded, request.headers["content-encoding"]);
     const payload = parseBody(body);
     requestedModel = typeof payload.model === "string" ? payload.model : "";
     const nativeGpt = requestedModel.startsWith("gpt-") && !MODEL_BY_SLUG.has(requestedModel);
@@ -1096,14 +1119,12 @@ async function handleResponses(request, response, requestUrl) {
         return;
       }
       if (gptRoute === "wlb") {
-        registeredRoute = MODEL_BY_SLUG.get(`wlb-relay/${requestedModel}`);
-        if (!registeredRoute) {
-          writeJson(response, 409, { error: {
-            type: "wlb_model_not_configured",
-            message: "WLB 未配置所选模型，请切换至官方路由或选择 WLB 已配置的模型。",
-          } });
-          return;
-        }
+        // 官方选择器负责模型名；新 GPT 模型无需先登记到旧静态目录。
+        registeredRoute = {
+          provider: "wlb-relay",
+          slug: `wlb-relay/${requestedModel}`,
+          upstreamModel: requestedModel,
+        };
       }
     } else {
       registeredRoute ??= MODEL_BY_SLUG.get(readNativeAliases()[requestedModel]);
@@ -1449,7 +1470,7 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
     let upstreamBody;
     if (request.method !== "GET") {
       const encoded = await readRequestBody(request, { signal: controller.signal });
-      const body = decodeBody(encoded, request.headers["content-encoding"]);
+      const body = await decodeBody(encoded, request.headers["content-encoding"]);
       const payload = parseBody(body);
       requestedModel = typeof payload.model === "string" ? payload.model : defaultModel;
       upstreamBody = await compressedNativeBody(body, headers);

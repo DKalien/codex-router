@@ -42,8 +42,8 @@
   `gpt-5.6-sol/terra/luna`；其中 5 个模型位于两个服务商的命名空间下并由路由器转发。
 - `route official|wlb|status` 管理或读取全局 GPT 路由；缺少状态文件时默认为
   `official`。设置从下一次 GPT 请求起对所有任务共享，不绑定线程；同一任务中途切换
-  服务商可能带来历史上下文兼容风险。`wlb` 对未注册的同名模型直接返回 `409`，不
-  回退官方；`route status` 只读且不支持 `--json`，只有总状态命令支持 `status --json`。
+  服务商可能带来历史上下文兼容风险。`wlb` 原样转发请求中的 `gpt-*` 模型名，不依赖旧目录注册，
+  上游不支持时返回错误且不回退官方；`route status` 只读且不支持 `--json`，只有总状态命令支持 `status --json`。
 - `/models` 和 `/v1/models` 始终使用官方身份透传官方查询参数和完整元数据；WLB
   路由不替换官方模型列表。
 - 每个改动过的 `src/*.mjs` 都必须运行 `node --check`；整个源码树的相对导入必须
@@ -66,6 +66,7 @@
   有界读取或健康 deadline 路径后，运行 `node --test test/http-health-bounds.mjs`。
 - 修改 `src/file-security.mjs` 或 `src/provider-credentials.mjs` 后，运行
   `node --test test/credential-file-security.mjs`。
+- 修改 Windows 后台子进程调用后，运行 `node --test test/windows-hidden-consoles.mjs`。
 - MiMo 兼容必须保持服务商隔离：标准 envelope 的旧 `MESSAGE` 进度不回放，
   `FINAL_ANSWER`、`NEW_TASK`、`FOLLOWUP_TASK` 仍保留；原生 GPT 和 WLB 不得应用
   MiMo 专属的历史裁剪或 custom-tool 映射。

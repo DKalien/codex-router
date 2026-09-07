@@ -95,8 +95,8 @@ supports_search_tool
 
 `src/gpt-route.mjs` 将 `official` 或 `wlb` 写入状态目录；文件不存在时默认使用
 `official`。这是全局设置，不绑定线程，从下一次 GPT 请求起对所有任务生效。使用
-`wlb` 时，`src/router.mjs` 只查找与官方请求模型同名、且已在 WLB 注册的模型；没有
-对应模型时直接返回 `409`，不会回退到官方。正在执行的任务中途切换服务商可能带来
+`wlb` 时，`src/router.mjs` 将请求中的 `gpt-*` 模型名原样发送给 WLB，不依赖
+旧静态模型名单。官方新增模型无需修改 Router；WLB 上游不支持时返回其错误，不会回退到官方。正在执行的任务中途切换服务商可能带来
 历史上下文兼容风险。`route status` 只读；`--json` 仅由总状态命令支持。
 
 对于官方 GPT slug，`official` 路由使用白名单 Codex 请求头将请求转发给原生 Codex
@@ -158,8 +158,15 @@ Bearer、token、key、secret、caller capability、查询参数和控制字符�
 `FullControl` 的非继承 DACL 替换现有 ACL。
 
 请求正文超限后，路由器停止缓存新字节并排空剩余请求，客户端断开仍可中止读取。
+zstd 请求异步解压，帧头声明尺寸超出解压上限时提前返回 413；没有声明尺寸的帧仍受
+解码器输出上限约束，畸形数据返回 400。该机制属于防御性加固，不能视为已确认修复
+Windows 原生解码器崩溃。后台凭据 ACL 与服务管理的非交互 PowerShell 调用隐藏窗口。
 协作载荷 relay 和 compact 响应分别最多缓冲 4 MiB 与 32 MiB，超限会立即取消上游
 流；这些限制在数据到达时执行，不会先由 `arrayBuffer()` 无界收集。
+
+第三方普通和压缩请求共用历史规范化入口：对于缺少有效调用 ID、但具有名称和输出的
+`codex_app` 工具结果，保留名称及原始输出文本（结构化输出转为 JSON），转换为可读
+用户消息；不伪造调用 ID。官方请求、有调用 ID 的结果和其他命名空间保持原样。
 
 路由器只监听回环地址，并在读取请求前检查每次安装生成的 caller 凭据。
 `src/start.mjs` 设置 `NODE_USE_ENV_PROXY=1` 并将 `HTTP_PROXY`/`HTTPS_PROXY`
@@ -217,8 +224,9 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | `test/official-catalog.mjs` | 检查官方目录状态、配置迁移及多代理子表去重 |
 | `test/router-fixes.mjs` | 检查路由、MiMo 历史兼容、relay 并发/缓存、统计、脱敏、有界错误和流式 idle timeout |
 | `test/response-usage-hardening.mjs` | 检查 split/BOM SSE、字节透传、MiMo 还原和密文 Token 估算 |
-| `test/http-health-bounds.mjs` | 检查请求 drain/中止、响应超限取消和健康 deadline |
+| `test/http-health-bounds.mjs` | 检查 zstd 帧头边界、请求 drain/中止、响应超限取消和健康 deadline |
 | `test/credential-file-security.mjs` | 检查凭据 symlink/非文件拒绝和 Windows ACL 规范化 |
 | `test/graceful-shutdown.mjs` | 检查重启 drain、SSE terminal error、503 fallback 和 idle keep-alive 快速退出 |
 | `test/upstream-hardening.mjs` | 检查健康响应排空、keep-alive 参数、错误 cause 链和断流 usage 标记 |
 | `test/windows-service-process.mjs` | 检查 Windows PID 登记、进程树停止和误杀防护 |
+| `test/windows-hidden-consoles.mjs` | 检查后台子进程隐藏窗口及交互输入保持可见 |

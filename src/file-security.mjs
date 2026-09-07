@@ -33,6 +33,7 @@ export function protectPrivateFile(target) {
         encoding: "utf8",
         env: { ...process.env, CODEX_ROUTER_PRIVATE_FILE: target },
         stdio: ["ignore", "ignore", "pipe"],
+        windowsHide: true,
       },
     );
   } catch (error) {
@@ -71,6 +72,7 @@ export function privateFileIsProtected(target) {
         encoding: "utf8",
         env: { ...process.env, CODEX_ROUTER_PRIVATE_FILE: target },
         stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
       },
     ).trim().toLowerCase() === "true";
   } catch {

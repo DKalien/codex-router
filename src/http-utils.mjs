@@ -12,6 +12,27 @@ export const MAX_BODY_BYTES = Number(
     64 * 1024 * 1024,
 );
 
+// 只读取 zstd 帧头声明的输出尺寸；缺失、截断或非 zstd 数据交由有界解码器处理。
+// 帧格式包含可选窗口描述符、字典 ID，以及 0/1/2/4/8 字节的尺寸字段。
+export function zstdFrameContentSize(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 6) return undefined;
+  if (buffer.readUInt32LE(0) !== 0xfd2fb528) return undefined;
+  const descriptor = buffer[4];
+  const singleSegment = (descriptor & 0x20) !== 0;
+  const sizeFlag = descriptor >> 6;
+  const sizeBytes = sizeFlag === 0 ? (singleSegment ? 1 : 0) : [0, 2, 4, 8][sizeFlag];
+  if (sizeBytes === 0) return undefined;
+  const offset = 5 + (singleSegment ? 0 : 1) + [0, 1, 2, 4][descriptor & 0x03];
+  if (buffer.length < offset + sizeBytes) return undefined;
+  if (sizeBytes === 1) return buffer[offset];
+  if (sizeBytes === 2) return buffer.readUInt16LE(offset) + 256;
+  if (sizeBytes === 4) return buffer.readUInt32LE(offset);
+  const declared = buffer.readBigUInt64LE(offset);
+  return declared > BigInt(Number.MAX_SAFE_INTEGER)
+    ? Number.MAX_SAFE_INTEGER
+    : Number(declared);
+}
+
 export const HOP_BY_HOP_HEADERS = new Set([
   "connection",
   "content-encoding",

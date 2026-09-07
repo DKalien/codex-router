@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { createZstdCompress, gzipSync, zstdCompressSync } from "node:zlib";
 
 import { ResponseUsageTransform } from "../src/response-usage.mjs";
 import { readResponseTextLimited } from "../src/http-utils.mjs";
@@ -114,6 +115,11 @@ test("官方目录的 GPT 路由可热切换并保持模型对应，错误不回
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     received.push({ provider, model: body.model, authorization: request.headers.authorization });
+    if (provider === "wlb" && body.model === "gpt-unsupported") {
+      response.writeHead(404, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "Model not supported" } }));
+      return;
+    }
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end(JSON.stringify({
       output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "摘要" }] }],
@@ -156,14 +162,18 @@ test("官方目录的 GPT 路由可热切换并保持模型对应，错误不回
     assert.equal(models.status, 200);
     assert.deepEqual(await models.json(), catalog);
     assert.deepEqual(received.at(-1), { provider: "official", url: "/models?client_version=test", authorization: "Bearer test-official-key" });
-    for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]) {
+    for (const model of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra", "gpt-new-model"]) {
       assert.equal((await request(model)).status, 200);
       assert.deepEqual(received.at(-1), { provider: "wlb", model, authorization: "Bearer test-wlb-key" });
     }
-    assert.equal((await request("gpt-5.6-sol", "responses/compact")).status, 200);
+    assert.equal((await request("gpt-new-model", "responses/compact")).status, 200);
+    assert.equal(received.at(-1).provider, "wlb");
+    assert.equal(received.at(-1).model, "gpt-new-model");
+    const beforeUnsupported = received.length;
+    assert.equal((await request("gpt-unsupported")).status, 404);
+    assert.equal(received.length, beforeUnsupported + 1);
     assert.equal(received.at(-1).provider, "wlb");
     const beforeFailure = received.length;
-    assert.equal((await request("gpt-unregistered")).status, 409);
     writeFileSync(path.join(router.stateDir, "gpt-route.json"), "broken");
     assert.equal((await request("gpt-5.6-sol")).status, 503);
     assert.equal(received.length, beforeFailure);
@@ -178,6 +188,104 @@ test("官方目录的 GPT 路由可热切换并保持模型对应，错误不回
     await router.close();
     await close(official);
     await close(wlb);
+  }
+});
+
+test("zstd 请求解压覆盖官方及第三方入口，并提前拒绝超大帧", async () => {
+  const received = [];
+  const upstream = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    received.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ output: [], usage: { input_tokens: 1, output_tokens: 0 } }));
+  });
+  const port = await listen(upstream);
+  const router = await startRouter({
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${port}`,
+    WLB_BASE_URL: `http://127.0.0.1:${port}`,
+    WLB_API_KEY: "test-wlb-key",
+    MODEL_ROUTER_MAX_DECODED_BODY_BYTES: "1024",
+  });
+  const send = async (endpoint, body, encoding = "zstd") => {
+    const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/${endpoint}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Content-Encoding": encoding, Authorization: "Bearer test-official" },
+      body,
+    });
+    await response.arrayBuffer();
+    return response.status;
+  };
+  try {
+    for (const [endpoint, model] of [["responses", "gpt-5.6-sol"], ["responses", "wlb-relay/gpt-5.6-sol"], ["alpha/search", "gpt-5.6-sol"]]) {
+      const payload = Buffer.from(JSON.stringify({ model, input: "你好", stream: false }));
+      assert.equal(await send(endpoint, zstdCompressSync(payload)), 200);
+      assert.equal(received.at(-1).input, "你好");
+      assert.equal(await send(endpoint, gzipSync(zstdCompressSync(payload)), "zstd, gzip"), 200);
+      // 只有帧头，没有可解码数据：413 证明在原生解码器报 400 前检查了尺寸。
+      const oversizedHeader = Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0xa0, 0, 8, 0, 0]);
+      const before = received.length;
+      assert.equal(await send(endpoint, oversizedHeader), 413);
+      assert.equal(await send(endpoint, Buffer.from("bad zstd")), 400);
+      assert.equal(received.length, before);
+    }
+    assert.equal(await send("responses", zstdCompressSync(Buffer.alloc(2048, 65))), 413);
+    // 流式编码不声明输出尺寸，仍必须由解码器的 maxOutputLength 拒绝。
+    const encoder = createZstdCompress();
+    encoder.end(Buffer.alloc(2048, 65));
+    const chunks = [];
+    for await (const chunk of encoder) chunks.push(chunk);
+    const unknownSize = Buffer.concat(chunks);
+    assert.equal(unknownSize[4] & 0xe0, 0);
+    assert.equal(await send("responses", unknownSize), 413);
+  } finally {
+    await router.close();
+    await close(upstream);
+  }
+});
+
+test("孤立 app 工具结果在第三方普通及压缩请求保留，官方和其他工具保持原样", async () => {
+  const received = [];
+  const upstream = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    received.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "摘要" }] }] }));
+  });
+  const port = await listen(upstream);
+  const router = await startRouter({ CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${port}`, MIMO_BASE_URL: `http://127.0.0.1:${port}`, WLB_BASE_URL: `http://127.0.0.1:${port}`, WLB_API_KEY: "test-wlb-key" });
+  const orphan = { type: "function_call_output", namespace: "codex_app", name: "read_thread", output: { text: "保留结果" } };
+  const untouched = [
+    { ...orphan, call_id: "existing-call" },
+    { ...orphan, namespace: "other" },
+    { type: "function_call_output", output: "无名称" },
+    { type: "function_call_output", namespace: "codex_app", name: "read_thread" },
+  ];
+  const input = [orphan, { ...orphan, call_id: "", output: "字符串结果" }, ...untouched];
+  try {
+    for (const model of ["gpt-5.6-sol", "wlb-relay/gpt-5.6-sol", "mimo-token-plan/mimo-v2.5-pro"]) {
+      for (const endpoint of ["responses", "responses/compact"]) {
+        const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/${endpoint}`, {
+          method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer test-official" },
+          body: JSON.stringify({ model, input, stream: false }),
+        });
+        assert.equal(response.status, 200, await response.text());
+        const actual = received.at(-1).input;
+        if (model.startsWith("gpt-")) assert.deepEqual(actual, input);
+        else {
+          assert.equal(actual[0].type, "message");
+          assert.equal(actual[0].role, "user");
+          assert.match(actual[0].content[0].text, /codex_app\.read_thread/);
+          assert.ok(actual[0].content[0].text.endsWith(JSON.stringify(orphan.output)));
+          assert.ok(actual[1].content[0].text.endsWith("字符串结果"));
+          assert.deepEqual(actual.slice(2, 6), untouched);
+        }
+      }
+    }
+  } finally {
+    await router.close();
+    await close(upstream);
   }
 });
 

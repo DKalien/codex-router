@@ -104,6 +104,7 @@ function schtasks(args, options = {}) {
   return execFileSync("schtasks.exe", args, {
     encoding: "utf8",
     stdio: options.quiet ? ["ignore", "ignore", "ignore"] : ["ignore", "pipe", "pipe"],
+    windowsHide: true,
   });
 }
 
@@ -162,6 +163,7 @@ function installTask() {
           CODEX_ROUTER_TASK_EXECUTE: execute,
           CODEX_ROUTER_TASK_ARGUMENT: argument,
         },
+        windowsHide: true,
         stdio: ["ignore", "ignore", "ignore"],
       },
     );
@@ -282,6 +284,7 @@ function findServiceProcess(pid) {
           },
           stdio: ["ignore", "pipe", "ignore"],
           timeout: TASK_STATE_TIMEOUT_MS,
+          windowsHide: true,
         },
       ).trim();
       return /^\d+$/.test(output) ? Number(output) : undefined;
@@ -314,6 +317,7 @@ function stopServiceProcess(pid) {
   try {
     execFileSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
       stdio: ["ignore", "ignore", "ignore"],
+      windowsHide: true,
     });
   } catch (error) {
     if (findServiceProcess(pid)) {
@@ -364,6 +368,7 @@ function taskState() {
           env: { ...process.env, CODEX_ROUTER_TASK: taskName },
           stdio: ["ignore", "pipe", "ignore"],
           timeout: TASK_STATE_TIMEOUT_MS,
+          windowsHide: true,
         },
       ).trim().toLowerCase();
     } catch {

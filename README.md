@@ -4,11 +4,12 @@
 的精简分支：Codex 保持使用官方模型目录，本地路由器只负责把请求转发到官方
 Codex 后端或已配置的第三方服务商。
 
-默认路由是 `official`。对官方目录中的 GPT 模型，可以用全局开关把下一次 GPT
-请求发往官方后端或 WLB；选择器选中的 `gpt-*` 模型名原样传给 WLB，
-新增模型无需修改本地名单，实际可用性取决于 WLB 上游支持。路由状态是全局设置，不绑定线程，从下一次 GPT
-请求起对所有任务生效；同一任务中途切换服务商可能带来历史上下文兼容风险。MiMo
-和 WLB 的旧命名空间 slug 仍保留给旧目录或直接请求使用，但不会显示在官方模型选择器中。
+默认路由是 `official`。对官方目录中的 GPT 模型，主代理遵循全局 `official`/`wlb`
+开关，已识别的原生 `gpt-*` 子代理固定走官方。选择器选中的 `gpt-*` 模型名原样传给
+WLB，新增模型无需修改本地名单，实际可用性取决于 WLB 上游支持。全局设置不绑定
+线程，从下一次非子代理的原生 GPT 请求起对所有任务共享；同一任务中途切换服务商可能带来
+历史上下文兼容风险。MiMo 和 WLB 的旧命名空间 slug 仍保留给旧目录或直接请求
+使用，但不会显示在官方模型选择器中。
 
 默认安装不写入 `model_catalog_json`，也不构建静态模型目录；Codex 的官方目录由
 Codex 自己更新。`src/catalog.mjs` 仍保留为需要旧命名空间目录时的手动工具。
@@ -33,8 +34,9 @@ clean EOF，未发出响应头的请求返回 503。可用 `MODEL_ROUTER_SHUTDOW
 
 ```
 Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.mjs
-    ├─ 官方 GPT + route official → ChatGPT Codex 后端（透传 Codex 身份验证）
-    ├─ 官方 GPT + route wlb      → WLB Relay（注入 WLB_API_KEY）
+    ├─ 已识别的 GPT 子代理      → ChatGPT Codex 后端（透传 Codex 身份验证）
+    ├─ GPT 主代理 + route official → ChatGPT Codex 后端（透传 Codex 身份验证）
+    ├─ GPT 主代理 + route wlb      → WLB Relay（注入 WLB_API_KEY）
     ├─ mimo-token-plan/*         → MiMo Token Plan（旧命名空间，注入 MIMO_API_KEY）
     └─ wlb-relay/*               → WLB Relay（旧命名空间，注入 WLB_API_KEY）
 ```
@@ -43,10 +45,16 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
   官方目录并自行更新。需要旧目录时可手动运行 `node src/catalog.mjs`；这不会改变
   默认安装路径。
 - **GPT 路由开关**：`route official|wlb|status` 写入或读取全局路由状态，切换从下
-  一次 GPT 请求生效，不需要重启服务或 Codex。`wlb` 按请求中的 GPT 模型名直接转发，
+  一次非子代理的原生 GPT 请求生效，不需要重启服务或 Codex。`wlb` 按请求中的 GPT 模型名直接转发，
   不依赖本地模型名单；上游不支持时返回其错误，不回退官方。`route status` 只读；只有总状态命令支持
   `--json`（`status --json`）。该开关不绑定线程，同一任务中途切换服务商可能带来
   历史上下文兼容风险。
+- **GPT 子代理**：已识别的原生 `gpt-*` 子代理固定走官方，普通请求和压缩请求
+  共用规则，且不读取全局路由状态，因此损坏的路由状态也不会阻断已识别的子代理。
+  识别复用 `x-openai-subagent`、有效的 `x-codex-parent-thread-id`，或线程 rollout 的
+  `source.subagent.thread_spawn`；明确的 `false`/`0` 子代理头不作为证据。rollout 缺失
+  或首行未写完时会在下次请求重试；没有可识别证据的请求仍按主代理请求遵循全局开关。
+  此规则只适用于原生 `gpt-*`，显式 `wlb-relay/*` 和 MiMo 路由继续遵循原命名空间。
 - **旧命名空间路由**：WLB 的 `wlb-relay/gpt-5.6-sol`、`terra`、`luna` 与官方
   GPT slug 一一对应；MiMo 的两个命名空间 slug 继续由原路由处理，但两者都不进入
   官方选择器。
@@ -89,8 +97,8 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
                                                 # 仅使用官方路由时无需第三方密钥
 .\codex-router.ps1 provider-key mimo-token-plan set  # 使用 MiMo 时再配置
 .\codex-router.ps1 provider-key wlb-relay set        # 使用 WLB 时再配置
-.\codex-router.ps1 route official             # 全局：GPT 请求走官方（默认）
-.\codex-router.ps1 route wlb                  # 全局：GPT 请求走 WLB
+.\codex-router.ps1 route official             # 全局：GPT 主代理请求走官方（默认）
+.\codex-router.ps1 route wlb                  # 全局：GPT 主代理请求走 WLB；原生子代理固定官方
 .\codex-router.ps1 route status               # 查看当前 GPT 路由
 .\codex-router.ps1 enable
 .\codex-router.ps1 start
@@ -131,8 +139,8 @@ owner 冲突。安装完成后完全退出并重新打开 Codex，使新的本�
 - 维护旧命名空间目录：手动运行 `node src/catalog.mjs`；如修改了
   `config/<provider>/models.json`，再运行同一命令并按需要重载路由器。旧目录构建
   失败时，WLB 模型必须能精确找到对应的官方 `upstreamModel`。
-- 切换 GPT 路由：运行 `route official` 或 `route wlb`；设置从下一次 GPT 请求生效，
-  对所有任务共享且无需重启。运行 `route status` 可只读查看当前设置；同一任务中途
+- 切换 GPT 路由：运行 `route official` 或 `route wlb`；设置从下一次非子代理的原生 GPT 请求生效，
+  对所有任务共享且无需重启；已识别的原生 GPT 子代理固定走官方。运行 `route status` 可只读查看当前设置；同一任务中途
   切换服务商可能带来历史上下文兼容风险。
 - 检查：`node test/catalog-metadata.mjs`、
   `node --test test/official-catalog.mjs`、

@@ -1108,12 +1108,13 @@ async function handleResponses(request, response, requestUrl) {
     const body = await decodeBody(encoded, request.headers["content-encoding"]);
     const payload = parseBody(body);
     requestedModel = typeof payload.model === "string" ? payload.model : "";
+    const activityMetadata = activityMetadataFromHeaders(request.headers);
     const nativeGpt = requestedModel.startsWith("gpt-") && !MODEL_BY_SLUG.has(requestedModel);
     let registeredRoute = MODEL_BY_SLUG.get(requestedModel);
     if (nativeGpt) {
       let gptRoute;
       try {
-        gptRoute = readGptRoute();
+        gptRoute = activityMetadata.isSubagent ? "official" : readGptRoute();
       } catch (error) {
         writeJson(response, 503, { error: { type: "invalid_gpt_route", message: error.message } });
         return;
@@ -1129,7 +1130,7 @@ async function handleResponses(request, response, requestUrl) {
     } else {
       registeredRoute ??= MODEL_BY_SLUG.get(readNativeAliases()[requestedModel]);
     }
-    // GPT 请求统一使用新开关；旧 alias/redirect 仅保留给其他模型，
+    // 原生 GPT 子代理固定官方，其余 GPT 使用全局开关；旧 alias/redirect 仅保留给其他模型，
     // 避免选择 official 后仍被历史配置转发到第三方。
     if (!nativeGpt && !registeredRoute && requestedModel) {
       const redirect = MODEL_BY_SLUG.get(readNativeRedirect());
@@ -1155,7 +1156,7 @@ async function handleResponses(request, response, requestUrl) {
     activity.setRoute({
       provider: route ? canonicalProviderId(route.provider) : "openai",
       model: route?.slug || requestedModel || undefined,
-      ...activityMetadataFromHeaders(request.headers),
+      ...activityMetadata,
     });
     const compactV1 = /\/responses\/compact$/.test(requestUrl.pathname);
     const compactV2 =

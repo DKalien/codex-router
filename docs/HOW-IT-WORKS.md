@@ -3,7 +3,7 @@
 Codex Router Lite 只包含一个本地 Node 路由器。Codex 继续使用内置的 `openai`
 服务商，但由路由器管理的 `openai_base_url` 指向本地路由器。默认安装不写入
 `model_catalog_json`，因此 Codex 继续使用并自行更新官方模型目录。路由器根据请求
-中的模型 slug 和全局 GPT 路由设置选择官方处理或第三方路由处理。
+中的模型 slug、子代理元数据和全局 GPT 路由设置选择官方处理或第三方路由处理。
 
 ## 请求流程
 
@@ -16,10 +16,10 @@ sequenceDiagram
   participant W as WLB Relay
 
   C->>R: 携带 caller URL 的 Responses 请求
-  alt 官方 GPT + route official
+  alt 已识别的原生 GPT 子代理或 GPT 主代理 + route official
     R->>N: 白名单 Codex 请求头和原生模型
     N-->>R: Responses 响应或数据流
-  else 官方 GPT + route wlb
+  else GPT 主代理 + route wlb
     R->>W: 同名 GPT 模型和 WLB 密钥
     W-->>R: Responses 响应或数据流
   else mimo-token-plan/*（旧命名空间）
@@ -94,13 +94,22 @@ supports_search_tool
 ## 路由和凭据
 
 `src/gpt-route.mjs` 将 `official` 或 `wlb` 写入状态目录；文件不存在时默认使用
-`official`。这是全局设置，不绑定线程，从下一次 GPT 请求起对所有任务生效。使用
+`official`。这是全局设置，不绑定线程，从下一次非子代理的原生 GPT 请求起对所有任务共享。使用
 `wlb` 时，`src/router.mjs` 将请求中的 `gpt-*` 模型名原样发送给 WLB，不依赖
 旧静态模型名单。官方新增模型无需修改 Router；WLB 上游不支持时返回其错误，不会回退到官方。正在执行的任务中途切换服务商可能带来
 历史上下文兼容风险。`route status` 只读；`--json` 仅由总状态命令支持。
 
-对于官方 GPT slug，`official` 路由使用白名单 Codex 请求头将请求转发给原生 Codex
-后端；`wlb` 路由注入 WLB 密钥并使用同名的 WLB 模型。独立的 `/alpha/search` 搜索
+对于原生 `gpt-*`，已识别的子代理固定走官方：复用 `x-openai-subagent`（忽略明确
+的 `false`/`0`）、有效的 `x-codex-parent-thread-id` 或线程 rollout 中的
+`source.subagent.thread_spawn`。首次请求时 rollout 缺失或首行未写完不会缓存负结果，
+后续请求会重新识别；没有可识别证据时仍按主代理请求遵循全局路由。子代理固定官方
+不读取全局状态，因此损坏的全局状态只阻断 GPT 主代理请求。此规则同时覆盖
+`/responses`、`/responses/compact` 和 `/responses` 内以 `compaction_trigger` 触发的
+压缩 v2；没有独立的 `/responses/compact/v2` 端点。显式 `wlb-relay/*` 与 MiMo
+命名空间路由保持原语义。
+
+官方路由使用白名单 Codex 请求头并保留客户端 `Authorization`，将请求转发给原生
+Codex 后端；GPT 主代理的 `wlb` 路由注入 WLB 密钥并使用同名的 WLB 模型。独立的 `/alpha/search` 搜索
 请求和图片请求也只会转发给原生后端，并且必须
 携带非空的 `Authorization`，否则本地直接返回 `401`，不访问上游。原生 SSE
 已经观察到 `response.completed` 后，即使客户端紧接着关闭连接，也按 upstream status
@@ -214,7 +223,7 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | `src/response-usage.mjs` | 从 JSON 或 SSE 响应提取 Token 用量并保持响应透传 |
 | `src/sse-prefix.mjs` | 有界识别无 `content-type` 的 SSE 并保持探测字节顺序 |
 | `src/catalog.mjs` | 为需要旧命名空间目录的手动流程捕获官方目录并生成 8 条目的合并目录 |
-| `src/gpt-route.mjs` | 读写全局 GPT 路由状态，默认官方路由 |
+| `src/gpt-route.mjs` | 读写非子代理的原生 GPT 请求的全局路由状态，默认官方路由 |
 | `src/model-registry.mjs` | 加载并验证服务商和模型 |
 | `src/start.mjs` | 监督一个路由器子进程并提供代理环境 |
 | `src/status.mjs` | 只读汇总路由器、配置、目录模式、GPT 路由、Provider、安装和服务状态 |

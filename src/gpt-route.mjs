@@ -59,7 +59,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     try {
       const route = command === "status" ? readGptRoute() : setGptRoute(command);
       console.log(`GPT 路由：${route === "official" ? "官方" : "WLB"} (${route})`);
-      if (command !== "status") console.log("设置已保存；支持此开关的路由器从下一次 GPT 请求起使用新路由，所有任务共享此设置。");
+      if (command !== "status") console.log("设置已保存；支持此开关的路由器从下一次非子代理的原生 GPT 请求起使用新路由，所有任务共享此设置；已识别的原生 GPT 子代理固定走官方。");
     } catch (error) {
       console.error(error.message);
       process.exitCode = 1;

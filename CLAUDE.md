@@ -17,7 +17,7 @@
 
 - `src/router.mjs` — 完整请求路径（官方请求透传、全局 GPT 路由，以及注入各服务商
   凭据后的旧命名空间直接转发）
-- `src/gpt-route.mjs` — 读写全局 GPT 路由状态，默认使用官方路由
+- `src/gpt-route.mjs` — 读写非子代理的原生 GPT 请求的全局路由状态，默认使用官方路由
 - `src/catalog.mjs` — 仅供手动旧目录流程根据官方捕获和 `config/` 构建
   `merged-models.json`；WLB 以对应官方条目为元数据基线，MiMo 输出明确指定的
   Xiaomi 元数据
@@ -41,8 +41,11 @@
   `gpt-5.6-sol/terra/luna`、MiMo `mimo-v2.5-pro` 和 `mimo-v2.5`，以及 WLB
   `gpt-5.6-sol/terra/luna`；其中 5 个模型位于两个服务商的命名空间下并由路由器转发。
 - `route official|wlb|status` 管理或读取全局 GPT 路由；缺少状态文件时默认为
-  `official`。设置从下一次 GPT 请求起对所有任务共享，不绑定线程；同一任务中途切换
-  服务商可能带来历史上下文兼容风险。`wlb` 原样转发请求中的 `gpt-*` 模型名，不依赖旧目录注册，
+  `official`。设置从下一次非子代理的原生 GPT 请求起对所有任务共享，不绑定线程；已识别的
+  原生 `gpt-*` 子代理固定走官方，不读取全局路由状态。识别复用子代理/父线程请求头和
+  rollout 的 `source.subagent.thread_spawn`；缺失或未写完的 rollout 不缓存负结果，
+  没有可识别证据时仍遵循全局路由。显式 `wlb-relay/*` 与 MiMo 路由保持原语义。
+  同一任务中途切换服务商可能带来历史上下文兼容风险。`wlb` 原样转发请求中的 `gpt-*` 模型名，不依赖旧目录注册，
   上游不支持时返回错误且不回退官方；`route status` 只读且不支持 `--json`，只有总状态命令支持 `status --json`。
 - `/models` 和 `/v1/models` 始终使用官方身份透传官方查询参数和完整元数据；WLB
   路由不替换官方模型列表。

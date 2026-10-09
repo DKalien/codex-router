@@ -115,6 +115,8 @@ function rolloutMetadata(threadId, sessionsPath) {
   if (cachedRolloutMetadata.has(key)) return cachedRolloutMetadata.get(key);
   const rolloutPath = findRollout(sessionsPath, threadId);
   const payload = rolloutPath ? firstJsonLine(rolloutPath)?.payload : undefined;
+  // 首次请求可能早于 rollout 首行写完；缺失或未写完时留待下次重新识别。
+  if (!payload || typeof payload !== "object") return undefined;
   const spawn = payload?.source?.subagent?.thread_spawn;
   const metadata = {
     threadId,
@@ -190,7 +192,10 @@ export function activityMetadataFromHeaders(
   const sessionName = sessionId
     ? sessionNames(indexPath).get(sessionId.toLowerCase())
     : undefined;
-  const headerAgent = headerText(headers, "x-openai-subagent")?.trim();
+  const subagentHeader = headerText(headers, "x-openai-subagent")?.trim();
+  const headerAgent = subagentHeader && !["false", "0"].includes(subagentHeader.toLowerCase())
+    ? subagentHeader
+    : undefined;
   const agentName = shortAgentName(rollout?.agentPath) ||
     (headerAgent && !["1", "true"].includes(headerAgent.toLowerCase())
       ? headerAgent

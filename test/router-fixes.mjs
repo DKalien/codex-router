@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import os from "node:os";
@@ -101,8 +101,9 @@ async function startRouter(overrides = {}) {
   };
 }
 
-test("官方目录的 GPT 路由可热切换并保持模型对应，错误不回退官方", async () => {
+test("原生 GPT 主代理遵循全局路由，子代理固定官方，旧命名空间和错误边界保持不变", async () => {
   const received = [];
+  const receivedUrls = [];
   const catalog = { models: [{ slug: "gpt-new-model", context_window: 123456, future_capability: true }] };
   const upstream = (provider) => http.createServer(async (request, response) => {
     if (request.method === "GET") {
@@ -114,6 +115,7 @@ test("官方目录的 GPT 路由可热切换并保持模型对应，错误不回
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    receivedUrls.push(request.url);
     received.push({ provider, model: body.model, authorization: request.headers.authorization });
     if (provider === "wlb" && body.model === "gpt-unsupported") {
       response.writeHead(404, { "Content-Type": "application/json" });
@@ -134,16 +136,18 @@ test("官方目录的 GPT 路由可热切换并保持模型对应，错误不回
     CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${officialPort}`,
     WLB_BASE_URL: `http://127.0.0.1:${wlbPort}`,
     WLB_API_KEY: "test-wlb-key",
+    CODEX_ROUTER_SESSIONS_PATH: "",
+    CODEX_ROUTER_SESSION_INDEX: "",
   });
   const cli = (command, extraEnv = {}) => spawnSync(process.execPath, [path.join(root, "src/gpt-route.mjs"), command], {
     encoding: "utf8",
     env: { ...process.env, CODEX_HOME: router.stateDir, MODEL_ROUTER_STATE_DIR: router.stateDir, WLB_API_KEY: "test-wlb-key", ...extraEnv },
   });
-  const request = async (model, endpoint = "responses") => {
+  const request = async (model, endpoint = "responses", headers = {}, input = [{ role: "user", content: "你好" }]) => {
     const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/${endpoint}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: "Bearer test-official-key" },
-      body: JSON.stringify({ model, input: [{ role: "user", content: "你好" }], stream: false }),
+      headers: { "Content-Type": "application/json", Authorization: "Bearer test-official-key", ...headers },
+      body: JSON.stringify({ model, input, stream: false }),
     });
     return { status: response.status, body: await response.json() };
   };
@@ -169,6 +173,56 @@ test("官方目录的 GPT 路由可热切换并保持模型对应，错误不回
     assert.equal((await request("gpt-new-model", "responses/compact")).status, 200);
     assert.equal(received.at(-1).provider, "wlb");
     assert.equal(received.at(-1).model, "gpt-new-model");
+    const compactV2Input = [{ role: "user", content: "你好" }, { type: "compaction_trigger" }];
+    const endpoints = [["responses", undefined], ["responses/compact", undefined], ["responses", compactV2Input]];
+    const parentId = "00000000-0000-4000-8000-000000000001";
+    const childId = "00000000-0000-4000-8000-000000000002";
+    const markers = [
+      { "x-openai-subagent": "true" },
+      { "x-openai-subagent": "reviewer" },
+      { "x-codex-parent-thread-id": parentId },
+      { "x-openai-subagent": "false", "x-codex-parent-thread-id": parentId },
+    ];
+    for (const [endpoint, input] of endpoints) {
+      assert.equal((await request("gpt-new-model", endpoint, {}, input)).status, 200);
+      assert.deepEqual(received.at(-1), { provider: "wlb", model: "gpt-new-model", authorization: "Bearer test-wlb-key" });
+      for (const marker of markers) {
+        assert.equal((await request("gpt-new-model", endpoint, marker, input)).status, 200);
+        assert.deepEqual(received.at(-1), { provider: "official", model: "gpt-new-model", authorization: "Bearer test-official-key" });
+        assert.equal(receivedUrls.at(-1), `/${endpoint}`);
+      }
+    }
+    for (const headers of [
+      { "x-openai-subagent": "" },
+      { "x-openai-subagent": " false " },
+      { "x-openai-subagent": "0" },
+      { "x-openai-subagent": "FALSE", "x-codex-parent-thread-id": "invalid" },
+    ]) {
+      assert.equal((await request("gpt-new-model", "responses", headers, [{ role: "user", content: "subagent thread_spawn" }])).status, 200);
+      assert.equal(received.at(-1).provider, "wlb");
+    }
+    const beforeUnknownEndpoint = received.length;
+    assert.equal((await request("gpt-new-model", "responses/compact/v2", markers[0])).status, 404);
+    assert.equal(received.length, beforeUnknownEndpoint);
+    const rolloutHeaders = { "thread-id": childId };
+    // 同一线程先缺文件，再出现空/未写完首行，最后才写入可识别的子代理元数据。
+    assert.equal((await request("gpt-new-model", "responses", rolloutHeaders)).status, 200);
+    assert.equal(received.at(-1).provider, "wlb");
+    const sessionsPath = path.join(router.stateDir, "sessions");
+    mkdirSync(sessionsPath, { recursive: true });
+    const rolloutPath = path.join(sessionsPath, `rollout-test-${childId}.jsonl`);
+    for (const partial of ["", '{"payload":']) {
+      writeFileSync(rolloutPath, partial);
+      assert.equal((await request("gpt-new-model", "responses", rolloutHeaders)).status, 200);
+      assert.equal(received.at(-1).provider, "wlb");
+    }
+    writeFileSync(rolloutPath, `${JSON.stringify({ type: "session_meta", payload: { id: childId, source: { subagent: { thread_spawn: { parent_thread_id: parentId } } } } })}\n`);
+    for (const [endpoint, input] of endpoints) {
+      assert.equal((await request("gpt-new-model", endpoint, rolloutHeaders, input)).status, 200);
+      assert.deepEqual(received.at(-1), { provider: "official", model: "gpt-new-model", authorization: "Bearer test-official-key" });
+    }
+    assert.equal((await request("gpt-new-model", "responses", { ...rolloutHeaders, "x-openai-subagent": "0" })).status, 200);
+    assert.equal(received.at(-1).provider, "official");
     const beforeUnsupported = received.length;
     assert.equal((await request("gpt-unsupported")).status, 404);
     assert.equal(received.length, beforeUnsupported + 1);
@@ -177,10 +231,14 @@ test("官方目录的 GPT 路由可热切换并保持模型对应，错误不回
     writeFileSync(path.join(router.stateDir, "gpt-route.json"), "broken");
     assert.equal((await request("gpt-5.6-sol")).status, 503);
     assert.equal(received.length, beforeFailure);
+    for (const marker of [...markers, rolloutHeaders]) {
+      assert.equal((await request("gpt-5.6-sol", "responses", marker)).status, 200);
+      assert.deepEqual(received.at(-1), { provider: "official", model: "gpt-5.6-sol", authorization: "Bearer test-official-key" });
+    }
     assert.equal(cli("official").status, 0);
     assert.equal((await request("gpt-unregistered")).status, 200);
     assert.equal(received.at(-1).provider, "official");
-    assert.equal((await request("wlb-relay/gpt-5.6-sol")).status, 200);
+    assert.equal((await request("wlb-relay/gpt-5.6-sol", "responses", markers[0])).status, 200);
     assert.equal(received.at(-1).provider, "wlb");
     assert.equal(cli("invalid").status, 2);
     assert.match(cli("status").stdout, /official/);

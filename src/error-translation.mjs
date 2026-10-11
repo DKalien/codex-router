@@ -69,7 +69,7 @@ function parseUpstreamError(bodyText) {
       (typeof parsed?.detail === "string" && parsed.detail) ||
       cleanedBody,
     );
-    const type = [error?.type, error?.status].find((value) => typeof value === "string");
+    const type = [error?.code, error?.type, error?.status].filter((value) => typeof value === "string").join(" ");
     return { message, type };
   } catch {
     // Non-JSON bodies (HTML gateway pages, plain text) pass through as-is.
@@ -93,21 +93,13 @@ export function extractUpstreamDetail(bodyText) {
 // insufficient_quota, DeepSeek 402, xAI 403, Anthropic 400), so the body has
 // to be checked before the status mapping — a quota 429 must not advise
 // "retry", and a no-credits 403 must not blame credentials.
-const QUOTA_PATTERNS = [
+const EXPLICIT_QUOTA_PATTERNS = [
   /insufficient[_\s]quota/i,
   /exceeded your current quota/i,
   /insufficient (?:balance|credits?)/i,
   /credit balance is too low/i,
   /(?:no|any|out of) credits/i,
-  // Both word orders occur in the wild: "usage limit reached" (zai) and
-  // "reached your usage limit" (Kimi).
-  /usage limit(?:s)? (?:reached|exceeded|hit)/i,
-  /reached your (?:usage|monthly|daily) limit/i,
-  /(?:monthly|daily|plan) usage limit/i,
-  /purchase extra usage/i,
-  /upgrade your plan/i,
   /quota\b[^.]*\bexhausted/i,
-  /quota (?:exceeded|exhausted|will be refreshed)/i,
   /\barrears\b/i,
   /balance (?:is )?(?:too low|not enough|insufficient)/i,
   // Chinese-market providers (Alibaba, SiliconFlow, zai, Moonshot) report
@@ -117,29 +109,49 @@ const QUOTA_PATTERNS = [
   /额度(?:不足|已用完)/,
 ];
 
+const QUOTA_HINT_PATTERNS = [
+  // Both word orders occur in the wild: "usage limit reached" (zai) and
+  // "reached your usage limit" (Kimi).
+  /usage limit(?:s)? (?:reached|exceeded|hit)/i,
+  /reached your (?:usage|monthly|daily) limit/i,
+  /(?:monthly|daily|plan) usage limit/i,
+  /quota (?:exceeded|exhausted|will be refreshed)/i,
+  /purchase extra usage/i,
+  /upgrade your plan/i,
+];
+
 // A plan that never included this API is not a rejected credential and not an
 // exhausted balance: nothing the operator does with keys or top-ups changes it.
 // Command Code answers a Go-plan key with "Your Go plan doesn't include API
 // access. Upgrade to Provider or higher", which read as bad credentials and
 // sent people back through setup.
-const ENTITLEMENT_PATTERNS = [
+const EXPLICIT_ENTITLEMENT_PATTERNS = [
   /plan does(?:n't| not) include/i,
   /not included (?:in|with) your .{0,40}plan/i,
-  /upgrade to [\w\s]{1,30}(?:or higher|plan)/i,
-  /requires? (?:the |a |an )?[\w\s]{1,30}plan/i,
   /plan does(?:n't| not) support/i,
   /no api access/i,
 ];
 
 function isPlanEntitlement(detail) {
-  return ENTITLEMENT_PATTERNS.some((pattern) => pattern.test(detail));
+  return EXPLICIT_ENTITLEMENT_PATTERNS.some((pattern) => pattern.test(detail)) ||
+    /upgrade to [\w\s]{1,30}(?:or higher|plan)|requires? (?:the |a |an )?[\w\s]{1,30}plan/i.test(detail);
 }
 
 function isOutOfUsage(detail, errorType) {
   if (typeof errorType === "string" && /quota|billing|resource_exhausted/i.test(errorType)) {
     return true;
   }
-  return QUOTA_PATTERNS.some((pattern) => pattern.test(detail));
+  return [...EXPLICIT_QUOTA_PATTERNS, ...QUOTA_HINT_PATTERNS].some((pattern) => pattern.test(detail));
+}
+
+// 自动切换只接受明确的余额/额度耗尽，排除套餐权限和临时限流。
+export function isUsageExhausted(status, bodyText) {
+  if (![400, 402, 403, 429].includes(status)) return false;
+  const { message, type } = parseUpstreamError(bodyText);
+  if (EXPLICIT_ENTITLEMENT_PATTERNS.some((pattern) => pattern.test(message))) return false;
+  if (/(?:^|\s)(?:insufficient_quota|billing_hard_limit(?:_reached)?)(?:$|\s)/i.test(type || "")) return true;
+  if (/per[-\s]?(?:minute|second|hour|day)|(?:request|token|rate)[^.]{0,30}(?:quota|limit)|(?:quota|limit)[^.]{0,30}(?:request|token|rate)|retry (?:in|after)|try again later/i.test(message)) return false;
+  return EXPLICIT_QUOTA_PATTERNS.some((pattern) => pattern.test(message));
 }
 
 function describeFailure({

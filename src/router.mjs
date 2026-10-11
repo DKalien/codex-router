@@ -32,12 +32,13 @@ import {
 import {
   NATIVE_CATALOG_PATH,
   PORTS,
+  SHUTDOWN_REQUEST_PATH,
   loopback,
 } from "./paths.mjs";
 import { MODEL_BY_SLUG, PROVIDERS, providerForModel } from "./model-registry.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
 import { readNativeRedirect } from "./native-redirect.mjs";
-import { readGptRoute } from "./gpt-route.mjs";
+import { readGptRoute, setGptRoute } from "./gpt-route.mjs";
 import {
   canonicalProviderId,
   readProviderSelection,
@@ -49,7 +50,7 @@ import {
   ResponseUsageTransform,
   tokenUsageFromPayload,
 } from "./response-usage.mjs";
-import { fetchWithRetry } from "./upstream-retry.mjs";
+import { fetchWithRetry, sleep } from "./upstream-retry.mjs";
 import {
   CollaborationToolCallTransform,
   flattenCollaborationHistory,
@@ -62,7 +63,7 @@ import {
   pruneMimoAgentProgress,
 } from "./mimo-custom-tools.mjs";
 import { activityMetadataFromHeaders } from "./codex-session-names.mjs";
-import { translateGatewayError } from "./error-translation.mjs";
+import { isUsageExhausted, translateGatewayError } from "./error-translation.mjs";
 import { recordUsageEvent } from "./usage-events.mjs";
 import { VERSION } from "./version.mjs";
 
@@ -330,6 +331,24 @@ function nativeHeaders(request) {
   }
   return headers;
 }
+
+async function prepareNativeRequest(request, requestUrl, payload, compactV1) {
+  const native = { ...payload };
+  normalizeNativePromptCacheCompatibility(native);
+  if (Array.isArray(payload.input)) native.input = normalizeNativeInput(payload.input);
+  if (!compactV1) delete native.previous_response_id;
+  const headers = nativeHeaders(request);
+  return {
+    target: nativeTarget(requestUrl.pathname, requestUrl.search),
+    headers,
+    routedBody: await compressedNativeBody(Buffer.from(JSON.stringify(native), "utf8"), headers),
+  };
+}
+
+const fallbackDelayValue = process.env.CODEX_ROUTER_WLB_FALLBACK_DELAY_MS;
+const fallbackDelayNumber = Number(fallbackDelayValue);
+const WLB_FALLBACK_DELAY_MS = fallbackDelayValue?.trim() && Number.isInteger(fallbackDelayNumber) &&
+  fallbackDelayNumber >= 0 && fallbackDelayNumber <= 30_000 ? fallbackDelayNumber : 5_000;
 
 function routedHeaders(credential) {
   return {
@@ -979,15 +998,18 @@ async function summarize(request, payload, route, signal) {
     }
     throw error;
   }
-  const parsed = JSON.parse(bytes.toString("utf8"));
+  const bodyText = bytes.toString("utf8");
+  if (!upstream.ok) {
+    let parsed;
+    try { parsed = JSON.parse(bodyText); } catch { parsed = { error: { message: bodyText } }; }
+    return { ok: false, status: upstream.status, payload: parsed, bodyText, usage: tokenUsageFromPayload(parsed) };
+  }
+  const parsed = JSON.parse(bodyText);
   // Compaction is a plain non-streaming call, so the usage block (when the
   // provider sends one) is already in hand. `tokenUsageFromPayload` returns
   // undefined when it is absent, and `recordUsageEvent` then omits the token
   // fields entirely rather than metering an invented zero.
   const usage = tokenUsageFromPayload(parsed);
-  if (!upstream.ok) {
-    return { ok: false, status: upstream.status, payload: parsed, usage };
-  }
   return { ok: true, summary: extractResponseText(parsed), input: originalInput, usage };
 }
 
@@ -1034,8 +1056,7 @@ function writeCompactionSse(response, model, summary) {
 async function handleRoutedCompaction(request, response, payload, route, signal, v2) {
   const result = await summarize(request, payload, route, signal);
   if (!result.ok) {
-    writeJson(response, result.status, result.payload);
-    return { status: result.status, usage: result.usage };
+    return { status: result.status, usage: result.usage, payload: result.payload, bodyText: result.bodyText };
   }
   if (v2) {
     if (payload.stream === false) {
@@ -1158,6 +1179,32 @@ async function handleResponses(request, response, requestUrl) {
       model: route?.slug || requestedModel || undefined,
       ...activityMetadata,
     });
+    const fallbackToOfficial = async (status, bodyText) => {
+      if (!nativeGpt || activityMetadata.isSubagent || route?.provider !== "wlb-relay" ||
+          !isUsageExhausted(status, bodyText) || !nothingRelayed(response) || controller.signal.aborted ||
+          typeof request.headers.authorization !== "string" || !request.headers.authorization.trim()) return false;
+      try {
+        // 重新验证状态，损坏或写入失败时停止，沿用 owner 校验和原子写入。
+        readGptRoute();
+        setGptRoute("official");
+      } catch (error) {
+        const failure = new Error(`WLB 额度耗尽，但无法保存官方路由：${error.message}`);
+        failure.status = 503;
+        throw failure;
+      }
+      console.error(`[codex-router] model=${requestedModel} status=${status} route=official wait-ms=${WLB_FALLBACK_DELAY_MS}`);
+      route = undefined;
+      activity.setRoute({ provider: "openai", model: requestedModel, ...activityMetadata });
+      controller.signal.throwIfAborted();
+      await sleep(WLB_FALLBACK_DELAY_MS, controller.signal);
+      controller.signal.throwIfAborted();
+      if (!nothingRelayed(response)) {
+        const failure = new Error("官方重发已停止：响应已发送或连接已关闭。");
+        failure.name = "AbortError";
+        throw failure;
+      }
+      return true;
+    };
     const compactV1 = /\/responses\/compact$/.test(requestUrl.pathname);
     const compactV2 =
       route &&
@@ -1188,7 +1235,11 @@ async function handleResponses(request, response, requestUrl) {
           `[codex-router] model=${requestedModel || "unknown"} provider=${route.provider} status=${compaction.status}`,
         );
       }
-      return;
+      if (!compaction.payload) return;
+      if (!await fallbackToOfficial(compaction.status, compaction.bodyText ?? JSON.stringify(compaction.payload))) {
+        writeJson(response, compaction.status, compaction.payload);
+        return;
+      }
     }
 
     let target;
@@ -1256,18 +1307,7 @@ async function handleResponses(request, response, requestUrl) {
       headers = routedHeaders(credential);
       routedBody = Buffer.from(JSON.stringify(routed), "utf8");
     } else {
-      const native = { ...payload };
-      normalizeNativePromptCacheCompatibility(native);
-      if (Array.isArray(payload.input)) {
-        native.input = normalizeNativeInput(payload.input);
-      }
-      if (!compactV1) delete native.previous_response_id;
-      target = nativeTarget(requestUrl.pathname, requestUrl.search);
-      headers = nativeHeaders(request);
-      routedBody = await compressedNativeBody(
-        Buffer.from(JSON.stringify(native), "utf8"),
-        headers,
-      );
+      ({ target, headers, routedBody } = await prepareNativeRequest(request, requestUrl, payload, compactV1));
     }
 
     // `routedBody` is a fully materialized Buffer -- plain JSON, or the zstd
@@ -1276,7 +1316,7 @@ async function handleResponses(request, response, requestUrl) {
     // attempt replays the identical bytes under the identical encoding. Nothing
     // here consumes a stream, which is what makes the request replayable at
     // all.
-    const { response: upstream, retries } = await fetchWithRetry(
+    let { response: upstream, retries } = await fetchWithRetry(
       target,
       {
         method: "POST",
@@ -1297,35 +1337,38 @@ async function handleResponses(request, response, requestUrl) {
     // Native traffic passes through untouched: OpenAI errors are already clear.
     if (route && !upstream.ok) {
       const provider = providerForModel(route);
-      const retryAfterHeader = upstream.headers.get("retry-after");
-      const retryAfterSeconds = Number(retryAfterHeader);
-      if (retryAfterHeader) response.setHeader("Retry-After", retryAfterHeader);
-      writeJson(
-        response,
-        upstream.status,
-        translateGatewayError({
-          status: upstream.status,
-          bodyText: await readResponseTextLimited(upstream),
-          modelName: route.displayName || route.slug,
-          providerName: provider?.ownedBy || provider?.displayName || route.provider,
-          providerKind: provider?.kind,
-          retryAfterSeconds: Number.isFinite(retryAfterSeconds)
-            ? retryAfterSeconds
-            : undefined,
-        }),
-      );
+      const bodyText = await readResponseTextLimited(upstream);
       recordUsageEvent({
         model: route.slug,
         provider: canonicalProviderId(route.provider),
         status: upstream.status,
         durationMs: Date.now() - startedAt,
       });
-      if (!QUIET) {
-        console.error(
-          `[codex-router] model=${requestedModel || "unknown"} provider=${route.provider} status=${upstream.status}`,
-        );
+      if (await fallbackToOfficial(upstream.status, bodyText)) {
+        ({ target, headers, routedBody } = await prepareNativeRequest(request, requestUrl, payload, compactV1));
+        ({ response: upstream, retries } = await fetchWithRetry(target, {
+          method: "POST", headers, body: routedBody, signal: controller.signal,
+        }, {
+          canRetry: () => nothingRelayed(response),
+          onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
+        }));
+        upstreamRetries = retries;
+        upstreamStatus = upstream.status;
+      } else {
+        const retryAfterHeader = upstream.headers.get("retry-after");
+        const retryAfterSeconds = Number(retryAfterHeader);
+        if (retryAfterHeader) response.setHeader("Retry-After", retryAfterHeader);
+        writeJson(response, upstream.status, translateGatewayError({
+          status: upstream.status,
+          bodyText,
+          modelName: route.displayName || route.slug,
+          providerName: provider?.ownedBy || provider?.displayName || route.provider,
+          providerKind: provider?.kind,
+          retryAfterSeconds: Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : undefined,
+        }));
+        if (!QUIET) console.error(`[codex-router] model=${requestedModel || "unknown"} provider=${route.provider} status=${upstream.status}`);
+        return;
       }
-      return;
     }
     // Native OpenAI responses carry the same `usage` shape as routed ones, so
     // meter both paths; without this, native traffic reports zero tokens.
@@ -1696,4 +1739,7 @@ server.listen(LISTEN_PORT, LISTEN_HOST, () => {
   console.error("[codex-router] listening");
 });
 
-installGracefulShutdown(server, { label: "codex-router" });
+installGracefulShutdown(server, {
+  label: "codex-router",
+  stopFile: SHUTDOWN_REQUEST_PATH,
+});

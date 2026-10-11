@@ -8,11 +8,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { createZstdCompress, gzipSync, zstdCompressSync } from "node:zlib";
+import { createZstdCompress, gzipSync, zstdCompressSync, zstdDecompressSync } from "node:zlib";
 
 import { ResponseUsageTransform } from "../src/response-usage.mjs";
 import { readResponseTextLimited } from "../src/http-utils.mjs";
-import { sanitizeUpstreamText } from "../src/error-translation.mjs";
+import { isUsageExhausted, sanitizeUpstreamText } from "../src/error-translation.mjs";
 import { statusIsReady } from "../src/status.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1448,5 +1448,197 @@ test("持续 SSE chunk 会重置 idle timeout", async () => {
   } finally {
     await router.close();
     await close(upstream);
+  }
+});
+
+
+test("WLB 明确额度耗尽在输出前持久化官方并等待，原生身份和压缩协议保持完整", async () => {
+  const received = [];
+  let rejection = { status: 403, error: { message: "日限额额度已用完" } };
+  let officialStatus = 200;
+  let sabotage;
+  const official = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    let bytes = Buffer.concat(chunks);
+    if (request.headers["content-encoding"] === "zstd") bytes = zstdDecompressSync(bytes);
+    received.push({ provider: "official", url: request.url, headers: request.headers, body: JSON.parse(bytes.toString()), at: Date.now() });
+    response.writeHead(officialStatus, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(officialStatus === 200 ? { output: [], usage: { input_tokens: 7, output_tokens: 2 } } : { error: { message: "official failure" } }));
+  });
+  const wlb = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    received.push({ provider: "wlb", body: JSON.parse(Buffer.concat(chunks).toString()), headers: request.headers, at: Date.now() });
+    sabotage?.();
+    if (rejection.stream) {
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.write('data: {"type":"response.created"}\n\n');
+      response.end(`data: ${JSON.stringify({ type: "error", error: { message: "额度已用完" } })}\n\n`);
+      return;
+    }
+    response.writeHead(rejection.status, { "Content-Type": rejection.text ? "text/plain" : "application/json" });
+    response.end(rejection.text || JSON.stringify({ error: rejection.error }));
+  });
+  const officialPort = await listen(official);
+  const wlbPort = await listen(wlb);
+  const router = await startRouter({ CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${officialPort}`, WLB_BASE_URL: `http://127.0.0.1:${wlbPort}`, WLB_API_KEY: "test-wlb-key", CODEX_ROUTER_WLB_FALLBACK_DELAY_MS: "80", CODEX_ROUTER_NATIVE_RETRIES: "0" });
+  const statePath = path.join(router.stateDir, "gpt-route.json");
+  const reset = () => writeFileSync(statePath, JSON.stringify({ version: 1, route: "wlb" }));
+  const payload = { model: "gpt-5.6-sol", stream: false, client_metadata: { retained: true }, prompt_cache_retention: "24h", previous_response_id: "old", tools: [{ type: "function", name: "test", parameters: {} }], input: [{ role: "user", content: "hello" }, { type: "reasoning", encrypted_content: "other-provider", content: [] }] };
+  const send = async (endpoint = "/responses", body = payload, headers = {}, signal) => {
+    const result = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}${endpoint}`, {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer original-official", "chatgpt-account-id": "original-account", ...headers }, body: JSON.stringify(body), signal,
+    });
+    return { status: result.status, body: await result.json() };
+  };
+  try {
+    for (const endpoint of ["/responses", "/v1/responses", "/responses/compact", "/v1/responses/compact"]) {
+      reset();
+      const before = received.length;
+      assert.equal((await send(endpoint)).status, 200);
+      const [rejected, retried] = received.slice(before);
+      assert.equal(rejected.provider, "wlb");
+      assert.equal(rejected.headers.authorization, "Bearer test-wlb-key");
+      assert.equal(retried.provider, "official");
+      assert.equal(retried.url, endpoint.replace(/^\/v1/, ""));
+      assert.ok(retried.at - rejected.at >= 65, "fallback must wait");
+      assert.equal(retried.headers.authorization, "Bearer original-official");
+      assert.equal(retried.headers["chatgpt-account-id"], "original-account");
+      assert.deepEqual(retried.body.tools, payload.tools);
+      assert.deepEqual(retried.body.client_metadata, payload.client_metadata);
+      assert.equal(retried.body.model, payload.model);
+      assert.equal(retried.body.prompt_cache_retention, undefined);
+      assert.equal(retried.body.input.length, 1);
+      assert.equal(retried.body.previous_response_id, endpoint.endsWith("compact") ? "old" : undefined);
+      assert.equal(JSON.parse(readFileSync(statePath)).route, "official");
+      assert.equal((await send()).status, 200);
+      assert.equal(received.at(-1).provider, "official");
+    }
+    for (const endpoint of ["/responses", "/v1/responses"]) {
+      reset();
+      rejection = { status: 429, error: { type: "rate_limit_error", code: "insufficient_quota", message: "quota exhausted" } };
+      const input = [...payload.input, { type: "compaction_trigger" }];
+      const before = received.length;
+      assert.equal((await send(endpoint, { ...payload, input })).status, 200);
+      assert.equal(received.length - before, 2, "one summary rejection and one original official request");
+      assert.deepEqual(received.at(-1).body.input.at(-1), { type: "compaction_trigger" });
+      assert.deepEqual(received.at(-1).body.tools, payload.tools);
+    }
+    reset();
+    rejection = { status: 403, text: "日限额额度已用完" };
+    assert.equal((await send("/responses/compact")).status, 200);
+    assert.equal(received.at(-1).provider, "official");
+    reset();
+    rejection = { status: 403, error: { message: "quota exhausted; upgrade your plan" } };
+    assert.equal((await send("/responses", { ...payload, input: [{ role: "user", content: "large history ".repeat(3000) }] })).status, 200);
+    assert.equal(received.at(-1).headers["content-encoding"], "zstd");
+    assert.equal(received.at(-1).body.input[0].content, "large history ".repeat(3000));
+    reset();
+    rejection = { stream: true };
+    const beforeStream = received.length;
+    const streamResponse = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/responses`, {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer original-official" }, body: JSON.stringify({ ...payload, stream: true }),
+    });
+    assert.equal(streamResponse.status, 200);
+    assert.match(await streamResponse.text(), /额度已用完/);
+    assert.equal(received.length - beforeStream, 1);
+    assert.equal(JSON.parse(readFileSync(statePath)).route, "wlb");
+    for (const error of [
+      { status: 403, error: { message: "invalid API key" } },
+      { status: 429, error: { type: "rate_limit_error", message: "too many requests" } },
+      { status: 429, error: { type: "resource_exhausted", message: "rate limit" } },
+      { status: 429, error: { code: "quota_exceeded", message: "Per-minute request quota exceeded. Retry in 60 seconds." } },
+      { status: 429, error: { type: "rate_limit_error", message: "Request quota exceeded, retry after 10 seconds." } },
+      { status: 429, error: { type: "rate_limit_error", message: "Your daily usage limit is 1000 requests, try again later." } },
+      { status: 404, error: { message: "quota exhausted model not found" } },
+      { status: 403, error: { type: "insufficient_quota", message: "Your plan does not include API access" } },
+    ]) {
+      reset(); rejection = error;
+      const before = received.length;
+      assert.equal((await send()).status, error.status);
+      assert.equal(received.length - before, 1);
+      assert.equal(JSON.parse(readFileSync(statePath)).route, "wlb");
+    }
+    rejection = { status: 403, error: { message: "额度已用完" } };
+    for (const headers of [{ Authorization: "" }, { "x-openai-subagent": "true" }]) {
+      reset();
+      const before = received.length;
+      await send("/responses", payload, headers);
+      assert.equal(received.length - before, 1);
+      assert.equal(JSON.parse(readFileSync(statePath)).route, "wlb");
+    }
+    reset();
+    const beforeExplicit = received.length;
+    assert.equal((await send("/responses", { ...payload, model: "wlb-relay/gpt-5.6-sol" })).status, 403);
+    assert.equal(received.length - beforeExplicit, 1);
+    assert.equal(JSON.parse(readFileSync(statePath)).route, "wlb");
+    reset(); officialStatus = 403;
+    const beforeOfficialError = received.length;
+    assert.deepEqual(await send(), { status: 403, body: { error: { message: "official failure" } } });
+    assert.equal(received.length - beforeOfficialError, 2);
+    officialStatus = 200;
+    reset();
+    sabotage = () => writeFileSync(statePath, "broken");
+    const beforeBroken = received.length;
+    assert.equal((await send()).status, 503);
+    assert.equal(received.length - beforeBroken, 1);
+    sabotage = undefined;
+    reset();
+    mkdirSync(`${statePath}.${router.router.pid}.tmp`);
+    const beforeWriteFailure = received.length;
+    assert.equal((await send()).status, 503);
+    assert.equal(received.length - beforeWriteFailure, 1);
+    assert.equal(JSON.parse(readFileSync(statePath)).route, "wlb");
+    rmSync(`${statePath}.${router.router.pid}.tmp`, { recursive: true });
+    reset();
+    const abort = new AbortController();
+    const beforeAbort = received.length;
+    const pending = send("/responses", payload, {}, abort.signal);
+    await waitUntil(() => JSON.parse(readFileSync(statePath)).route === "official", "fallback did not save state");
+    abort.abort();
+    await assert.rejects(pending, { name: "AbortError" });
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(received.length - beforeAbort, 1);
+    const events = usageEvents(router.stateDir);
+    assert.ok(events.some((event) => event.provider === "wlb-relay" && event.status === 403));
+    assert.ok(events.some((event) => event.provider === "openai" && event.inputTokens === 7));
+  } finally {
+    await router.close();
+    await close(official);
+    await close(wlb);
+  }
+});
+
+
+test("自动切换只识别明确额度耗尽，套餐营销和普通 resource_exhausted 不触发", () => {
+  for (const message of ["日限额额度已用完", "quota exhausted; upgrade your plan", "余额不足"]) {
+    assert.equal(isUsageExhausted(403, JSON.stringify({ error: { message } })), true);
+  }
+  for (const message of ["upgrade your plan", "purchase extra usage", "Your plan does not include API access; quota exhausted", "too many requests"]) {
+    assert.equal(isUsageExhausted(429, JSON.stringify({ error: { message, type: "resource_exhausted" } })), false);
+  }
+  assert.equal(isUsageExhausted(429, JSON.stringify({ error: { code: "insufficient_quota", message: "limit" } })), true);
+  assert.equal(isUsageExhausted(503, "额度已用完"), false);
+});
+
+
+test("WLB 自动切换区分临时请求配额和账单硬额度，并保留升级建议后的真实额度错误", () => {
+  const cases = [
+    [{ code: "quota_exceeded", message: "Per-minute request quota exceeded. Retry in 60 seconds." }, false],
+    [{ type: "rate_limit_error", message: "Request quota exceeded, retry after 10 seconds." }, false],
+    [{ type: "rate_limit_error", message: "Your daily usage limit is 1000 requests, try again later." }, false],
+    [{ code: "quota_exceeded", message: "limit" }, false],
+    [{ code: "quota_exhausted", message: "Token quota exhausted" }, false],
+    [{ message: "Quota exhausted for requests this hour" }, false],
+    [{ message: "usage limit reached" }, false],
+    [{ message: "reached your daily limit" }, false],
+    [{ code: "insufficient_quota", message: "You exceeded your current quota. Upgrade to Pro plan." }, true],
+    [{ code: "billing_hard_limit_reached", message: "Upgrade to Pro plan." }, true],
+    [{ message: "Your plan does not include API access", code: "insufficient_quota" }, false],
+    [{ message: "余额不足，请升级套餐" }, true],
+  ];
+  for (const [error, expected] of cases) {
+    assert.equal(isUsageExhausted(429, JSON.stringify({ error })), expected, JSON.stringify(error));
   }
 });

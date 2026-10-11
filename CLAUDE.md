@@ -46,7 +46,13 @@
   rollout 的 `source.subagent.thread_spawn`；缺失或未写完的 rollout 不缓存负结果，
   没有可识别证据时仍遵循全局路由。显式 `wlb-relay/*` 与 MiMo 路由保持原语义。
   同一任务中途切换服务商可能带来历史上下文兼容风险。`wlb` 原样转发请求中的 `gpt-*` 模型名，不依赖旧目录注册，
-  上游不支持时返回错误且不回退官方；`route status` 只读且不支持 `--json`，只有总状态命令支持 `status --json`。
+  上游不支持时返回错误；仅明确额度耗尽且尚未输出时自动保存为 `official`，默认等待
+  5 秒后使用原始 Codex 身份继续普通或压缩请求。普通限流、认证失败、套餐不包含 API
+  和已输出的流不切换；缺少官方身份、路由状态损坏或状态写入失败时不回退。显式
+  `wlb-relay/*` 和 MiMo 保持原语义。等待复用可取消的 `sleep`，由
+  `CODEX_ROUTER_WLB_FALLBACK_DELAY_MS` 调整（0 至 30000 毫秒整数，其他值默认 5000），
+  不修改 Codex 客户端的重连间隔；切换后需手动 `route wlb` 才恢复 WLB。
+  `route status` 只读且不支持 `--json`，只有总状态命令支持 `status --json`。
 - `/models` 和 `/v1/models` 始终使用官方身份透传官方查询参数和完整元数据；WLB
   路由不替换官方模型列表。
 - 每个改动过的 `src/*.mjs` 都必须运行 `node --check`；整个源码树的相对导入必须

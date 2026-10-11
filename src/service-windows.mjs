@@ -13,10 +13,13 @@ import {
   CODEX_HOME,
   LOG_PATH,
   PORTS,
+  SHUTDOWN_REQUEST_PATH,
   SOURCE_ROOT,
   STATE_DIR,
   TARGET,
 } from "./paths.mjs";
+import { SHUTDOWN_DRAIN_MS, SHUTDOWN_FLUSH_MS } from "./http-utils.mjs";
+import { waitForRouterHealth } from "./router-health.mjs";
 
 const effectivePlatform = process.env.CODEX_ROUTER_SERVICE_PLATFORM || process.platform;
 const command = process.argv[2] || "status";
@@ -196,6 +199,12 @@ function installTask() {
 // instead of hoping one extra attempt is enough.
 const TASK_STOP_TIMEOUT_MS = 10_000;
 const TASK_STOP_POLL_MS = 250;
+// 优雅停止的等待窗口：路由器的排空（drain）+ 收尾（flush）+ 进程退出余量。
+// 超时后走原有的强杀路径，停止命令不会无限等待。
+const GRACEFUL_STOP_TIMEOUT_MS = SHUTDOWN_DRAIN_MS + SHUTDOWN_FLUSH_MS + 3_000;
+// /Run 之后等待路由器就绪的上限：start.mjs 给路由器 30 秒启动预算，这里再覆盖
+// wscript -> cmd -> node 的拉起开销。
+const READINESS_TIMEOUT_MS = 60_000;
 // Every state query has to return for the deadline above to mean anything, so a
 // wedged PowerShell is capped rather than allowed to hang the install outright.
 const TASK_STATE_TIMEOUT_MS = 15_000;
@@ -329,8 +338,55 @@ function stopServiceProcess(pid) {
   removeServicePid(pid);
 }
 
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM 表示进程存在但无权限探测；其余情况视为已退出。
+    return error?.code === "EPERM";
+  }
+}
+
+function removeShutdownRequest() {
+  try {
+    unlinkSync(SHUTDOWN_REQUEST_PATH);
+  } catch {
+    // 路由器可能已自行清理。
+  }
+}
+
+// Windows 无法跨进程投递 SIGTERM，taskkill 又是硬杀，会把在途请求直接掐断。
+// 优雅停止改为写入停止请求文件，让路由器按既有排空流程结束响应后退出；
+// 返回 true 表示进程已在窗口内退出，false 表示需要强杀兜底。
+function requestGracefulStop(pid) {
+  if (!pid) return false;
+  try {
+    writeAtomic(SHUTDOWN_REQUEST_PATH, Buffer.from("stop\n", "utf8"));
+  } catch {
+    return false;
+  }
+  const deadline = Date.now() + GRACEFUL_STOP_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) {
+      removeShutdownRequest();
+      return true;
+    }
+    sleep(TASK_STOP_POLL_MS);
+  }
+  removeShutdownRequest();
+  return false;
+}
+
 function endTask() {
   const pid = serviceProcessPid();
+  if (requestGracefulStop(pid)) {
+    removeServicePid(pid);
+    // 监督进程退出后 wscript/cmd 可能还在收尾，等任务实例真正结束再返回，
+    // 避免随后的 /Run 被 MultipleInstances IgnoreNew 静默丢弃。
+    waitForTaskToStop();
+    return;
+  }
   let ended = false;
   try {
     schtasks(["/End", "/TN", taskName], { quiet: true });
@@ -376,6 +432,25 @@ function taskState() {
     }
   }
   return undefined;
+}
+
+// Node 的 fetch 不使用 Windows 系统代理；在 start.mjs 之外发起 fetch 的进程必须
+// 自己携带代理环境变量。健康探测只打本机回环，NO_PROXY 强制包含回环地址，
+// 保证探测始终直连、不依赖代理存活。
+function ensureFetchProxyEnvironment() {
+  const proxyUrl =
+    process.env.HTTPS_PROXY ||
+    process.env.https_proxy ||
+    "http://127.0.0.1:7897";
+  process.env.NODE_USE_ENV_PROXY = "1";
+  process.env.HTTP_PROXY = process.env.HTTP_PROXY || proxyUrl;
+  process.env.HTTPS_PROXY = process.env.HTTPS_PROXY || proxyUrl;
+  process.env.NO_PROXY = [
+    "127.0.0.1,localhost",
+    process.env.NO_PROXY || process.env.no_proxy || "",
+  ]
+    .filter(Boolean)
+    .join(",");
 }
 
 if (
@@ -478,5 +553,15 @@ if (command === "render") {
 } else {
   if (command === "restart") endTask();
   schtasks(["/Run", "/TN", taskName], { quiet: true });
-  process.stdout.write(`${JSON.stringify({ state: "running" })}\n`);
+  // 就绪等待内聚到服务管理器：直接调用 restart/start 也会等到 /health 通过才
+  // 返回成功，避免调用方在路由器尚未接管端口时就继续发流量。
+  ensureFetchProxyEnvironment();
+  const health = await waitForRouterHealth({ timeoutMs: READINESS_TIMEOUT_MS });
+  if (!health.ok) {
+    process.stdout.write(
+      `${JSON.stringify({ state: "running", ready: false, error: health.error })}\n`,
+    );
+    process.exit(1);
+  }
+  process.stdout.write(`${JSON.stringify({ state: "running", ready: true })}\n`);
 }

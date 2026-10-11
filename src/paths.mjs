@@ -43,6 +43,9 @@ export const INSTALL_MANIFEST_PATH = path.join(STATE_DIR, "install-manifest.json
 export const MIGRATIONS_DIR = path.join(STATE_DIR, "migrations");
 export const SUPPORT_DIR = path.join(STATE_DIR, "support");
 export const LOG_PATH = path.join(STATE_DIR, "router.log");
+// Windows 没有跨进程 SIGTERM，服务管理器写入此文件请求路由器排空并退出；
+// 路由器启动时会清理残留文件，避免上一次停止的遗留让新实例一启动就关闭。
+export const SHUTDOWN_REQUEST_PATH = path.join(STATE_DIR, "shutdown.request");
 export const BACKUP_PATH = path.join(CODEX_HOME, "config.toml.pre-codex-router");
 export const SERVICE_LABEL = "io.github.codex-router";
 export const LEGACY_SERVICE_LABEL = "io.github.kimi-codex-router";

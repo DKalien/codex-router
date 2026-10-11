@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -40,7 +43,7 @@ function read(response) {
   return { first, done };
 }
 
-function shutdownHarness(server, drainMs) {
+function shutdownHarness(server, drainMs, stopFile) {
   const signal = `codex-router-test-shutdown-${++signalSequence}`;
   let resolveExit;
   const exited = new Promise((resolve) => {
@@ -51,6 +54,7 @@ function shutdownHarness(server, drainMs) {
     signals: [signal],
     drainMs,
     exit: resolveExit,
+    stopFile,
   });
   return { signal, exited };
 }
@@ -128,5 +132,57 @@ test("空闲 keep-alive 服务不等待 drain window 即退出", async () => {
   } finally {
     process.removeAllListeners(signal);
     await close(server);
+  }
+});
+
+test("stop 文件触发排空关闭并清理自身", async () => {
+  let resolveArrived;
+  const arrived = new Promise((resolve) => {
+    resolveArrived = resolve;
+  });
+  const server = http.createServer(() => resolveArrived());
+  applyKeepAliveTimeouts(server);
+  const port = await listen(server);
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "codex-router-stop-file-"));
+  const stopFile = path.join(stateDir, "shutdown.request");
+  const { signal, exited } = shutdownHarness(server, 25, stopFile);
+
+  try {
+    const pending = get(port, "/responses");
+    await arrived;
+    writeFileSync(stopFile, "stop\n");
+    const response = await pending;
+    const { done } = read(response);
+    assert.equal(response.statusCode, 503);
+    assert.equal(JSON.parse(await done).error.type, "local_router_restarting");
+    assert.equal(await exited, 0);
+    assert.equal(existsSync(stopFile), false);
+  } finally {
+    process.removeAllListeners(signal);
+    await close(server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("启动时清理残留 stop 文件且不触发关闭", async () => {
+  const server = http.createServer((_request, response) => response.end("ok"));
+  applyKeepAliveTimeouts(server);
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "codex-router-stop-file-stale-"));
+  const stopFile = path.join(stateDir, "shutdown.request");
+  writeFileSync(stopFile, "stop\n");
+  const { signal, exited } = shutdownHarness(server, 25, stopFile);
+
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(existsSync(stopFile), false);
+    const outcome = await Promise.race([
+      exited.then(() => "exited"),
+      new Promise((resolve) => setTimeout(() => resolve("running"), 100)),
+    ]);
+    assert.equal(outcome, "running");
+  } finally {
+    process.removeAllListeners(signal);
+    await close(server);
+    rmSync(stateDir, { recursive: true, force: true });
   }
 });

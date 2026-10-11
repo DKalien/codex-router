@@ -15,6 +15,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { waitForRouterHealth } from "../src/router-health.mjs";
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 async function unusedPort() {
@@ -182,6 +184,13 @@ test(
     try {
       await waitFor(() => existsSync(pidPath));
       assert.equal(Number.parseInt(readFileSync(pidPath, "utf8"), 10), service.pid);
+      // 等路由器就绪再停止：停止请求文件只对已安装 watcher 的实例生效，
+      // 否则会被当作启动残留清理掉，测试就只会走强杀兜底。
+      const health = await waitForRouterHealth({
+        url: `http://127.0.0.1:${port}/health`,
+        timeoutMs: 30_000,
+      });
+      assert.equal(health.ok, true, health.error);
 
       let result = spawnSync(
         process.execPath,
@@ -190,7 +199,9 @@ test(
       );
       assert.equal(result.status, 0, result.stderr);
       await waitFor(() => service.exitCode !== null || service.signalCode !== null);
+      assert.equal(service.exitCode, 0, "the service should exit cleanly after a graceful stop");
       assert.equal(existsSync(pidPath), false);
+      assert.equal(existsSync(path.join(stateDir, "shutdown.request")), false);
 
       writeFileSync(pidPath, `${unrelated.pid}\n`);
       result = spawnSync(
@@ -200,6 +211,7 @@ test(
       );
       assert.equal(result.status, 0, result.stderr);
       assert.equal(unrelated.exitCode, null, "an unrelated Node process was terminated");
+      assert.equal(existsSync(path.join(stateDir, "shutdown.request")), false);
     } finally {
       await stopChild(service);
       await stopChild(unrelated);

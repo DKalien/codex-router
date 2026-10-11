@@ -1,3 +1,4 @@
+import { existsSync, rmSync } from "node:fs";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
@@ -72,6 +73,7 @@ export function installGracefulShutdown(
     drainMs = SHUTDOWN_DRAIN_MS,
     flushMs = SHUTDOWN_FLUSH_MS,
     exit = (code) => process.exit(code),
+    stopFile,
   } = {},
 ) {
   const live = new Set();
@@ -134,6 +136,28 @@ export function installGracefulShutdown(
   };
 
   for (const signal of signals) process.on(signal, shutdown);
+
+  // Windows 无法跨进程投递 SIGTERM，服务管理器改为写入停止请求文件。轮询探测
+  // 是刻意的：stat 轮询在 Windows 上比 fs.watch 可靠，250ms 的开销可以忽略。
+  // 注册前先清理残留文件，避免上一次停止的遗留让新实例一启动就关闭。
+  if (stopFile) {
+    try {
+      rmSync(stopFile, { force: true });
+    } catch {
+      // 清理失败时保留文件，交由停止方的超时强杀兜底。
+    }
+    const stopWatcher = setInterval(() => {
+      if (!existsSync(stopFile)) return;
+      clearInterval(stopWatcher);
+      try {
+        rmSync(stopFile, { force: true });
+      } catch {
+        // 停止方可能已删除该文件。
+      }
+      shutdown();
+    }, 250);
+    stopWatcher.unref?.();
+  }
   return server;
 }
 

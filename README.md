@@ -46,7 +46,11 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
   默认安装路径。
 - **GPT 路由开关**：`route official|wlb|status` 写入或读取全局路由状态，切换从下
   一次非子代理的原生 GPT 请求生效，不需要重启服务或 Codex。`wlb` 按请求中的 GPT 模型名直接转发，
-  不依赖本地模型名单；上游不支持时返回其错误，不回退官方。`route status` 只读；只有总状态命令支持
+  不依赖本地模型名单；上游不支持时仍返回其错误。明确报告额度耗尽时，路由器自动保存为
+  `official`，默认等待 5 秒后用原始 Codex 身份继续当前请求，后续 GPT 主代理请求也走官方。
+  普通限流、认证失败、套餐不包含 API 和已开始输出的流不会触发切换；缺少官方身份或
+  无法保存路由状态时不会回退。切换覆盖普通请求和压缩请求，显式 `wlb-relay/*` 保持原语义。
+  额度恢复后需手动运行 `route wlb` 切回。`route status` 只读；只有总状态命令支持
   `--json`（`status --json`）。该开关不绑定线程，同一任务中途切换服务商可能带来
   历史上下文兼容风险。
 - **GPT 子代理**：已识别的原生 `gpt-*` 子代理固定走官方，普通请求和压缩请求
@@ -118,7 +122,9 @@ POSIX：`bin/install`（兼容入口 `install.sh`）、`bin/provider-key`、`bin
 状态保存在 `~/.codex/codex-router/`（路由状态、密钥和日志；旧目录为可选文件）。Windows 通过名为
 “Codex Router”的计划任务在登录时自动启动服务。后台监督进程会登记
 `service.pid`；停止或重启时会校验 Node 路径和完整的 `src/start.mjs` 命令行后再
-结束该进程树，避免旧路由器继续占用 4102 端口。
+结束该进程树，避免旧路由器继续占用 4102 端口。Windows 下停止先写入
+`shutdown.request` 请求路由器排空退出（在途请求按重启 drain 规则收尾），超时才强杀；
+`start`/`restart` 会等待 `/health` 通过后才返回。
 
 另一台设备不应复制上述状态目录。拉取 `lite` 后，仅使用官方路由可直接从当前
 checkout 运行 `.\codex-router.ps1 install`；需要第三方路由时，再先运行
@@ -148,6 +154,10 @@ owner 冲突。安装完成后完全退出并重新打开 Codex，使新的本�
   `node scripts-check.mjs`。
 - 请求级调试：使用 `CODEX_ROUTER_REQUEST_LOG=1` 启动；HTTP/WS caller capability
   会自动脱敏，仍不要分享包含私有路径的日志。
+- WLB 额度耗尽后转官方的等待默认是 5 秒；可通过 `CODEX_ROUTER_WLB_FALLBACK_DELAY_MS`
+  调整（0 至 30000 毫秒，非整数或越界值使用默认）。客户端取消会终止等待；
+  路由器关闭后不会再向官方重发。这是路由器内的切换等待，Codex 客户端自身的重连
+  间隔保持原设置。修改源码后需重启路由服务才能启用新行为。
 - 流式响应默认允许 300 秒无数据；可用 `CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS` 调整（10 毫秒至 15 分钟）。
 
 ## 分支

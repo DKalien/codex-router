@@ -43,7 +43,11 @@ sequenceDiagram
 
 Windows 后台服务由 `src/service-windows.mjs` 通过计划任务管理。后台启动的
 `src/start.mjs` 会将监督进程 PID 原子写入 `service.pid`；停止或重启时，服务管理器
-先核对 Node 可执行文件和完整的 `src/start.mjs` 命令行，再结束整个进程树。旧启动器
+先核对 Node 可执行文件和完整的 `src/start.mjs` 命令行，再结束整个进程树。Windows
+无法跨进程投递 `SIGTERM`，因此停止先写入 `shutdown.request` 触发与重启信号相同的
+排空流程，等监督进程在 drain/flush 窗口内退出，超时才走强杀兜底；路由器启动时会
+清理残留的请求文件，避免上次停止的遗留让新实例一启动就关闭。`start`/`restart` 会
+等待 `/health` 通过后才返回就绪。旧启动器
 没有 PID 文件时，只按精确的 `wscript -> cmd -> start.mjs` 父子链查找一次，避免误杀
 无关的 Node 进程，也避免旧路由器继续占用 4102 端口。
 
@@ -96,7 +100,15 @@ supports_search_tool
 `src/gpt-route.mjs` 将 `official` 或 `wlb` 写入状态目录；文件不存在时默认使用
 `official`。这是全局设置，不绑定线程，从下一次非子代理的原生 GPT 请求起对所有任务共享。使用
 `wlb` 时，`src/router.mjs` 将请求中的 `gpt-*` 模型名原样发送给 WLB，不依赖
-旧静态模型名单。官方新增模型无需修改 Router；WLB 上游不支持时返回其错误，不会回退到官方。正在执行的任务中途切换服务商可能带来
+旧静态模型名单。官方新增模型无需修改 Router；WLB 上游不支持时返回其错误。只有
+明确的额度耗尽会自动保存为 `official`，默认等待 5 秒，再以原始 Codex 身份重发
+当前尚未输出的请求；后续 GPT 主代理请求也走官方。普通限流、认证失败、套餐不包含
+API 和已开始输出的流不切换；没有非空官方 `Authorization` 或状态保存失败时不访问
+官方。状态损坏或 owner 校验失败时停止切换并报告错误。显式 `wlb-relay/*`、MiMo
+和固定官方的子代理保持原语义；额度恢复后需手动运行 `route wlb`。等待可通过
+`CODEX_ROUTER_WLB_FALLBACK_DELAY_MS` 调整，接受 0 至 30000 毫秒的整数，其他值使用
+默认。客户端取消会终止等待；路由器关闭后不会再向官方重发。这个等待发生在
+路由器内，不修改 Codex 客户端的重连间隔；更新源码后需重启服务。正在执行的任务中途切换服务商可能带来
 历史上下文兼容风险。`route status` 只读；`--json` 仅由总状态命令支持。
 
 对于原生 `gpt-*`，已识别的子代理固定走官方：复用 `x-openai-subagent`（忽略明确
@@ -105,7 +117,9 @@ supports_search_tool
 后续请求会重新识别；没有可识别证据时仍按主代理请求遵循全局路由。子代理固定官方
 不读取全局状态，因此损坏的全局状态只阻断 GPT 主代理请求。此规则同时覆盖
 `/responses`、`/responses/compact` 和 `/responses` 内以 `compaction_trigger` 触发的
-压缩 v2；没有独立的 `/responses/compact/v2` 端点。显式 `wlb-relay/*` 与 MiMo
+压缩 v2；没有独立的 `/responses/compact/v2` 端点。WLB 额度耗尽转官方同样覆盖
+这三种请求，并从原始请求重建官方请求体，保留原端点、模型、工具及官方身份，复用
+原生历史清理；WLB 密钥不会带到官方。官方返回错误时直接透传，不循环切换。显式 `wlb-relay/*` 与 MiMo
 命名空间路由保持原语义。
 
 官方路由使用白名单 Codex 请求头并保留客户端 `Authorization`，将请求转发给原生
@@ -227,7 +241,7 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | `src/model-registry.mjs` | 加载并验证服务商和模型 |
 | `src/start.mjs` | 监督一个路由器子进程并提供代理环境 |
 | `src/status.mjs` | 只读汇总路由器、配置、目录模式、GPT 路由、Provider、安装和服务状态 |
-| `src/service-windows.mjs` | 管理 Windows 计划任务并安全停止已验证的监督进程树 |
+| `src/service-windows.mjs` | 管理 Windows 计划任务，先优雅排空再强杀已验证的监督进程树，启动/重启等待健康检查 |
 | `config/mimo/`、`config/wlb/` | 两个服务商的描述文件和模型片段 |
 | `test/catalog-metadata.mjs` | 检查 WLB 元数据基线和 MiMo 字段集合 |
 | `test/official-catalog.mjs` | 检查官方目录状态、配置迁移及多代理子表去重 |
@@ -235,7 +249,7 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | `test/response-usage-hardening.mjs` | 检查 split/BOM SSE、字节透传、MiMo 还原和密文 Token 估算 |
 | `test/http-health-bounds.mjs` | 检查 zstd 帧头边界、请求 drain/中止、响应超限取消和健康 deadline |
 | `test/credential-file-security.mjs` | 检查凭据 symlink/非文件拒绝和 Windows ACL 规范化 |
-| `test/graceful-shutdown.mjs` | 检查重启 drain、SSE terminal error、503 fallback 和 idle keep-alive 快速退出 |
+| `test/graceful-shutdown.mjs` | 检查重启 drain、SSE terminal error、503 fallback、stop 文件触发和 idle keep-alive 快速退出 |
 | `test/upstream-hardening.mjs` | 检查健康响应排空、keep-alive 参数、错误 cause 链和断流 usage 标记 |
-| `test/windows-service-process.mjs` | 检查 Windows PID 登记、进程树停止和误杀防护 |
+| `test/windows-service-process.mjs` | 检查 Windows PID 登记、优雅停止与进程树强杀兜底和误杀防护 |
 | `test/windows-hidden-consoles.mjs` | 检查后台子进程隐藏窗口及交互输入保持可见 |

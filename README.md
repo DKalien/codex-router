@@ -25,7 +25,8 @@ clean EOF，未发出响应头的请求返回 503。可用 `MODEL_ROUTER_SHUTDOW
 `test/router-fixes.mjs`、`test/response-usage-hardening.mjs`、
 `test/http-health-bounds.mjs`、`test/credential-file-security.mjs`、
 `test/graceful-shutdown.mjs`、`test/upstream-hardening.mjs`、
-`test/windows-service-process.mjs` 和 `scripts-check.mjs`。
+`test/windows-service-process.mjs`、`test/windows-hidden-consoles.mjs`、
+`test/start-proxy.mjs` 和 `scripts-check.mjs`。
 
 ## 架构
 
@@ -87,14 +88,15 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
   终止读取；协作载荷 relay 和 compact 响应分别最多缓冲 4 MiB 与 32 MiB。
 - **凭据文件**：持久化密钥只从普通文件读取，符号链接和目录会被忽略。Windows
   写入时会用仅包含当前用户 `FullControl` 的非继承 DACL 替换旧 ACL。
-- **代理**：监督进程启动时探测本机代理端口（v2rayN `10808`/`10809` 优先，兼容
-  Clash `7897`/`7890`，`CODEX_ROUTER_PROXY_PORTS` 可覆盖，显式 `HTTPS_PROXY` 优先；
-  探测不到则原生路由直连），再经 `NODE_USE_ENV_PROXY`/`HTTPS_PROXY` 注入路由器。
-  WLB 和 MiMo 域名固定加入 `NO_PROXY` 并保持 DIRECT，不依赖代理是否在线；
-  SuperGPT 使用现有代理环境。监督
-  进程内的看门狗每 12 秒复测：代理在启动后才出现或换到其他候选端口时，先写
-  `shutdown.request` 优雅排空再带新代理环境重启路由器子进程；代理消失不触发
-  重启；显式设置 `HTTPS_PROXY` 时看门狗停用。
+- **代理**：默认通过 `http://127.0.0.1:7897` 转发官方请求，不预先探测端口是否监听。
+  显式代理按 `HTTPS_PROXY`、`https_proxy`、`HTTP_PROXY`、`http_proxy` 的优先级覆盖，
+  再经 `NODE_USE_ENV_PROXY` 注入路由器。`NO_PROXY` 保留自定义值，并补入
+  `127.0.0.1`、`localhost`、`codex.wlbclub.com`、`token-plan-cn.xiaomimimo.com`
+  和 `api.supergpt.dev`，三个第三方服务商默认 DIRECT（直连）。自定义
+  `SUPERGPT_BASE_URL` 的其他域名不会自动直连，需要时将该域名加入 `NO_PROXY`。
+  `CODEX_ROUTER_PROXY_PORTS` 已退役，旧配置请改用 `HTTPS_PROXY`；不再定时探测
+  或因代理端口变化自动重启。代理配置变更后需重启 Router；代理未运行时，官方请求
+  会连接失败，不会自动改为直连。代理恢复监听同一端口后无需重启 Router。
 
 ## 安装与日常使用（Windows）
 

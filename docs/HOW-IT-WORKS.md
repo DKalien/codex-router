@@ -42,11 +42,13 @@ sequenceDiagram
 在途请求最多 drain 2 秒；已开始的 SSE 会收到本地重启 terminal error 后 clean EOF，
 尚未发送响应头的请求返回 503。`src/start.mjs` 的强杀 backstop 会覆盖 drain 和 flush
 窗口；`MODEL_ROUTER_SHUTDOWN_DRAIN_MS` 可调整 drain 时长。它还为 Node 的 `fetch`
-提供代理环境：启动时按候选端口探测本机代理（v2rayN `10808`/`10809` 优先，兼容
-Clash `7897`/`7890`，`CODEX_ROUTER_PROXY_PORTS` 可覆盖，显式 `HTTPS_PROXY` 优先，
-探测不到则原生路由直连），监督进程内的看门狗每 12 秒复测，代理在启动后才出现或
-换到其他候选端口时，先写 `shutdown.request` 优雅排空再带新代理环境重启路由器子
-进程（代理消失不触发重启；显式 `HTTPS_PROXY` 时看门狗停用）。请求路径中没有
+提供代理环境：默认固定使用 `http://127.0.0.1:7897`，不预先探测端口监听；
+显式 `HTTPS_PROXY`、`https_proxy`、`HTTP_PROXY`、`http_proxy` 按此优先级覆盖。
+`NO_PROXY` 保留已有自定义值，并补入 `127.0.0.1`、`localhost`、
+`codex.wlbclub.com`、`token-plan-cn.xiaomimimo.com` 和 `api.supergpt.dev`，
+官方请求走代理，三个第三方默认 DIRECT（直连）。`CODEX_ROUTER_PROXY_PORTS`
+已退役，旧配置请改用 `HTTPS_PROXY`；删除定时探测和端口变化自动重启，代理环境
+变更后需重启 Router。子进程启动、健康检查及退出/信号清理保持原语义。请求路径中没有
 网关、API 转发器、Python 进程、OAuth 流程、托盘应用或更新器。
 
 Windows 后台服务由 `src/service-windows.mjs` 通过计划任务管理。后台启动的
@@ -185,7 +187,8 @@ Windows 原生解码器崩溃。后台凭据 ACL 与服务管理的非交互 Pow
 
 路由器只监听回环地址，并在读取请求前检查每次安装生成的 caller 凭据。
 `src/start.mjs` 设置 `NODE_USE_ENV_PROXY=1` 并将 `HTTP_PROXY`/`HTTPS_PROXY`
-传递给上游 fetch。WLB/MiMo 固定 DIRECT，SuperGPT 使用现有代理环境；服务商 URL 和 TLS 行为
+传递给上游 fetch。WLB/MiMo/SuperGPT 默认域名固定 DIRECT；自定义 `SUPERGPT_BASE_URL` 的其他域名
+如需直连，应显式加入 `NO_PROXY`。服务商 URL 和 TLS 行为
 仍由服务商注册表及 Node 的正常 HTTPS 验证控制。
 
 ## 维护和检查
@@ -195,6 +198,7 @@ Windows 原生解码器崩溃。后台凭据 ACL 与服务管理的非交互 Pow
 ```sh
 node --input-type=module -e 'await import("./src/model-registry.mjs")'
 node --test test/official-catalog.mjs
+node --test test/start-proxy.mjs
 node --test test/router-fixes.mjs test/response-usage-hardening.mjs test/http-health-bounds.mjs test/credential-file-security.mjs test/graceful-shutdown.mjs test/upstream-hardening.mjs test/windows-service-process.mjs
 node scripts-check.mjs
 ```
@@ -238,5 +242,6 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | `test/credential-file-security.mjs` | 检查凭据 symlink/非文件拒绝和 Windows ACL 规范化 |
 | `test/graceful-shutdown.mjs` | 检查重启 drain、SSE terminal error、503 fallback、stop 文件触发和 idle keep-alive 快速退出 |
 | `test/upstream-hardening.mjs` | 检查健康响应排空、keep-alive 参数、错误 cause 链和断流 usage 标记 |
+| `test/start-proxy.mjs` | 检查固定代理、环境变量覆盖、直连名单和无端口探测的启动/退出 |
 | `test/windows-service-process.mjs` | 检查 Windows PID 登记、优雅停止与进程树强杀兜底和误杀防护 |
 | `test/windows-hidden-consoles.mjs` | 检查后台子进程隐藏窗口及交互输入保持可见 |

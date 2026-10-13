@@ -27,12 +27,13 @@
   探测期间缓存的字节
 - `src/mimo-custom-tools.mjs` — 只处理 MiMo 的 custom tool/agent message 兼容、
   旧 `MESSAGE` 进度裁剪和 JSON/SSE 响应还原
-- `src/start.mjs` — 监督唯一的路由器子进程并注入代理环境：启动时按候选端口探测
-  本机代理（v2rayN `10808`/`10809` 优先，兼容 Clash `7897`/`7890`，
-  `CODEX_ROUTER_PROXY_PORTS` 可覆盖；显式 `HTTPS_PROXY` 优先，探测不到则原生路由
-  直连）；看门狗每 12 秒复测，代理出现或换端口时优雅排空并重启子进程，代理消失
-  不重启；WLB/MiMo 始终在 `NO_PROXY` 中保持 DIRECT。Windows 后台服务原子登记
-  `service.pid`，退出时只清理仍属于自己的 PID
+- `src/start.mjs` — 监督唯一的路由器子进程并注入代理环境：官方请求默认走固定
+  `http://127.0.0.1:7897`，不预先探测监听；显式 `HTTPS_PROXY`、`https_proxy`、
+  `HTTP_PROXY`、`http_proxy` 按此优先级覆盖。`NO_PROXY` 保留自定义值并补入回环
+  地址及 WLB/MiMo/SuperGPT 默认域名，三个第三方默认 DIRECT（直连）。
+  `CODEX_ROUTER_PROXY_PORTS` 已退役，旧配置改用 `HTTPS_PROXY`；不定时探测或因
+  端口变化自动重启。保留启动健康检查、进程退出及信号清理。Windows 后台服务
+  原子登记 `service.pid`，退出时只清理仍属于自己的 PID
 - `codex-router.ps1` / `install.ps1` — Windows 入口；`bin/` — POSIX 入口
 
 ## 规则
@@ -54,7 +55,8 @@
   不修改 Codex 客户端的重连间隔；切换后需手动 `route wlb` 才恢复 WLB。
   `supergpt` 同样按原始 `gpt-*` 模型名转发，不新增旧命名空间模型条目或生成目录；
   上游错误直接返回，不应用 WLB 专属的额度耗尽回退。首次新增服务商配置需重启
-  Router，之后 `route` 热切换无需重启。SuperGPT 使用现有代理环境，不加入固定 DIRECT。
+  Router，之后 `route` 热切换无需重启。SuperGPT 默认域名固定 DIRECT；自定义
+  `SUPERGPT_BASE_URL` 的其他域名如需直连，应显式加入 `NO_PROXY`。
   `route status` 只读且不支持 `--json`，只有总状态命令支持 `status --json`。
 - `/models` 和 `/v1/models` 始终使用官方身份透传官方查询参数和完整元数据；WLB 和 SuperGPT
   路由不替换官方模型列表。
@@ -84,7 +86,8 @@
   形状的 `reasoning`；其他服务商的 reasoning 必须整项丢弃，合法项也必须移除仅
   用于输出的 `content`，避免 `store=false` 下引用未持久化的外部 item。
 - 修改 `src/start.mjs` 或 `src/service-windows.mjs` 后，运行
-  `node --test test/windows-service-process.mjs`。
+  `node --test test/windows-service-process.mjs`；修改 `src/start.mjs` 还需运行
+  `node --test test/start-proxy.mjs`。
 - 修改 `src/http-utils.mjs` 的 graceful shutdown 路径后，运行
   `node --test test/graceful-shutdown.mjs`。
 - 修改注册表时必须保留 slug 命名空间格式（`<provider>/<model>`），并通过

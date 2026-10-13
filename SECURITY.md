@@ -40,11 +40,14 @@ MiMo 长会话中的 custom tool 和协作历史会先在本地转换为其支�
 
 配置中的服务商 URL 使用 HTTPS，路由器直接调用各服务商的 `/responses` 端点。
 应保持正常的 TLS 验证，并且只信任自己管理的代理。`src/start.mjs` 设置
-`NODE_USE_ENV_PROXY=1` 并传递 `HTTP_PROXY`/`HTTPS_PROXY`；显式 `HTTPS_PROXY` 优先，
-否则探测本机代理端口（默认依次为 `10808`、`10809`、`7897`、`7890`），探测不到则直连。
-`NO_PROXY` 包含回环地址和固定直连的 WLB/MiMo。
-SuperGPT 使用现有代理环境，基础 URL 默认为 `https://api.supergpt.dev/v1`，可由
-`SUPERGPT_BASE_URL` 覆盖。选择第三方路由意味着提示词和工具结果会发送给对应服务商。如果代理终止 TLS，它可以
+`NODE_USE_ENV_PROXY=1` 并传递 `HTTP_PROXY`/`HTTPS_PROXY`；默认固定使用
+`http://127.0.0.1:7897`，不预先探测监听。显式代理按 `HTTPS_PROXY`、`https_proxy`、
+`HTTP_PROXY`、`http_proxy` 的优先级覆盖。`NO_PROXY` 保留自定义值，并补入
+`127.0.0.1`、`localhost`、`codex.wlbclub.com`、`token-plan-cn.xiaomimimo.com`
+和 `api.supergpt.dev`，三个第三方服务商默认直连。SuperGPT 基础 URL 默认为
+`https://api.supergpt.dev/v1`，可由 `SUPERGPT_BASE_URL` 覆盖；自定义其他域名
+不会自动直连，如需直连应加入 `NO_PROXY`。`CODEX_ROUTER_PROXY_PORTS` 已退役，
+旧配置改用 `HTTPS_PROXY`；不再定时探测或因代理端口变化自动重启。选择第三方路由意味着提示词和工具结果会发送给对应服务商。如果代理终止 TLS，它可以
 观察或修改流量，因此应检查代理配置和日志。
 
 请求日志默认关闭。`CODEX_ROUTER_REQUEST_LOG=1` 会记录请求方法、URL、状态码和

@@ -170,11 +170,8 @@ function loadRegistry() {
       ) {
         fail(`provider ${provider.id} has an invalid planNote`);
       }
-      if (
-        provider.protocol !== undefined &&
-        !["openai", "anthropic", "openai-responses"].includes(provider.protocol)
-      ) {
-        fail(`provider ${provider.id} has an unsupported API protocol`);
+      if (provider.protocol !== "openai-responses") {
+        fail(`provider ${provider.id} requires protocol openai-responses; legacy gateway protocols are retired`);
       }
     }
     providers.set(provider.id, Object.freeze(provider));

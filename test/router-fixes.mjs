@@ -1758,3 +1758,150 @@ test("SuperGPT 原名路由隔离凭据，支持 JSON/SSE/压缩，子代理和�
     await close(supergpt);
   }
 });
+
+
+test("审计：失败或空摘要不能替换压缩历史", async () => {
+  let result;
+  const upstream = http.createServer(async (request, response) => {
+    for await (const _ of request) {}
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(result));
+  });
+  const port = await listen(upstream);
+  const router = await startRouter({ SUPERGPT_BASE_URL: `http://127.0.0.1:${port}`, SUPERGPT_API_KEY: "test-key" });
+  writeFileSync(path.join(router.stateDir, "gpt-route.json"), JSON.stringify({ version: 1, route: "supergpt" }));
+  try {
+    const original = [{ role: "user", content: "continue" }, { type: "function_call_output", call_id: "call_test", output: "critical intermediate result" }];
+    for (const failed of [
+      { status: "failed", error: { message: "failure" }, output: [] },
+      { status: "incomplete", output_text: "partial summary" },
+      { status: "in_progress", output_text: "unfinished summary" },
+      { status: "completed", output: [] },
+      { status: "completed", output_text: "   " },
+      { error: { message: "failure without status" } },
+    ]) {
+      result = failed;
+      for (const v2 of [false, true]) {
+        const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/responses${v2 ? "" : "/compact"}`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "gpt-test", stream: false, input: v2 ? [...original, { type: "compaction_trigger" }] : original }),
+        });
+        assert.equal(response.status, 502, JSON.stringify(failed));
+        const body = await response.json();
+        assert.ok(body.error);
+        assert.equal(body.output, undefined, "failed compaction must not supply replacement history");
+      }
+    }
+    result = { output_text: "valid summary" };
+    const valid = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/responses/compact`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "gpt-test", input: original }),
+    });
+    assert.equal(valid.status, 200, "providers omitting status remain compatible");
+    assert.match(JSON.stringify(await valid.json()), /valid summary/);
+  } finally { await router.close(); await close(upstream); }
+});
+
+test("审计：压缩错误和普通错误一致脱敏并保留 Retry-After", async () => {
+  const secret = "sk-audit-placeholder-00000000000000000000";
+  const upstream = http.createServer(async (request, response) => {
+    for await (const _ of request) {}
+    response.writeHead(429, { "Content-Type": "application/json", "Retry-After": "11" });
+    response.end(JSON.stringify({ error: { message: `rate limit; Authorization: Bearer ${secret}`, api_key: secret } }));
+  });
+  const port = await listen(upstream);
+  const router = await startRouter({ SUPERGPT_BASE_URL: `http://127.0.0.1:${port}`, SUPERGPT_API_KEY: "test-key" });
+  writeFileSync(path.join(router.stateDir, "gpt-route.json"), JSON.stringify({ version: 1, route: "supergpt" }));
+  try {
+    for (const mode of ["normal", "compact", "v2"]) {
+      const input = [{ role: "user", content: "test" }, ...(mode === "v2" ? [{ type: "compaction_trigger" }] : [])];
+      const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/responses${mode === "compact" ? "/compact" : ""}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "gpt-test", input, stream: false }),
+      });
+      const body = await response.text();
+      assert.equal(response.status, 429);
+      assert.equal(body.includes(secret), false, mode);
+      assert.equal(response.headers.get("retry-after"), "11", mode);
+      assert.ok(JSON.parse(body).error);
+    }
+  } finally { await router.close(); await close(upstream); }
+});
+
+test("审计：旧 WLB 请求不能覆盖之后的手动切换或同路由重选", async () => {
+  let rejectWlb;
+  let officialRequests = 0;
+  const wlb = http.createServer(async (request, response) => {
+    for await (const _ of request) {}
+    rejectWlb = () => { response.writeHead(429, { "Content-Type": "application/json" }); response.end(JSON.stringify({ error: { code: "insufficient_quota", message: "quota exhausted" } })); };
+  });
+  const official = http.createServer((request, response) => {
+    officialRequests += 1; request.resume(); response.writeHead(200, { "Content-Type": "application/json" }); response.end('{"output":[]}');
+  });
+  const wlbPort = await listen(wlb);
+  const officialPort = await listen(official);
+  const router = await startRouter({ WLB_BASE_URL: `http://127.0.0.1:${wlbPort}`, WLB_API_KEY: "test-wlb-key", SUPERGPT_API_KEY: "test-supergpt-key", CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${officialPort}`, CODEX_ROUTER_WLB_FALLBACK_DELAY_MS: "0" });
+  const statePath = path.join(router.stateDir, "gpt-route.json");
+  const cli = (route) => {
+    const result = spawnSync(process.execPath, [path.join(root, "src/gpt-route.mjs"), route], { encoding: "utf8", windowsHide: true, env: { ...process.env, CODEX_HOME: router.stateDir, MODEL_ROUTER_STATE_DIR: router.stateDir, WLB_API_KEY: "test-wlb-key", SUPERGPT_API_KEY: "test-supergpt-key" } });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  try {
+    for (const endpoint of ["responses", "responses/compact"]) {
+      for (const choice of ["supergpt", "wlb"]) {
+        cli("wlb"); rejectWlb = undefined;
+        const pending = fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/${endpoint}`, {
+          method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer test-official" },
+          body: JSON.stringify({ model: "gpt-test", input: [], stream: false }),
+        });
+        await waitUntil(() => rejectWlb, "WLB did not receive the request");
+        cli(choice);
+        const chosenState = readFileSync(statePath, "utf8");
+        rejectWlb();
+        const response = await pending;
+        await response.text();
+        assert.equal(readFileSync(statePath, "utf8"), chosenState, `old ${endpoint} overwrote ${choice}`);
+        assert.equal(response.status, 429);
+        assert.equal(officialRequests, 0);
+      }
+    }
+  } finally { await router.close(); await close(wlb); await close(official); }
+});
+
+test("审计：错误体和压缩读取遵循闲置超时", async () => {
+  const upstream = http.createServer(async (request, response) => {
+    const chunks = []; for await (const chunk of request) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks));
+    response.writeHead(payload.model === "gpt-error" ? 400 : 200, { "Content-Type": "application/json" });
+    response.write('{"partial":');
+  });
+  const port = await listen(upstream);
+  const router = await startRouter({ SUPERGPT_BASE_URL: `http://127.0.0.1:${port}`, SUPERGPT_API_KEY: "test-key", CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS: "35" });
+  writeFileSync(path.join(router.stateDir, "gpt-route.json"), JSON.stringify({ version: 1, route: "supergpt" }));
+  try {
+    for (const [model, endpoint] of [["gpt-error", "responses"], ["gpt-ok", "responses/compact"]]) {
+      const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/${endpoint}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model, input: [] }), signal: AbortSignal.timeout(1500),
+      });
+      assert.equal(response.status, 504);
+      assert.ok((await response.json()).error);
+    }
+  } finally { await router.close(); upstream.closeAllConnections(); await close(upstream); }
+});
+
+
+test("审计：Lite 拒绝已退役的非 Responses 协议", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-protocol-"));
+  const registryPath = path.join(directory, "registry.json");
+  const provider = JSON.parse(readFileSync(path.join(root, "config/supergpt/supergpt.json"))).providers[0];
+  try {
+    for (const protocol of [undefined, "openai", "anthropic", "openai-responses"]) {
+      writeFileSync(registryPath, JSON.stringify({ version: 1, providers: [{ ...provider, protocol }], models: [] }));
+      const result = spawnSync(process.execPath, ["--input-type=module", "-e", "await import('./src/model-registry.mjs')"], {
+        cwd: root, encoding: "utf8", windowsHide: true,
+        env: { ...process.env, MODEL_ROUTER_REGISTRY: registryPath },
+      });
+      assert.equal(result.status, protocol === "openai-responses" ? 0 : 1, String(protocol));
+      if (protocol !== "openai-responses") assert.match(result.stderr, /openai-responses/);
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});

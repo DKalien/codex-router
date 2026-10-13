@@ -53,7 +53,10 @@ sequenceDiagram
 
 Windows 后台服务由 `src/service-windows.mjs` 通过计划任务管理。后台启动的
 `src/start.mjs` 会将监督进程 PID 原子写入 `service.pid`；停止或重启时，服务管理器
-先核对 Node 可执行文件和完整的 `src/start.mjs` 命令行，再结束整个进程树。Windows
+先按已登记的 VBS 启动器（兼容旧 CMD wrapper）核对 Node 可执行文件和完整的
+`src/start.mjs` 命令行，再结束整个进程树；不会把当前 CLI 的 Node 路径强加给后台。
+未知启动器格式拒绝识别，重新安装先停止旧启动器的进程，再写入新启动器。
+`status` 只读，即使没有核验到进程也不删除 PID 文件。Windows
 无法跨进程投递 `SIGTERM`，因此停止先写入 `shutdown.request` 触发与重启信号相同的
 排空流程，等监督进程在 drain/flush 窗口内退出，超时才走强杀兜底；路由器启动时会
 清理残留的请求文件，避免上次停止的遗留让新实例一启动就关闭。`start`/`restart` 会
@@ -64,7 +67,10 @@ Windows 后台服务由 `src/service-windows.mjs` 通过计划任务管理。后
 ## 官方目录与旧模型目录
 
 `src/model-registry.mjs` 从 `config/` 加载三个服务商描述文件及已有模型片段，并验证
-服务商 ID、带命名空间的 slug、上游模型名称和已列出的元数据。仅支持以下服务商：
+服务商 ID、带命名空间的 slug、上游模型名称和已列出的元数据。服务商必须显式声明
+`protocol: openai-responses`；旧 Chat/Anthropic 网关协议及其协作工具转换已退役。
+自定义注册表若遗漏协议，仅在上游已原生支持 Responses 时补入该字段；其他协议
+需要更换兼容的 Responses 服务。仅支持以下服务商：
 
 | 服务商 | 基础 URL 来源 | 凭据文件 |
 | --- | --- | --- |
@@ -82,7 +88,8 @@ MiMo 的两个及 WLB 的三个命名空间 slug 保留给已有目录或直接�
 
 如果仍使用本安装管理的旧目录配置，重新执行 `codex-router.ps1 enable`
 （POSIX：`bin/enable`）移除该配置，再完全重启 Codex。用户自有的目录配置仍受
-保护，安装器不会覆盖。
+保护，安装器不会覆盖。`features` 表名、`multi_agent_v2` 键名和其子表支持裸名、
+双引号与单引号写法，重复启用及关闭保留原有设置，不重复注入定义。
 
 ## 路由和凭据
 
@@ -95,7 +102,10 @@ MiMo 的两个及 WLB 的三个命名空间 slug 保留给已有目录或直接�
 当前尚未输出的请求；后续 GPT 主代理请求也走官方。普通限流、认证失败、套餐不包含
 API 和已开始输出的流不切换；没有非空官方 `Authorization` 或状态保存失败时不访问
 官方。状态损坏或 owner 校验失败时停止切换并报告错误。显式 `wlb-relay/*`、MiMo
-和固定官方的子代理保持原语义；额度恢复后需手动运行 `route wlb`。等待可通过
+和固定官方的子代理保持原语义；额度恢复后需手动运行 `route wlb`。路由文件保持
+version 1，并在每次写入时生成新 revision，兼容没有 revision 的旧文件。手动设置
+和自动回退共用跨进程锁；回退在锁内核对请求发出时的 route/revision。期间手动
+切换或重复选择 WLB 后，旧请求返回原错误，不覆盖新状态，也不向官方重发。等待可通过
 `CODEX_ROUTER_WLB_FALLBACK_DELAY_MS` 调整，接受 0 至 30000 毫秒的整数，其他值使用
 默认。客户端取消会终止等待；路由器关闭后不会再向官方重发。这个等待发生在
 路由器内，不修改 Codex 客户端的重连间隔；更新源码后需重启服务。正在执行的任务中途切换服务商可能带来
@@ -129,7 +139,8 @@ Codex 后端；GPT 主代理的 `wlb` 或 `supergpt` 路由注入对应密钥并
 读取对应密钥，再使用服务商的 `Authorization` 请求头直接发送
 `POST <provider base URL>/responses`。Codex 的账户和安装凭据不会发送给第三方
 服务商。数据流会直接透传；`/responses/compact` 使用相同的直连路径，并在需要时
-生成由路由器管理的续接摘要。
+生成由路由器管理的续接摘要。摘要响应含 error、明确的非 completed 状态或空白
+摘要时返回 502，不生成替换历史；省略 status 但摘要有效时仍兼容。
 
 `GET /models` 和 `GET /v1/models` 始终使用官方身份透传到官方上游，并保留请求查询
 参数和官方完整响应元数据；WLB 和 SuperGPT 路由不会把模型列表替换成本地简化目录。没有当前
@@ -138,7 +149,10 @@ Codex 登录身份时，这两个端点返回 `401`。
 上游省略 `content-type` 时，`src/sse-prefix.mjs` 会在最多 512 bytes 的前缀内识别
 SSE。字段名可跨 chunk，开头允许 UTF-8 BOM、注释和空行；探测期间缓存的原始字节会
 按顺序交回响应处理器。Token 用量统计和 MiMo custom tool 还原共用该判定，非 SSE
-响应则保持原路径。第三方输入 Token 的兜底估算会扣除 `encrypted_content` 字符串值，
+响应则保持原路径。`src/sse-events.mjs` 共用事件解析支持多行 `data:` 和 CR/LF/CRLF，
+包括跨 chunk 的 CRLF；空行 CR 到达即交付事件，不等待后续字节。按固定块积累事件
+避免逐 chunk 全量复制，单事件缓存上限 8 MiB。用量统计超限时释放已缓存原字节并
+继续透传，跳过该事件解析，在下一事件恢复；未修改的事件始终保持原字节。第三方输入 Token 的兜底估算会扣除 `encrypted_content` 字符串值，
 因为这些密文不是模型可见提示词；未知字段仍默认计入，保持向上估算。
 
 MiMo 的 Responses 网关不接受 Codex 扩展的 `custom_tool_call` 和 `agent_message`。
@@ -147,7 +161,9 @@ MiMo 的 Responses 网关不接受 Codex 扩展的 `custom_tool_call` 和 `agent
 custom tool 事件；普通 function tool 保持不变。标准协作 envelope 中的 `MESSAGE`
 是未验收的中间进度，跨模型续接时不再回放；`FINAL_ANSWER`、`NEW_TASK`、
 `FOLLOWUP_TASK` 及无法识别的类型仍保留。compact 路径应用同一规则。原生 GPT、
-WLB 和 SuperGPT 不做这项 MiMo 专属裁剪或 custom-tool 映射。
+WLB 和 SuperGPT 不做这项 MiMo 专属裁剪或 custom-tool 映射。MiMo 转换的单个 SSE
+事件、JSON 响应及累计未完成工具状态各限 8 MiB；工具完成时释放对应状态，超限
+明确失败，不把未转换的 function tool 静默传回客户端。
 
 第三方路由仍需回放的标准原生 `agent_message` envelope 可能只含不可由本地解开的
 `encrypted_content`。路由器使用原生 Codex 后端的受控 function call 取回明文，
@@ -156,12 +172,13 @@ WLB 和 SuperGPT 不做这项 MiMo 专属裁剪或 custom-tool 映射。
 MiMo 裁掉旧 `MESSAGE` 进度后，新设备和服务重启后的首次续接通常无需解密这些
 历史项；仍需解密的载荷由 4 路并发避免串行，LRU 则加速同一进程内的后续续接。
 
-响应流连续 300 秒没有任何数据时，路由器会取消上游请求。SSE 会收到固定的
+响应流以及错误体、压缩和协作 relay 的缓冲读取连续 300 秒没有任何数据时，
+路由器会取消上游读取。SSE 会收到固定的
 terminal error；尚未开始的非 SSE 响应会返回 504。该空闲时限可通过
 `CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS` 在 10 毫秒至 15 分钟之间调整，收到每个
 chunk 后都会重新计时，因此不会限制持续输出请求的总时长。
 
-普通路由请求的第三方上游错误响应体最多读取 64 KiB；路由器会在翻译为 Codex 错误前遮盖
+普通及压缩请求的第三方上游错误响应体最多读取 64 KiB；路由器会在翻译为 Codex 错误前遮盖
 Bearer、token、key、secret、caller capability、查询参数和控制字符，并把错误详情
 限制为短文本。可解析的 quoted JSON 字段会替换字段值而保留合法 JSON，避免凭据或
 上游内部信息进入客户端响应。
@@ -229,7 +246,8 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | `src/mimo-custom-tools.mjs` | MiMo custom tool/agent message 的请求转换、历史裁剪和 JSON/SSE 响应还原 |
 | `src/response-usage.mjs` | 从 JSON 或 SSE 响应提取 Token 用量并保持响应透传 |
 | `src/sse-prefix.mjs` | 有界识别无 `content-type` 的 SSE 并保持探测字节顺序 |
-| `src/gpt-route.mjs` | 读写非子代理的原生 GPT 请求的全局路由状态，默认官方路由 |
+| `src/sse-events.mjs` | 有界 SSE 事件解析、多行 data、CR/LF/CRLF 和原字节还原 |
+| `src/gpt-route.mjs` | 读取全局路由，串行化手动设置与有条件的自动回退，默认官方路由 |
 | `src/model-registry.mjs` | 加载并验证服务商和模型 |
 | `src/start.mjs` | 监督一个路由器子进程并提供代理环境 |
 | `src/status.mjs` | 只读汇总路由器、配置、目录模式、GPT 路由、Provider、安装和服务状态 |

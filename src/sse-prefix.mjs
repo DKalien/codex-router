@@ -28,7 +28,8 @@ export function classifySsePrefix(value, { end = false } = {}) {
   const text = bytes.toString("utf8");
   let offset = 0;
   while (offset < text.length) {
-    const newline = text.indexOf("\n", offset);
+    const relativeNewline = text.slice(offset).search(/[\r\n]/);
+    const newline = relativeNewline === -1 ? -1 : offset + relativeNewline;
     if (newline === -1) {
       const line = text.slice(offset);
       if (line.startsWith(":")) return "event-stream";

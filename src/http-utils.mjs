@@ -183,7 +183,7 @@ export function streamIdleTimeoutMs(value) {
   );
 }
 
-export async function readResponseTextLimited(response, maxBytes = MAX_UPSTREAM_ERROR_BYTES) {
+export async function readResponseTextLimited(response, maxBytes = MAX_UPSTREAM_ERROR_BYTES, { signal, idleTimeoutMs } = {}) {
   if (!response?.body) return "";
   const limit = Math.max(1, Math.floor(maxBytes));
   const reader = response.body.getReader();
@@ -192,7 +192,7 @@ export async function readResponseTextLimited(response, maxBytes = MAX_UPSTREAM_
   let total = 0;
   try {
     while (total < limit) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readWithAbort(reader, signal, idleTimeoutMs);
       if (done) break;
       const chunk = Buffer.from(value);
       const remaining = limit - total;
@@ -221,12 +221,17 @@ function abortReason(signal) {
   return error;
 }
 
-function readWithAbort(reader, signal) {
-  if (!signal) return reader.read();
-  if (signal.aborted) return Promise.reject(abortReason(signal));
+function readWithAbort(reader, signal, idleTimeoutMs) {
+  if (signal?.aborted) {
+    void reader.cancel().catch(() => {});
+    return Promise.reject(abortReason(signal));
+  }
   return new Promise((resolve, reject) => {
     let settled = false;
-    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+    };
     const onAbort = () => {
       if (settled) return;
       settled = true;
@@ -234,7 +239,17 @@ function readWithAbort(reader, signal) {
       cleanup();
       reject(abortReason(signal));
     };
-    signal.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const error = new Error("Upstream response body idle timeout.");
+      error.code = "ERR_ROUTER_STREAM_IDLE_TIMEOUT";
+      error.status = 504;
+      void reader.cancel().catch(() => {});
+      cleanup();
+      reject(error);
+    }, streamIdleTimeoutMs(idleTimeoutMs));
+    signal?.addEventListener("abort", onAbort, { once: true });
     reader.read().then(
       (result) => {
         if (settled) return;
@@ -254,7 +269,7 @@ function readWithAbort(reader, signal) {
 
 export async function readResponseBody(
   response,
-  { maxBytes = MAX_BUFFERED_RESPONSE_BYTES, signal } = {},
+  { maxBytes = MAX_BUFFERED_RESPONSE_BYTES, signal, idleTimeoutMs } = {},
 ) {
   if (!response?.body) return Buffer.alloc(0);
   const configuredLimit = Number(maxBytes);
@@ -266,7 +281,7 @@ export async function readResponseBody(
   let total = 0;
   try {
     while (true) {
-      const result = await readWithAbort(reader, signal);
+      const result = await readWithAbort(reader, signal, idleTimeoutMs);
       if (result.done) break;
       const chunk = result.value instanceof Uint8Array
         ? result.value
@@ -282,7 +297,7 @@ export async function readResponseBody(
       chunks.push(Buffer.from(chunk));
     }
   } catch (error) {
-    await reader.cancel().catch(() => {});
+    void reader.cancel().catch(() => {});
     throw error;
   } finally {
     reader.releaseLock?.();

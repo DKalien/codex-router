@@ -51,7 +51,8 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
   `official`，默认等待 5 秒后用原始 Codex 身份继续当前请求，后续 GPT 主代理请求也走官方。
   普通限流、认证失败、套餐不包含 API 和已开始输出的流不会触发切换；缺少官方身份或
   无法保存路由状态时不会回退。切换覆盖普通请求和压缩请求，显式 `wlb-relay/*` 保持原语义。
-  SuperGPT 上游错误直接返回，不触发该回退或改变全局路由。
+  自动回退只在请求发出后的路由状态未变时执行；期间手动切换或重选 WLB，旧请求会
+  保留新选择并返回原错误。SuperGPT 上游错误直接返回，不触发该回退或改变全局路由。
   额度恢复后需手动运行 `route wlb` 切回。`route status` 只读；只有总状态命令支持
   `--json`（`status --json`）。该开关不绑定线程，同一任务中途切换服务商可能带来
   历史上下文兼容风险。
@@ -72,7 +73,8 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
   带 BOM、注释和空行，路由器也能识别并统计 Token，同时保持原始字节不变。
   原生流在 `response.completed` 后才断开时仍按 upstream status/usage 记录，不再误记
   为取消或 `0`；原生 GPT-5.6 请求会移除旧兼容字段 `prompt_cache_retention`，保留
-  `prompt_cache_options`。
+  `prompt_cache_options`。SSE 支持多行 `data:` 和 CR/LF/CRLF 换行；单事件解析缓存
+  上限为 8 MiB，超限时仍原样透传，仅跳过该事件的用量统计。
 - **MiMo 长会话兼容**：Codex 的 custom tool 会在请求侧桥接为普通 function tool，
   JSON/SSE 响应再还原成 custom tool 事件。跨模型续接会保留已经验收的
   `FINAL_ANSWER`；标准协作 envelope 中的旧 `MESSAGE` 进度不发送给 MiMo，
@@ -80,9 +82,12 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
   会按原顺序最多 4 路并发；解密结果保存在进程内 LRU 缓存，逻辑 TTL 为 24 小时，
   最多 512 条或 8 MiB。路由器估算第三方输入 Token 时不再把不会发送给模型的
   `encrypted_content` 密文计入提示词大小。切回原生 GPT 时，没有原生加密上下文的
-  第三方 reasoning 会被丢弃，不会作为未持久化的 `rs_*` item 继续回放。
+  第三方 reasoning 会被丢弃，不会作为未持久化的 `rs_*` item 继续回放。MiMo 响应
+  转换的单个 SSE 事件、JSON 响应和累计未完成工具状态各限 8 MiB，超限明确报错。
+- **压缩历史**：第三方摘要必须完整且非空；HTTP 200 中的失败、不完整或空摘要
+  返回 502，不生成替换历史，避免丢失续接上下文。省略 status 的有效摘要仍兼容。
 - **错误和日志安全**：请求日志默认关闭；启用后会自动遮盖 HTTP/WS caller URL
-  中的 capability。普通路由请求的第三方上游错误体最多读取 64 KiB，返回前会遮盖 Bearer、token、
+  中的 capability。普通及压缩请求的第三方上游错误体最多读取 64 KiB，返回前会遮盖 Bearer、token、
   key、secret、caller capability、查询参数和控制字符；可解析的 quoted JSON 字段仍保留
   合法的 JSON 结构。请求正文超限后会停止缓存、排空余流，并允许客户端断开信号
   终止读取；协作载荷 relay 和 compact 响应分别最多缓冲 4 MiB 与 32 MiB。
@@ -136,10 +141,11 @@ SuperGPT 默认基础 URL 是 `https://api.supergpt.dev/v1`，可用 `SUPERGPT_B
 
 状态保存在 `~/.codex/codex-router/`（路由状态、密钥和日志；旧目录为可选文件）。Windows 通过名为
 “Codex Router”的计划任务在登录时自动启动服务。后台监督进程会登记
-`service.pid`；停止或重启时会校验 Node 路径和完整的 `src/start.mjs` 命令行后再
+`service.pid`；停止或重启时会按已登记启动器校验 Node 路径和完整的 `src/start.mjs` 命令行后再
 结束该进程树，避免旧路由器继续占用 4102 端口。Windows 下停止先写入
 `shutdown.request` 请求路由器排空退出（在途请求按重启 drain 规则收尾），超时才强杀；
-`start`/`restart` 会等待 `/health` 通过后才返回。
+`start`/`restart` 会等待 `/health` 通过后才返回。CLI 与后台使用不同 Node 安装时
+仍能识别服务；`status` 不会清理 PID 文件。
 
 另一台设备不应复制上述状态目录。拉取 `lite` 后，仅使用官方路由可直接从当前
 checkout 运行 `.\codex-router.ps1 install`；需要第三方路由时，再先运行
@@ -163,6 +169,9 @@ owner 冲突。安装完成后完全退出并重新打开 Codex，使新的本�
 - 切换 GPT 路由：运行 `route official`、`route wlb` 或 `route supergpt`；设置从下一次非子代理的原生 GPT 请求生效，
   对所有任务共享且无需重启；已识别的原生 GPT 子代理固定走官方。运行 `route status` 可只读查看当前设置；同一任务中途
   切换服务商可能带来历史上下文兼容风险。
+- 服务商协议只接受 `openai-responses`，旧网关协作转换已删除。自定义注册表遗漏
+  `protocol` 时，仅在上游原生支持 Responses API 的前提下补入该字段；旧 Chat/Anthropic
+  协议配置需要迁移至兼容的 Responses 服务，不能只改协议名。
 - 检查：`node --test test/official-catalog.mjs`、
   `node --test test/router-fixes.mjs test/response-usage-hardening.mjs test/http-health-bounds.mjs test/credential-file-security.mjs test/graceful-shutdown.mjs test/upstream-hardening.mjs test/windows-service-process.mjs` 和
   `node scripts-check.mjs`。
@@ -172,7 +181,8 @@ owner 冲突。安装完成后完全退出并重新打开 Codex，使新的本�
   调整（0 至 30000 毫秒，非整数或越界值使用默认）。客户端取消会终止等待；
   路由器关闭后不会再向官方重发。这是路由器内的切换等待，Codex 客户端自身的重连
   间隔保持原设置。修改源码后需重启路由服务才能启用新行为。
-- 流式响应默认允许 300 秒无数据；可用 `CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS` 调整（10 毫秒至 15 分钟）。
+- 响应流及错误体、压缩、协作 relay 的缓冲读取默认允许 300 秒无数据；可用
+  `CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS` 调整（10 毫秒至 15 分钟）。持续有数据会重新计时。
 
 ## 分支
 

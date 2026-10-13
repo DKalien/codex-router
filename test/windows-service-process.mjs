@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import http from "node:http";
@@ -219,3 +220,78 @@ test(
     }
   },
 );
+
+
+test("Windows service verification uses the registered Node and status preserves PID files", {
+  skip: process.platform !== "win32",
+}, () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "codex-router-service-exe-"));
+  try {
+    const launcherPath = path.join(stateDir, "start-codex-router-hidden.vbs");
+    const wrapperPath = path.join(stateDir, "start-codex-router.cmd");
+    const servicePidPath = path.join(stateDir, "service.pid");
+    const startPath = path.join(root, "src", "start.mjs");
+    const registeredNode = "C:\\Node24\\node.exe";
+    const pid = 42_424;
+    writeFileSync(servicePidPath, `${pid}\n`);
+    const source = readFileSync(path.join(root, "src", "service-windows.mjs"), "utf8");
+    const functions = source.slice(source.indexOf("function readServicePid()"), source.indexOf("function stopServiceProcess("));
+    let commandLine = `"${registeredNode}" "${startPath}"`;
+    let generatedScript;
+    let actualNode = registeredNode;
+    const query = (_executable, args, options) => {
+      generatedScript = args.at(-1);
+      const mock = "function Get-CimInstance { param($ClassName, $Filter, $ErrorAction) [pscustomobject]@{ ExecutablePath = $env:TEST_NODE; CommandLine = $env:TEST_COMMAND; ProcessId = 42424; ParentProcessId = 123; Name = 'node.exe' } }; ";
+      return execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", mock + generatedScript], {
+        ...options,
+        env: { ...options.env, TEST_NODE: actualNode, TEST_COMMAND: commandLine },
+      });
+    };
+    const { findServiceProcess, serviceProcessPid } = new Function(
+      "readFileSync", "unlinkSync", "existsSync", "path", "vbsEscape", "execFileSync", "launcherPath", "wrapperPath", "servicePidPath", "startPath", "TASK_STATE_TIMEOUT_MS",
+      `${functions}; return { findServiceProcess, serviceProcessPid };`,
+    )(readFileSync, unlinkSync, existsSync, path, (value) => value.replaceAll('"', '""'), query, launcherPath, wrapperPath, servicePidPath, startPath, 15_000);
+    const launcher = spawnSync(process.execPath, [path.join(root, "src", "service-windows.mjs"), "render-launcher"], { encoding: "utf8" });
+    assert.equal(launcher.status, 0, launcher.stderr);
+    const contents = launcher.stdout.replaceAll(process.execPath, registeredNode);
+    writeFileSync(launcherPath, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(contents, "utf16le")]));
+    assert.equal(findServiceProcess(pid), pid);
+    assert.equal(serviceProcessPid({ cleanup: false }), pid);
+    assert.equal(readFileSync(servicePidPath, "utf8"), `${pid}\n`);
+    assert.match(source, /loaded = Boolean\(serviceProcessPid\(\{ cleanup: false \}\)\)/);
+    actualNode = process.execPath;
+    assert.equal(findServiceProcess(pid), undefined, "a different executable must not match");
+    actualNode = registeredNode;
+    commandLine = `"${registeredNode}" "${path.join(root, "src", "router.mjs")}"`;
+    assert.equal(findServiceProcess(pid), undefined, "the exact start script is required");
+    commandLine = `"${registeredNode}" "${startPath}" --extra`;
+    assert.equal(serviceProcessPid({ cleanup: false }), undefined);
+    assert.equal(readFileSync(servicePidPath, "utf8"), `${pid}\n`);
+    assert.match(generatedScript, /ParentProcessId/);
+    commandLine = `"${registeredNode}" "${startPath}"`;
+    writeFileSync(launcherPath, 'status = shell.Run("cmd.exe /D /C " & quote & quote & "' + wrapperPath + '" & quote & quote, 0, True)');
+    writeFileSync(wrapperPath, `@echo off\r\n"${registeredNode}" "${startPath}" >> "test.log" 2>&1\r\n`);
+    assert.equal(findServiceProcess(pid), pid, "older wrapper launchers remain supported");
+    writeFileSync(launcherPath, "unrecognized launcher");
+    assert.throws(() => findServiceProcess(pid), /Unable to identify Node/);
+    assert.equal(readFileSync(servicePidPath, "utf8"), `${pid}\n`);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+
+test("Windows reinstall stops the previous launcher before replacing it and retains recovery", () => {
+  const source = readFileSync(path.join(root, "src", "service-windows.mjs"), "utf8");
+  const branch = source.slice(source.indexOf('} else if (command === "install") {') + 2, source.indexOf('} else if (command === "uninstall") {') + 1);
+  for (const failWrite of [false, true]) {
+    const calls = [];
+    const execute = new Function("command", "endTask", "writeLaunchers", "installTask", "schtasks", "taskExists", "process", "wrapperPath", "taskName", branch.replace(/^else /, ""));
+    execute("install", () => calls.push("stop-old"), () => {
+      calls.push("write-new");
+      if (failWrite) throw new Error("fixture write failed");
+    }, () => calls.push("register"), () => calls.push("run"), () => true,
+    { stdout: { write() {} } }, "fixture.cmd", "fixture-task");
+    assert.deepEqual(calls, failWrite ? ["stop-old", "write-new", "run"] : ["stop-old", "write-new", "register", "run"]);
+  }
+});

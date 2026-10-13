@@ -20,11 +20,13 @@
   凭据后的旧命名空间直接转发）
 - `src/gpt-route.mjs` — 读写非子代理的原生 GPT 请求的全局路由状态，默认使用官方路由
 - `src/model-registry.mjs` — 加载并验证 `config/**`；已列出模型的字段可选，但
-  提供时必须通过验证
+  提供时必须通过验证；服务商必须显式声明 `protocol: openai-responses`，不保留旧网关协议转换
 - `src/response-usage.mjs` — 从 JSON/SSE 响应提取 Token 用量；上游省略
   `content-type` 时也必须保持字节级透传和正确统计
 - `src/sse-prefix.mjs` — 有界识别省略 `content-type` 的 SSE 前缀，并按原顺序交还
   探测期间缓存的字节
+- `src/sse-events.mjs` — 有界解析 SSE 事件，支持多行 `data:` 与 CR/LF/CRLF；
+  空行 CR 到达即结束事件，不等待后续字节
 - `src/mimo-custom-tools.mjs` — 只处理 MiMo 的 custom tool/agent message 兼容、
   旧 `MESSAGE` 进度裁剪和 JSON/SSE 响应还原
 - `src/start.mjs` — 监督唯一的路由器子进程并注入代理环境：官方请求默认走固定
@@ -33,7 +35,8 @@
   地址及 WLB/MiMo/SuperGPT 默认域名，三个第三方默认 DIRECT（直连）。
   `CODEX_ROUTER_PROXY_PORTS` 已退役，旧配置改用 `HTTPS_PROXY`；不定时探测或因
   端口变化自动重启。保留启动健康检查、进程退出及信号清理。Windows 后台服务
-  原子登记 `service.pid`，退出时只清理仍属于自己的 PID
+  原子登记 `service.pid`，退出时只清理仍属于自己的 PID；服务管理按已登记启动器的
+  Node 路径验证进程，不依赖当前 CLI 的 Node；`status` 不删除 PID 文件
 - `codex-router.ps1` / `install.ps1` — Windows 入口；`bin/` — POSIX 入口
 
 ## 规则
@@ -48,7 +51,10 @@
   没有可识别证据时仍遵循全局路由。显式 `wlb-relay/*` 与 MiMo 路由保持原语义。
   同一任务中途切换服务商可能带来历史上下文兼容风险。`wlb` 原样转发请求中的 `gpt-*` 模型名，不依赖旧目录注册，
   上游不支持时返回错误；仅明确额度耗尽且尚未输出时自动保存为 `official`，默认等待
-  5 秒后使用原始 Codex 身份继续普通或压缩请求。普通限流、认证失败、套餐不包含 API
+  5 秒后使用原始 Codex 身份继续普通或压缩请求。手动设置和回退共用跨进程锁，
+  回退在锁内核对请求发出时的 route/revision；期间手动切换或同路由重选后，保留新
+  状态并返回原错误。每次写入更新 revision，兼容旧状态文件缺少该字段。
+  普通限流、认证失败、套餐不包含 API
   和已输出的流不切换；缺少官方身份、路由状态损坏或状态写入失败时不回退。显式
   `wlb-relay/*` 和 MiMo 保持原语义。等待复用可取消的 `sleep`，由
   `CODEX_ROUTER_WLB_FALLBACK_DELAY_MS` 调整（0 至 30000 毫秒整数，其他值默认 5000），
@@ -67,11 +73,12 @@
 - 修改源码后，运行 `node scripts-check.mjs`。
 - 修改 `src/router.mjs` 或 `src/response-usage.mjs` 后，运行
   `node --test test/router-fixes.mjs`。
-- 配置管理必须保留用户已有的 `[features.multi_agent_v2]` 子表（包括带引号的表名），
-  不得重复注入同名内联表；启用、重复启用和关闭均需保持 TOML 有效。
+- 配置管理必须识别裸名、双引号和单引号的 `features` 表、`multi_agent_v2` 键及
+  `[features.multi_agent_v2]` 子表；保留已有配置，不重复注入表或内联键，
+  启用、重复启用和关闭均需保持 TOML 有效。
 - 修改 GPT 路由开关后运行 `node --test test/router-fixes.mjs`；修改配置管理、服务商
   密钥操作或状态检查后运行 `node --test test/official-catalog.mjs`。
-- 修改 `src/response-usage.mjs`、`src/sse-prefix.mjs` 或
+- 修改 `src/response-usage.mjs`、`src/sse-prefix.mjs`、`src/sse-events.mjs` 或
   `src/mimo-custom-tools.mjs` 后，运行
   `node --test test/response-usage-hardening.mjs`。
 - 修改 `src/http-utils.mjs`、`src/router.mjs` 或 `src/router-health.mjs` 的请求/响应
@@ -82,6 +89,10 @@
 - MiMo 兼容必须保持服务商隔离：标准 envelope 的旧 `MESSAGE` 进度不回放，
   `FINAL_ANSWER`、`NEW_TASK`、`FOLLOWUP_TASK` 仍保留；原生 GPT、WLB 和 SuperGPT 不得应用
   MiMo 专属的历史裁剪或 custom-tool 映射。
+- SSE 用量解析缓存单事件最多 8 MiB，超限仍按字节透传并跳过该事件解析；MiMo
+  转换的单个事件、JSON 响应和累计未完成工具状态各限 8 MiB，超限必须明确报错。
+- 第三方压缩必须拒绝失败、不完整或空摘要，不得返回替换历史；普通及压缩请求的
+  上游错误统一限读 64 KiB 并脱敏。响应流及缓冲读取均遵循闲置超时和请求取消。
 - 切回原生 GPT 时，只能回放 `encrypted_content` 符合原生 `gAAAAA...` token
   形状的 `reasoning`；其他服务商的 reasoning 必须整项丢弃，合法项也必须移除仅
   用于输出的 `content`，避免 `store=false` 下引用未持久化的外部 item。

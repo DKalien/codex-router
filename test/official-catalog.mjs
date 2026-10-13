@@ -163,6 +163,39 @@ test("enable 保留已有 multi_agent_v2 子表，重复启用与关闭不产生
   }
 });
 
+test("enable 支持 features 表与 multi_agent_v2 键的 bare/basic/literal 写法", () => {
+  const tempRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-quoted-features-"));
+  const stateDir = path.join(tempRoot, "codex-router");
+  mkdirSync(stateDir);
+  writeFileSync(path.join(stateDir, "caller-secret"), `${callerSecret}\n`);
+  const codexBin = path.join(tempRoot, process.platform === "win32" ? "codex.cmd" : "codex");
+  writeFileSync(codexBin, process.platform === "win32"
+    ? "@echo Not logged in 1>&2\r\n@exit /b 1\r\n"
+    : "#!/bin/sh\necho 'Not logged in' >&2\nexit 1\n", { mode: 0o700 });
+  const configPath = path.join(tempRoot, "config.toml");
+  try {
+    for (const header of ["[features]", '[ "features" ] # 用户配置', "[ 'features' ]"]) {
+      for (const key of [null, "multi_agent_v2", '"multi_agent_v2"', "'multi_agent_v2'"]) {
+        const original = `${header}\nshell_tool = true\n${key ? `${key} = { enabled = true }\n` : ""}`;
+        writeFileSync(configPath, original);
+        for (const command of ["enable", "enable", "disable"]) {
+          const result = runConfig(command, tempRoot, stateDir, { CODEX_BIN: codexBin });
+          assert.equal(result.status, 0, result.stderr);
+          const config = readFileSync(configPath, "utf8");
+          assert.equal(config.includes(original.trimEnd()), true);
+          assert.equal((config.match(/^\s*\[\s*(?:features|"features"|'features')\s*\]/gm) || []).length, 1, `${header}, ${key}, ${command}`);
+          assert.equal((config.match(/^\s*(?:multi_agent_v2|"multi_agent_v2"|'multi_agent_v2')\s*=/gm) || []).length,
+            key || command !== "disable" ? 1 : 0, `${header}, ${key}, ${command}`);
+          assert.equal(config.includes("# BEGIN codex-router-multi-agent-v2-managed"), !key && command !== "disable");
+          assert.equal(config.includes("# BEGIN codex-router-agent-concurrency-managed"), false);
+        }
+      }
+    }
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test("enable 拒绝覆盖用户自有 model_catalog_json", () => {
   const tempRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-user-catalog-"));
   const codexHome = path.join(tempRoot, "codex");

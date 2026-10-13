@@ -187,14 +187,14 @@ function hasModernMultiAgentConfig(input) {
   if (lines.some((line) => /^\s*features\.multi_agent_v2\s*=/.test(line))) return true;
   if (lines.some((line) => /^\s*\[agents\.[^\]]+\]\s*(?:#.*)?$/.test(line))) return true;
   const featuresHeader = lines.findIndex((line) =>
-    /^\s*\[features\]\s*(?:#.*)?$/.test(line),
+    /^\s*\[\s*(?:features|"features"|'features')\s*\]\s*(?:#.*)?$/.test(line),
   );
   if (featuresHeader === -1) return false;
   let tableEnd = featuresHeader + 1;
   while (tableEnd < lines.length && !/^\s*\[/.test(lines[tableEnd])) tableEnd += 1;
   return lines
     .slice(featuresHeader + 1, tableEnd)
-    .some((line) => /^\s*multi_agent_v2\s*=/.test(line));
+    .some((line) => /^\s*(?:multi_agent_v2|"multi_agent_v2"|'multi_agent_v2')\s*=/.test(line));
 }
 
 // Some Codex builds do not know the `multi_agent_v2` feature and would reject
@@ -258,7 +258,7 @@ function withManagedMultiAgentV2(input) {
   ];
   const lines = cleaned.split("\n");
   const featuresHeader = lines.findIndex((line) =>
-    /^\s*\[features\]\s*(?:#.*)?$/.test(line),
+    /^\s*\[\s*(?:features|"features"|'features')\s*\]\s*(?:#.*)?$/.test(line),
   );
   if (featuresHeader === -1) {
     const firstTable = lines.findIndex((line) => /^\s*\[/.test(line));

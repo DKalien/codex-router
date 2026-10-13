@@ -2,6 +2,19 @@
 
 ## Lite 分支（未发布）
 
+- 审计修复：第三方压缩拒绝 HTTP 200 中的失败、不完整或空摘要，不再替换有效历史；
+  普通及压缩上游错误共用 64 KiB 限读和脱敏，并保留 Retry-After。
+- 手动路由设置与 WLB 自动回退共用跨进程锁和 revision 校验，旧请求不能覆盖之后的
+  手动切换或同路由重选。错误体、压缩和协作 relay 缓冲读取也遵循闲置超时。
+- SSE 支持多行 data、CR/LF/CRLF 和跨 chunk 换行；固定块缓存避免重复全量复制，
+  单事件限 8 MiB。用量解析超限仍透传原字节；MiMo 事件、JSON 和累计未完成工具
+  状态超限明确报错，不静默损坏工具调用。
+- 配置启停识别 features 表与 multi_agent_v2 键的裸名、双引号及单引号形式，
+  不重复注入 TOML 定义。Windows 服务按已登记启动器的 Node 路径核验，支持 CLI
+  与后台使用不同 Node；status 不清理 PID，重新安装先停旧服务再更新启动器。
+- 删除不可达的旧网关协作转换；服务商协议必须显式为 openai-responses。
+  自定义注册表的迁移条件见 README；当前三个服务商无需修改。
+
 - 新增 `supergpt-relay` 和 `route supergpt`：按官方选择器的原始 `gpt-*` 模型名直接
   转发到 `https://api.supergpt.dev/v1`，通过 `provider-key supergpt-relay set` 安全保存
   并启用 API key；不新增旧模型条目或生成目录。子代理和模型列表继续走官方，

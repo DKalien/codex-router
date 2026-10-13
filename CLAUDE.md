@@ -5,11 +5,12 @@
 
 ## 范围
 
-只保留两个第三方服务商。它们都原生支持 Responses API，并由 `src/router.mjs`
+只保留三个第三方服务商。它们都原生支持 Responses API，并由 `src/router.mjs`
 直接转发（没有 LiteLLM、转发器或 Python）：
 
 - `mimo-token-plan` — `config/mimo/` — `https://token-plan-cn.xiaomimimo.com/v1`
 - `wlb-relay` — `config/wlb/` — `https://codex.wlbclub.com`
+- `supergpt-relay` — `config/supergpt/` — `https://api.supergpt.dev/v1`
 
 不得重新引入网关/转发层、服务商预设、OAuth 流程、托盘应用或自动更新器。
 
@@ -18,9 +19,6 @@
 - `src/router.mjs` — 完整请求路径（官方请求透传、全局 GPT 路由，以及注入各服务商
   凭据后的旧命名空间直接转发）
 - `src/gpt-route.mjs` — 读写非子代理的原生 GPT 请求的全局路由状态，默认使用官方路由
-- `src/catalog.mjs` — 仅供手动旧目录流程根据官方捕获和 `config/` 构建
-  `merged-models.json`；WLB 以对应官方条目为元数据基线，MiMo 输出明确指定的
-  Xiaomi 元数据
 - `src/model-registry.mjs` — 加载并验证 `config/**`；已列出模型的字段可选，但
   提供时必须通过验证
 - `src/response-usage.mjs` — 从 JSON/SSE 响应提取 Token 用量；上游省略
@@ -39,11 +37,10 @@
 
 ## 规则
 
-- 默认安装不写入 `model_catalog_json`，也不构建静态模型目录，官方目录由 Codex
-  自己更新。只有手动旧目录构建时才要求固定 8 个模型：原生
-  `gpt-5.6-sol/terra/luna`、MiMo `mimo-v2.5-pro` 和 `mimo-v2.5`，以及 WLB
-  `gpt-5.6-sol/terra/luna`；其中 5 个模型位于两个服务商的命名空间下并由路由器转发。
-- `route official|wlb|status` 管理或读取全局 GPT 路由；缺少状态文件时默认为
+- 不提供模型元数据更新或静态目录生成入口，也不写入 `model_catalog_json`；官方
+  目录由 Codex 自己更新。服务商密钥操作不得触发目录重建。保留旧目录状态读取和
+  配置迁移兼容；MiMo 的两个及 WLB 的三个命名空间 slug 继续由路由器转发。
+- `route official|wlb|supergpt|status` 管理或读取全局 GPT 路由；缺少状态文件时默认为
   `official`。设置从下一次非子代理的原生 GPT 请求起对所有任务共享，不绑定线程；已识别的
   原生 `gpt-*` 子代理固定走官方，不读取全局路由状态。识别复用子代理/父线程请求头和
   rollout 的 `source.subagent.thread_spawn`；缺失或未写完的 rollout 不缓存负结果，
@@ -55,22 +52,23 @@
   `wlb-relay/*` 和 MiMo 保持原语义。等待复用可取消的 `sleep`，由
   `CODEX_ROUTER_WLB_FALLBACK_DELAY_MS` 调整（0 至 30000 毫秒整数，其他值默认 5000），
   不修改 Codex 客户端的重连间隔；切换后需手动 `route wlb` 才恢复 WLB。
+  `supergpt` 同样按原始 `gpt-*` 模型名转发，不新增旧命名空间模型条目或生成目录；
+  上游错误直接返回，不应用 WLB 专属的额度耗尽回退。首次新增服务商配置需重启
+  Router，之后 `route` 热切换无需重启。SuperGPT 使用现有代理环境，不加入固定 DIRECT。
   `route status` 只读且不支持 `--json`，只有总状态命令支持 `status --json`。
-- `/models` 和 `/v1/models` 始终使用官方身份透传官方查询参数和完整元数据；WLB
+- `/models` 和 `/v1/models` 始终使用官方身份透传官方查询参数和完整元数据；WLB 和 SuperGPT
   路由不替换官方模型列表。
 - 每个改动过的 `src/*.mjs` 都必须运行 `node --check`；整个源码树的相对导入必须
   保持完整（对照 `grep -h 'from "./' src/*.mjs` 与实际文件）。
-- 修改 `config/` 或手动旧目录代码后，运行 `node src/catalog.mjs`，确认旧目录的
-  8 个模型 slug 和 5 个路由 slug 全部存在；重载路由器进程，如果模型选择器仍显示
-  手动旧目录，再重启 Codex。默认官方目录状态无需运行该命令。
-- 修改旧目录代码或源码后，运行 `node test/catalog-metadata.mjs` 和
-  `node scripts-check.mjs`。
+- 修改 `config/` 后，通过 `src/model-registry.mjs` 的验证器并运行
+  `node --test test/router-fixes.mjs`；运行中的路由器需重启才能加载配置变更。
+- 修改源码后，运行 `node scripts-check.mjs`。
 - 修改 `src/router.mjs` 或 `src/response-usage.mjs` 后，运行
   `node --test test/router-fixes.mjs`。
 - 配置管理必须保留用户已有的 `[features.multi_agent_v2]` 子表（包括带引号的表名），
   不得重复注入同名内联表；启用、重复启用和关闭均需保持 TOML 有效。
-- 修改 GPT 路由开关后运行 `node --test test/router-fixes.mjs`；修改配置管理、目录
-  刷新入口或状态检查后运行 `node --test test/official-catalog.mjs`。
+- 修改 GPT 路由开关后运行 `node --test test/router-fixes.mjs`；修改配置管理、服务商
+  密钥操作或状态检查后运行 `node --test test/official-catalog.mjs`。
 - 修改 `src/response-usage.mjs`、`src/sse-prefix.mjs` 或
   `src/mimo-custom-tools.mjs` 后，运行
   `node --test test/response-usage-hardening.mjs`。
@@ -80,7 +78,7 @@
   `node --test test/credential-file-security.mjs`。
 - 修改 Windows 后台子进程调用后，运行 `node --test test/windows-hidden-consoles.mjs`。
 - MiMo 兼容必须保持服务商隔离：标准 envelope 的旧 `MESSAGE` 进度不回放，
-  `FINAL_ANSWER`、`NEW_TASK`、`FOLLOWUP_TASK` 仍保留；原生 GPT 和 WLB 不得应用
+  `FINAL_ANSWER`、`NEW_TASK`、`FOLLOWUP_TASK` 仍保留；原生 GPT、WLB 和 SuperGPT 不得应用
   MiMo 专属的历史裁剪或 custom-tool 映射。
 - 切回原生 GPT 时，只能回放 `encrypted_content` 符合原生 `gAAAAA...` token
   形状的 `reasoning`；其他服务商的 reasoning 必须整项丢弃，合法项也必须移除仅

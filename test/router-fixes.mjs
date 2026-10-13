@@ -1642,3 +1642,119 @@ test("WLB 自动切换区分临时请求配额和账单硬额度，并保留升�
     assert.equal(isUsageExhausted(429, JSON.stringify({ error })), expected, JSON.stringify(error));
   }
 });
+
+
+test("SuperGPT 原名路由隔离凭据，支持 JSON/SSE/压缩，子代理和模型目录保留官方", async () => {
+  const received = [];
+  const catalog = { models: [{ slug: "gpt-future", future_capability: true }] };
+  const sse = 'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2}}}\n\n';
+  const upstream = (provider) => http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString()) : undefined;
+    received.push({ provider, url: request.url, headers: request.headers, body });
+    if (request.method === "GET") {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify(catalog));
+    } else if (body.model === "gpt-no-quota") {
+      response.writeHead(429, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: { code: "insufficient_quota", message: "Insufficient balance" } }));
+    } else if (body.model === "gpt-unsupported") {
+      response.writeHead(404, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: { message: "Model not supported" } }));
+    } else if (body.stream) {
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.end(sse);
+    } else {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "摘要" }] }] }));
+    }
+  });
+  const official = upstream("official");
+  const supergpt = upstream("supergpt");
+  const officialPort = await listen(official);
+  const supergptPort = await listen(supergpt);
+  const router = await startRouter({
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${officialPort}`,
+    SUPERGPT_BASE_URL: `http://127.0.0.1:${supergptPort}/v1/`,
+    SUPERGPT_API_KEY: "test-supergpt-key",
+    CODEX_ROUTER_SESSIONS_PATH: "", CODEX_ROUTER_SESSION_INDEX: "",
+  });
+  const statePath = path.join(router.stateDir, "gpt-route.json");
+  const selectionPath = path.join(router.stateDir, "enabled-providers.json");
+  const cli = (command, extraEnv = {}) => spawnSync(process.execPath, [path.join(root, "src/gpt-route.mjs"), command], {
+    encoding: "utf8", env: { ...process.env, CODEX_HOME: router.stateDir, MODEL_ROUTER_STATE_DIR: router.stateDir, SUPERGPT_API_KEY: "test-supergpt-key", ...extraEnv },
+  });
+  const send = (model, { endpoint = "responses", stream = false, headers = {}, input = [{ role: "user", content: "你好" }] } = {}) => fetch(
+    `http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/${endpoint}`, {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer test-official-key", "ChatGPT-Account-Id": "private-account", Cookie: "private-session", ...headers },
+      body: JSON.stringify({ model, input, stream }),
+    },
+  );
+  try {
+    const missingKey = cli("supergpt", { SUPERGPT_API_KEY: "" });
+    assert.equal(missingKey.status, 1);
+    assert.match(missingKey.stderr, /SuperGPT 未配置密钥/);
+    assert.equal(existsSync(statePath), false);
+    writeFileSync(selectionPath, JSON.stringify({ version: 1, providers: ["wlb-relay"] }));
+    assert.match(cli("supergpt").stderr, /SuperGPT 尚未启用/);
+    assert.equal(existsSync(statePath), false);
+    writeFileSync(selectionPath, JSON.stringify({ version: 1, providers: ["supergpt-relay"] }));
+    const switched = cli("supergpt");
+    assert.equal(switched.status, 0, switched.stderr);
+    const before = readFileSync(statePath, "utf8");
+    assert.match(cli("status").stdout, /SuperGPT \(supergpt\)/);
+    assert.equal(readFileSync(statePath, "utf8"), before);
+    for (const model of ["gpt-5.6-sol", "gpt-6.1-sol", "gpt-future"]) {
+      const response = await send(model);
+      assert.equal(response.status, 200);
+      await response.json();
+      const last = received.at(-1);
+      assert.equal(last.provider, "supergpt");
+      assert.equal(last.url, "/v1/responses");
+      assert.equal(last.body.model, model);
+      assert.equal(last.headers.authorization, "Bearer test-supergpt-key");
+      assert.equal(last.headers["chatgpt-account-id"], undefined);
+      assert.equal(last.headers.cookie, undefined);
+    }
+    const streamed = await send("gpt-future", { stream: true });
+    assert.equal(streamed.status, 200);
+    assert.equal(await streamed.text(), sse);
+    for (const options of [{ endpoint: "responses/compact" }, { input: [{ role: "user", content: "你好" }, { type: "compaction_trigger" }] }]) {
+      const compact = await send("gpt-future", options);
+      assert.equal(compact.status, 200);
+      await compact.json();
+      assert.equal(received.at(-1).provider, "supergpt");
+      assert.equal(received.at(-1).url, "/v1/responses");
+      assert.equal(received.at(-1).body.model, "gpt-future");
+    }
+    const child = await send("gpt-future", { headers: { "x-openai-subagent": "true" } });
+    assert.equal(child.status, 200);
+    await child.json();
+    assert.equal(received.at(-1).provider, "official");
+    assert.equal(received.at(-1).headers.authorization, "Bearer test-official-key");
+    for (const endpoint of ["models", "v1/models"]) {
+      const models = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/${endpoint}?client_version=supergpt-test`, { headers: { Authorization: "Bearer test-official-key" } });
+      assert.deepEqual(await models.json(), catalog);
+      assert.equal(received.at(-1).provider, "official");
+      assert.equal(received.at(-1).url, "/models?client_version=supergpt-test");
+    }
+    for (const [model, status] of [["gpt-no-quota", 429], ["gpt-unsupported", 404]]) {
+      const count = received.length;
+      const response = await send(model);
+      assert.equal(response.status, status);
+      await response.json();
+      assert.equal(received.length, count + 1);
+      assert.equal(readFileSync(statePath, "utf8"), before);
+    }
+    writeFileSync(selectionPath, JSON.stringify({ version: 1, providers: [] }));
+    const disabled = await send("gpt-future");
+    assert.equal(disabled.status, 409);
+    assert.equal((await disabled.json()).error.type, "provider_not_enabled");
+    assert.equal(cli("official").status, 0);
+  } finally {
+    await router.close();
+    await close(official);
+    await close(supergpt);
+  }
+});

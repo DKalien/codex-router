@@ -5,11 +5,14 @@ Codex Router Lite 是一个本地 Node 服务。它只有一个路由器进程�
 
 ## 凭据
 
-- 只路由 `mimo-token-plan` 和 `wlb-relay` 两个服务商。分别使用
-  `provider-key mimo-token-plan set` 和 `provider-key wlb-relay set` 设置密钥。
+- 只路由 `mimo-token-plan`、`wlb-relay` 和 `supergpt-relay` 三个服务商。使用
+  `provider-key <provider> set` 安全保存密钥并启用对应服务商。
 - 受保护的密钥文件默认位于
-  `~/.codex/codex-router/mimo-api-key.secret` 和
-  `~/.codex/codex-router/wlb-api-key.secret`。可以通过
+  `~/.codex/codex-router/mimo-api-key.secret`、
+  `~/.codex/codex-router/wlb-api-key.secret` 和
+  `~/.codex/codex-router/supergpt-api-key.secret`。SuperGPT 的 macOS Keychain 服务名为
+  `codex-router-supergpt`；前台环境变量为 `SUPERGPT_API_KEY`，网页控制台 token 不能
+  替代 API key。可以通过
   `CODEX_ROUTER_STATE_DIR` 或 `MODEL_ROUTER_STATE_DIR` 指定其他状态目录。
 - 只从普通文件读取持久化密钥；符号链接、目录和读取失败的候选会被忽略。文件权限
   仅授予当前用户：POSIX 使用 `600`，Windows 使用非继承 DACL，且只保留当前用户的
@@ -37,8 +40,11 @@ MiMo 长会话中的 custom tool 和协作历史会先在本地转换为其支�
 
 配置中的服务商 URL 使用 HTTPS，路由器直接调用各服务商的 `/responses` 端点。
 应保持正常的 TLS 验证，并且只信任自己管理的代理。`src/start.mjs` 设置
-`NODE_USE_ENV_PROXY=1` 并传递 `HTTP_PROXY`/`HTTPS_PROXY`；代理默认是
-`http://127.0.0.1:7897`，`NO_PROXY` 则包含回环地址。如果代理终止 TLS，它可以
+`NODE_USE_ENV_PROXY=1` 并传递 `HTTP_PROXY`/`HTTPS_PROXY`；显式 `HTTPS_PROXY` 优先，
+否则探测本机代理端口（默认依次为 `10808`、`10809`、`7897`、`7890`），探测不到则直连。
+`NO_PROXY` 包含回环地址和固定直连的 WLB/MiMo。
+SuperGPT 使用现有代理环境，基础 URL 默认为 `https://api.supergpt.dev/v1`，可由
+`SUPERGPT_BASE_URL` 覆盖。选择第三方路由意味着提示词和工具结果会发送给对应服务商。如果代理终止 TLS，它可以
 观察或修改流量，因此应检查代理配置和日志。
 
 请求日志默认关闭。`CODEX_ROUTER_REQUEST_LOG=1` 会记录请求方法、URL、状态码和
@@ -58,8 +64,8 @@ Codex 响应。
 ## 支持的运行环境和更新
 
 按照 `package.json` 的声明使用 Node.js `>=22.19.0`，并保持锁文件同步。修改路由
-模型后，运行 `node src/catalog.mjs`，重载路由器进程；如果模型选择器尚未刷新，再
-重启 Codex。分发变更前，必须运行仓库内的元数据和语法检查。
+模型配置后，通过注册表验证并重启路由器；官方模型目录由 Codex 自行更新，本项目
+不再生成或更新模型元数据。分发变更前，必须运行相关回归测试和语法检查。
 
 ## 报告安全漏洞
 

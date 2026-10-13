@@ -90,6 +90,7 @@ try {
   Write-Host "路由器已安装；Codex 默认继续使用官方模型目录。请完全退出并重新打开 Codex，以加载受管理的本地 endpoint。"
   Write-Host "MiMo API 密钥：.\codex-router.ps1 provider-key mimo-token-plan set"
   Write-Host "WLB API 密钥： .\codex-router.ps1 provider-key wlb-relay set"
+  Write-Host "SuperGPT API 密钥：.\codex-router.ps1 provider-key supergpt-relay set；配置后 route supergpt"
 } finally {
   Pop-Location
 }

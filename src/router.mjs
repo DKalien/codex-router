@@ -38,11 +38,10 @@ import {
 import { MODEL_BY_SLUG, PROVIDERS, providerForModel } from "./model-registry.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
 import { readNativeRedirect } from "./native-redirect.mjs";
-import { readGptRoute, setGptRoute } from "./gpt-route.mjs";
+import { GPT_ROUTES, readGptRoute, setGptRoute } from "./gpt-route.mjs";
 import {
   canonicalProviderId,
   readProviderSelection,
-  selectedConfiguredListedModels,
 } from "./provider-selection.mjs";
 import { resolveProviderCredential } from "./provider-credentials.mjs";
 import {
@@ -1140,11 +1139,12 @@ async function handleResponses(request, response, requestUrl) {
         writeJson(response, 503, { error: { type: "invalid_gpt_route", message: error.message } });
         return;
       }
-      if (gptRoute === "wlb") {
+      const provider = GPT_ROUTES.get(gptRoute).provider;
+      if (provider) {
         // 官方选择器负责模型名；新 GPT 模型无需先登记到旧静态目录。
         registeredRoute = {
-          provider: "wlb-relay",
-          slug: `wlb-relay/${requestedModel}`,
+          provider,
+          slug: `${provider}/${requestedModel}`,
           upstreamModel: requestedModel,
         };
       }

@@ -2,6 +2,15 @@
 
 ## Lite 分支（未发布）
 
+- 新增 `supergpt-relay` 和 `route supergpt`：按官方选择器的原始 `gpt-*` 模型名直接
+  转发到 `https://api.supergpt.dev/v1`，通过 `provider-key supergpt-relay set` 安全保存
+  并启用 API key；不新增旧模型条目或生成目录。子代理和模型列表继续走官方，
+  SuperGPT 上游错误直接返回，不使用 WLB 专属的额度耗尽回退。首次新增配置需重启
+  Router，之后路由热切换无需重启；SuperGPT 沿用现有代理环境。
+
+- 移除模型元数据更新和旧静态目录生成器；服务商密钥操作不再触发目录重建。
+  官方模型目录继续由 Codex 更新，已有旧目录的状态读取和配置迁移兼容保留。
+
 - 原生上游代理改为启动时探测本机候选端口（v2rayN `10808`/`10809` 优先，兼容
   Clash `7897`/`7890`，`CODEX_ROUTER_PROXY_PORTS` 可覆盖，显式 `HTTPS_PROXY` 优先），
   探测不到时原生路由直连。新增监督进程看门狗：代理在启动后出现或换端口时优雅

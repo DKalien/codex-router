@@ -35,7 +35,6 @@ export const CODEX_AGENTS_DIR = path.join(CODEX_HOME, "agents");
 export const NATIVE_CATALOG_PATH = path.join(STATE_DIR, "native-models.json");
 export const MERGED_CATALOG_PATH = path.join(STATE_DIR, "merged-models.json");
 export const NATIVE_ALIAS_PATH = path.join(STATE_DIR, "native-aliases.json");
-export const ANNOUNCED_MODELS_PATH = path.join(STATE_DIR, "announced-models.json");
 export const CALLER_SECRET_PATH = path.join(STATE_DIR, "caller-secret");
 export const CODEX_PROVIDER_MODE_PATH = path.join(STATE_DIR, "codex-provider-mode.json");
 export const PROVIDER_SELECTION_PATH = path.join(STATE_DIR, "enabled-providers.json");

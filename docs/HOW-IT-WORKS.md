@@ -38,8 +38,12 @@ sequenceDiagram
 在途请求最多 drain 2 秒；已开始的 SSE 会收到本地重启 terminal error 后 clean EOF，
 尚未发送响应头的请求返回 503。`src/start.mjs` 的强杀 backstop 会覆盖 drain 和 flush
 窗口；`MODEL_ROUTER_SHUTDOWN_DRAIN_MS` 可调整 drain 时长。它还为 Node 的 `fetch`
-提供代理环境。请求路径中没有网关、API 转发器、Python 进程、OAuth 流程、托盘应用
-或更新器。
+提供代理环境：启动时按候选端口探测本机代理（v2rayN `10808`/`10809` 优先，兼容
+Clash `7897`/`7890`，`CODEX_ROUTER_PROXY_PORTS` 可覆盖，显式 `HTTPS_PROXY` 优先，
+探测不到则原生路由直连），监督进程内的看门狗每 12 秒复测，代理在启动后才出现或
+换到其他候选端口时，先写 `shutdown.request` 优雅排空再带新代理环境重启路由器子
+进程（代理消失不触发重启；显式 `HTTPS_PROXY` 时看门狗停用）。请求路径中没有
+网关、API 转发器、Python 进程、OAuth 流程、托盘应用或更新器。
 
 Windows 后台服务由 `src/service-windows.mjs` 通过计划任务管理。后台启动的
 `src/start.mjs` 会将监督进程 PID 原子写入 `service.pid`；停止或重启时，服务管理器

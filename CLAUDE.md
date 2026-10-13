@@ -29,8 +29,11 @@
   探测期间缓存的字节
 - `src/mimo-custom-tools.mjs` — 只处理 MiMo 的 custom tool/agent message 兼容、
   旧 `MESSAGE` 进度裁剪和 JSON/SSE 响应还原
-- `src/start.mjs` — 监督唯一的路由器子进程并注入代理环境（`NODE_USE_ENV_PROXY=1`，
-  `HTTPS_PROXY` 默认为 `http://127.0.0.1:7897`）；Windows 后台服务原子登记
+- `src/start.mjs` — 监督唯一的路由器子进程并注入代理环境：启动时按候选端口探测
+  本机代理（v2rayN `10808`/`10809` 优先，兼容 Clash `7897`/`7890`，
+  `CODEX_ROUTER_PROXY_PORTS` 可覆盖；显式 `HTTPS_PROXY` 优先，探测不到则原生路由
+  直连）；看门狗每 12 秒复测，代理出现或换端口时优雅排空并重启子进程，代理消失
+  不重启；WLB/MiMo 始终在 `NO_PROXY` 中保持 DIRECT。Windows 后台服务原子登记
   `service.pid`，退出时只清理仍属于自己的 PID
 - `codex-router.ps1` / `install.ps1` — Windows 入口；`bin/` — POSIX 入口
 

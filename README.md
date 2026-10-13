@@ -90,9 +90,13 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
   终止读取；协作载荷 relay 和 compact 响应分别最多缓冲 4 MiB 与 32 MiB。
 - **凭据文件**：持久化密钥只从普通文件读取，符号链接和目录会被忽略。Windows
   写入时会用仅包含当前用户 `FullControl` 的非继承 DACL 替换旧 ACL。
-- **代理**：原生上游请求通过 `NODE_USE_ENV_PROXY` 使用 `HTTPS_PROXY`（默认
-  `http://127.0.0.1:7897`，即 Clash 混合端口）；WLB 和 MiMo 域名默认加入
-  `NO_PROXY` 并保持 DIRECT。
+- **代理**：监督进程启动时探测本机代理端口（v2rayN `10808`/`10809` 优先，兼容
+  Clash `7897`/`7890`，`CODEX_ROUTER_PROXY_PORTS` 可覆盖，显式 `HTTPS_PROXY` 优先；
+  探测不到则原生路由直连），再经 `NODE_USE_ENV_PROXY`/`HTTPS_PROXY` 注入路由器。
+  WLB 和 MiMo 域名固定加入 `NO_PROXY` 并保持 DIRECT，不依赖代理是否在线。监督
+  进程内的看门狗每 12 秒复测：代理在启动后才出现或换到其他候选端口时，先写
+  `shutdown.request` 优雅排空再带新代理环境重启路由器子进程；代理消失不触发
+  重启；显式设置 `HTTPS_PROXY` 时看门狗停用。
 
 ## 安装与日常使用（Windows）
 

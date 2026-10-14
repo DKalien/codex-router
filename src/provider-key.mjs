@@ -9,10 +9,6 @@ import {
 } from "./provider-credentials.mjs";
 import { disableProvider, enableProvider } from "./provider-selection.mjs";
 import { secretEntryFeedback, secretEntryProblem } from "./secret-entry.mjs";
-import {
-  refreshTargetPickerIfInstalled,
-  targetPickerName,
-} from "./target-integration.mjs";
 
 const providerId = process.argv[2];
 const command = process.argv[3] || "status";
@@ -232,11 +228,8 @@ if (command === "status") {
   const value = promptForKey(provider.credential.prompt || `${provider.displayName} API key`);
   const target = writeProviderCredential(provider, value);
   enableProvider(provider.id);
-  const refreshed = refreshTargetPickerIfInstalled();
   process.stdout.write(
-    `${provider.displayName} key saved to protected local storage at ${target}. The provider is enabled.${
-      refreshed ? ` Fully quit and reopen ${targetPickerName()} to refresh the model picker.` : ""
-    }\n`,
+    `${provider.displayName} key saved to protected local storage at ${target}. The provider is enabled.\n`,
   );
 } else {
   const target = primaryCredentialPath(provider);
@@ -249,12 +242,9 @@ if (command === "status") {
     stillConfigured: remaining.configured,
     remainingSource: remaining.source,
   };
-  const refreshed = removal.removedFiles ? refreshTargetPickerIfInstalled() : false;
   process.stdout.write(
     removal.removedFiles
-      ? `Removed ${removal.removedFiles} managed ${provider.displayName} key file${removal.removedFiles === 1 ? "" : "s"} and disabled the provider.${
-          refreshed ? ` Fully quit and reopen ${targetPickerName()} to refresh the model picker.` : ""
-        }\n`
+      ? `Removed ${removal.removedFiles} managed ${provider.displayName} key file${removal.removedFiles === 1 ? "" : "s"} and disabled the provider.\n`
       : `No managed ${provider.displayName} key file exists.\n`,
   );
   if (removal.stillConfigured) {

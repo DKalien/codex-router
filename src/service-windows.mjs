@@ -245,7 +245,39 @@ function removeServicePid(pid) {
   }
 }
 
+function serviceNodePath() {
+  let launcher;
+  try {
+    const bytes = readFileSync(launcherPath);
+    launcher = bytes.subarray(0, 2).equals(Buffer.from([0xff, 0xfe]))
+      ? bytes.subarray(2).toString("utf16le")
+      : bytes.toString("utf8");
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  const direct = launcher?.match(/^\s*status = shell\.Run\("cmd\.exe \/D \/C " & quote & quote & "((?:""|[^"])*)" & quote & " " & quote & "((?:""|[^"])*)" & quote & " >> "/m);
+  if (direct && path.resolve(direct[2].replaceAll('""', '"')).toLowerCase() === startPath.toLowerCase()) {
+    return direct[1].replaceAll('""', '"');
+  }
+  // Older VBS launchers delegate to the registered CMD wrapper.
+  if (launcher && !launcher.includes(`"${vbsEscape(wrapperPath)}"`)) {
+    throw new Error("Unable to identify Node in the registered Codex Router launcher.");
+  }
+  try {
+    const wrapper = readFileSync(wrapperPath, "utf8");
+    const command = wrapper.match(/^"([^"]+)" "([^"]+)" >> /m);
+    if (command && path.resolve(command[2].replaceAll("%%", "%")).toLowerCase() === startPath.toLowerCase()) {
+      return command[1].replaceAll("%%", "%");
+    }
+    throw new Error("Unable to identify Node in the registered Codex Router wrapper.");
+  } catch (error) {
+    if (error.code !== "ENOENT" || launcher) throw error;
+    return process.execPath;
+  }
+}
+
 function findServiceProcess(pid) {
+  const nodePath = serviceNodePath();
   const script = [
     "try {",
     "  $expectedExe = [IO.Path]::GetFullPath($env:CODEX_ROUTER_NODE_BIN)",
@@ -286,7 +318,7 @@ function findServiceProcess(pid) {
           encoding: "utf8",
           env: {
             ...process.env,
-            CODEX_ROUTER_NODE_BIN: process.execPath,
+            CODEX_ROUTER_NODE_BIN: nodePath,
             CODEX_ROUTER_START_SCRIPT: startPath,
             CODEX_ROUTER_LAUNCHER_PATH: launcherPath,
             ...(pid ? { CODEX_ROUTER_SERVICE_PID: String(pid) } : {}),
@@ -309,12 +341,12 @@ function findServiceProcess(pid) {
   });
 }
 
-function serviceProcessPid() {
+function serviceProcessPid({ cleanup = true } = {}) {
   const trackedPid = readServicePid();
   if (trackedPid) {
     const verifiedPid = findServiceProcess(trackedPid);
     if (verifiedPid) return verifiedPid;
-    removeServicePid(trackedPid);
+    if (cleanup) removeServicePid(trackedPid);
   }
   // Older launchers did not set a PID path. The exact wscript -> cmd -> start.mjs
   // parent chain keeps this one-time fallback from selecting a foreground Node.
@@ -480,22 +512,19 @@ if (command === "render") {
   process.stdout.write(`${JSON.stringify(taskAction())}\n`);
 } else if (command === "install") {
   try {
-    // Writing the launchers belongs inside the try: renameSync over the .vbs
-    // raises a sharing violation while a running wscript.exe still holds it
-    // open, and that used to throw out of install with nothing to catch it.
-    writeLaunchers();
     // An upgrade from the console-visible task may still have that instance
     // running. Register-ScheduledTask -Force replaces the definition under the
     // same task name, so no duplicate is left behind, but it does not stop the
     // running instance, and MultipleInstances IgnoreNew would then drop the new
     // hidden run — the console window would survive until the next logon.
     endTask();
+    // Stop using the previous launcher's Node path before replacing it.
+    writeLaunchers();
     installTask();
     schtasks(["/Run", "/TN", taskName], { quiet: true });
   } catch {
     // Scheduled-task creation can be restricted in a non-elevated terminal. The
-    // launchers are still written, so the install is reported as success and
-    // the caller can retry -- but endTask() has already stopped whatever was
+    // caller can retry -- but endTask() may already have stopped whatever was
     // running by this point, so simply returning would take a working router
     // down in exchange for nothing. Start whichever definition survived the
     // failed registration. When none did there is nothing to restore: no
@@ -533,7 +562,7 @@ if (command === "render") {
     state = "ready";
     if (taskState() === "running") {
       try {
-        loaded = Boolean(serviceProcessPid());
+        loaded = Boolean(serviceProcessPid({ cleanup: false }));
       } catch {
         // An unavailable or failed process query is not proof that the service is alive.
       }

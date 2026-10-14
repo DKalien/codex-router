@@ -5,11 +5,14 @@ Codex Router Lite 是一个本地 Node 服务。它只有一个路由器进程�
 
 ## 凭据
 
-- 只路由 `mimo-token-plan` 和 `wlb-relay` 两个服务商。分别使用
-  `provider-key mimo-token-plan set` 和 `provider-key wlb-relay set` 设置密钥。
+- 只路由 `mimo-token-plan`、`wlb-relay` 和 `supergpt-relay` 三个服务商。使用
+  `provider-key <provider> set` 安全保存密钥并启用对应服务商。
 - 受保护的密钥文件默认位于
-  `~/.codex/codex-router/mimo-api-key.secret` 和
-  `~/.codex/codex-router/wlb-api-key.secret`。可以通过
+  `~/.codex/codex-router/mimo-api-key.secret`、
+  `~/.codex/codex-router/wlb-api-key.secret` 和
+  `~/.codex/codex-router/supergpt-api-key.secret`。SuperGPT 的 macOS Keychain 服务名为
+  `codex-router-supergpt`；前台环境变量为 `SUPERGPT_API_KEY`，网页控制台 token 不能
+  替代 API key。可以通过
   `CODEX_ROUTER_STATE_DIR` 或 `MODEL_ROUTER_STATE_DIR` 指定其他状态目录。
 - 只从普通文件读取持久化密钥；符号链接、目录和读取失败的候选会被忽略。文件权限
   仅授予当前用户：POSIX 使用 `600`，Windows 使用非继承 DACL，且只保留当前用户的
@@ -37,8 +40,14 @@ MiMo 长会话中的 custom tool 和协作历史会先在本地转换为其支�
 
 配置中的服务商 URL 使用 HTTPS，路由器直接调用各服务商的 `/responses` 端点。
 应保持正常的 TLS 验证，并且只信任自己管理的代理。`src/start.mjs` 设置
-`NODE_USE_ENV_PROXY=1` 并传递 `HTTP_PROXY`/`HTTPS_PROXY`；代理默认是
-`http://127.0.0.1:7897`，`NO_PROXY` 则包含回环地址。如果代理终止 TLS，它可以
+`NODE_USE_ENV_PROXY=1` 并传递 `HTTP_PROXY`/`HTTPS_PROXY`；默认固定使用
+`http://127.0.0.1:7897`，不预先探测监听。显式代理按 `HTTPS_PROXY`、`https_proxy`、
+`HTTP_PROXY`、`http_proxy` 的优先级覆盖。`NO_PROXY` 保留自定义值，并补入
+`127.0.0.1`、`localhost`、`codex.wlbclub.com`、`token-plan-cn.xiaomimimo.com`
+和 `api.supergpt.dev`，三个第三方服务商默认直连。SuperGPT 基础 URL 默认为
+`https://api.supergpt.dev/v1`，可由 `SUPERGPT_BASE_URL` 覆盖；自定义其他域名
+不会自动直连，如需直连应加入 `NO_PROXY`。`CODEX_ROUTER_PROXY_PORTS` 已退役，
+旧配置改用 `HTTPS_PROXY`；不再定时探测或因代理端口变化自动重启。选择第三方路由意味着提示词和工具结果会发送给对应服务商。如果代理终止 TLS，它可以
 观察或修改流量，因此应检查代理配置和日志。
 
 请求日志默认关闭。`CODEX_ROUTER_REQUEST_LOG=1` 会记录请求方法、URL、状态码和
@@ -46,20 +55,25 @@ MiMo 长会话中的 custom tool 和协作历史会先在本地转换为其支�
 `[REDACTED]`，分享日志前仍应检查私有路径。路由器错误不会记录请求正文、响应正文
 或服务商密钥，但日志仍可能包含模型名称和路径。
 
-普通路由请求的第三方上游错误体最多读取 64 KiB，且只在返回前处理；Bearer、token、key、secret、
+普通及压缩请求的第三方上游错误体最多读取 64 KiB，且只在返回前处理；Bearer、token、key、secret、
 caller capability、查询参数和控制字符会被遮盖或清理，quoted JSON 字段会保留合法
 结构，错误详情还会限制长度。这样既避免巨型错误体占用内存，也避免上游凭据进入
 Codex 响应。
 
 请求正文达到配置上限后不再保留后续字节，但会排空请求以保持 HTTP framing，并可由
 客户端断开信号终止。协作载荷 relay 和 compact 响应分别最多缓冲 4 MiB 与 32 MiB；
-超限时立即取消上游流，避免由上游控制的响应无界占用内存。
+超限时立即取消上游流，避免由上游控制的响应无界占用内存。响应流及缓冲读取均有
+闲置超时，默认 300 秒无数据即取消；请求取消也会终止读取。
+
+SSE 单事件解析缓存最多 8 MiB。用量统计超限时释放缓存、原样透传并跳过该事件解析；
+MiMo 工具转换的单个事件、JSON 响应及累计未完成工具状态各限 8 MiB，超限明确失败，
+避免转发未转换的工具。第三方压缩遇到失败、不完整或空摘要时不会替换原历史。
 
 ## 支持的运行环境和更新
 
 按照 `package.json` 的声明使用 Node.js `>=22.19.0`，并保持锁文件同步。修改路由
-模型后，运行 `node src/catalog.mjs`，重载路由器进程；如果模型选择器尚未刷新，再
-重启 Codex。分发变更前，必须运行仓库内的元数据和语法检查。
+模型配置后，通过注册表验证并重启路由器；官方模型目录由 Codex 自行更新，本项目
+不再生成或更新模型元数据。分发变更前，必须运行相关回归测试和语法检查。
 
 ## 报告安全漏洞
 

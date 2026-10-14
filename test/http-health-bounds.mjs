@@ -39,7 +39,7 @@ test("upstream response 超限时立即取消余流", async () => {
     cancel() {
       canceled = true;
     },
-  });
+  }, { highWaterMark: 0 }); // 禁止流自身预取，单独验证读取器在超限后不再拉取。
 
   await assert.rejects(
     readResponseBody(new Response(body), { maxBytes: 4 }),

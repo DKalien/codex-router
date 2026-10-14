@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { credentialStatus } from "./provider-credentials.mjs";
-import { GPT_ROUTE_PROVIDERS, readGptRoute } from "./gpt-route.mjs";
+import { GPT_ROUTES, readGptRoute } from "./gpt-route.mjs";
 import { providerSelectionStatus } from "./provider-selection.mjs";
 import { LISTED_MODELS, PROVIDERS } from "./model-registry.mjs";
 import { readInstallManifest } from "./install-manifest.mjs";
@@ -131,7 +131,7 @@ function providersStatus() {
 function gptRouteStatus(providers) {
   try {
     const mode = readGptRoute();
-    const selected = providers.providers.find((provider) => provider.id === GPT_ROUTE_PROVIDERS[mode]);
+    const selected = providers.providers.find((provider) => provider.id === GPT_ROUTES.get(mode).provider);
     return {
       readable: true,
       mode,
@@ -226,7 +226,7 @@ function printText(status) {
   if (status.gptRoute) {
     console.log(`GPT 路由：${status.gptRoute.mode}`);
     if (!status.gptRoute.readable) console.log(`  ${status.gptRoute.error}`);
-    else if (!status.gptRoute.ready) console.log("  当前路由的服务商凭据或 provider selection 缺失。");
+    else if (!status.gptRoute.ready) console.log(`  ${GPT_ROUTES.get(status.gptRoute.mode).label} 凭据或 provider selection 缺失。`);
   }
   console.log(
     `Provider selection: ${status.providers.selection.explicit ? "explicit" : "default"} (${status.providers.selection.providers.join(", ") || "none"})`,

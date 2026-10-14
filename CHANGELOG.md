@@ -1,17 +1,35 @@
 # Changelog
 
-## SuperGPT 重新接入
-
-- 恢复 `supergpt-relay` 服务商、安全密钥与 `route supergpt`；原生 GPT 子代理和模型列表继续走官方。
-- 使用 `https://api.supergpt.dev/v1/responses`，保留 WLB 专属额度回退；现有全局路由不自动切换。
-
 ## Lite 分支（未发布）
 
-- 原生上游代理改为启动时探测本机候选端口（v2rayN `10808`/`10809` 优先，兼容
-  Clash `7897`/`7890`，`CODEX_ROUTER_PROXY_PORTS` 可覆盖，显式 `HTTPS_PROXY` 优先），
-  探测不到时原生路由直连。新增监督进程看门狗：代理在启动后出现或换端口时优雅
-  排空并重启路由器子进程，代理消失不重启；WLB/MiMo 始终直连，不受代理状态影响。
-- 已识别的原生 `gpt-*` 子代理固定走官方；主代理仍遵循全局 `official`/`wlb`。
+- 审计修复：第三方压缩拒绝 HTTP 200 中的失败、不完整或空摘要，不再替换有效历史；
+  普通及压缩上游错误共用 64 KiB 限读和脱敏，并保留 Retry-After。
+- 手动路由设置与 WLB 自动回退共用跨进程锁和 revision 校验，旧请求不能覆盖之后的
+  手动切换或同路由重选。错误体、压缩和协作 relay 缓冲读取也遵循闲置超时。
+- SSE 支持多行 data、CR/LF/CRLF 和跨 chunk 换行；固定块缓存避免重复全量复制，
+  单事件限 8 MiB。用量解析超限仍透传原字节；MiMo 事件、JSON 和累计未完成工具
+  状态超限明确报错，不静默损坏工具调用。
+- 配置启停识别 features 表与 multi_agent_v2 键的裸名、双引号及单引号形式，
+  不重复注入 TOML 定义。Windows 服务按已登记启动器的 Node 路径核验，支持 CLI
+  与后台使用不同 Node；status 不清理 PID，重新安装先停旧服务再更新启动器。
+- 删除不可达的旧网关协作转换；服务商协议必须显式为 openai-responses。
+  自定义注册表的迁移条件见 README；当前三个服务商无需修改。
+
+- 新增 `supergpt-relay` 和 `route supergpt`：按官方选择器的原始 `gpt-*` 模型名直接
+  转发到 `https://api.supergpt.dev/v1`，通过 `provider-key supergpt-relay set` 安全保存
+  并启用 API key；不新增旧模型条目或生成目录。子代理和模型列表继续走官方，
+  SuperGPT 上游错误直接返回，不使用 WLB 专属的额度耗尽回退。首次新增配置需重启
+  Router，之后路由热切换无需重启；SuperGPT 默认域名直连。
+
+- 移除模型元数据更新和旧静态目录生成器；服务商密钥操作不再触发目录重建。
+  官方模型目录继续由 Codex 更新，已有旧目录的状态读取和配置迁移兼容保留。
+
+- 官方上游默认固定走 `http://127.0.0.1:7897`；保留标准代理环境变量的显式覆盖。
+  移除多端口探测、12 秒看门狗及端口变化自动重启，`CODEX_ROUTER_PROXY_PORTS`
+  已退役，旧配置改用 `HTTPS_PROXY`。`NO_PROXY` 保留自定义值，并补入回环地址及
+  WLB/MiMo/SuperGPT 默认域名，三个第三方默认直连；自定义 SuperGPT 域名如需
+  直连，应加入 `NO_PROXY`。子进程监督、健康检查和 PID 清理保持原语义。
+- 已识别的原生 `gpt-*` 子代理固定走官方；主代理仍遵循全局 `official`/`wlb`/`supergpt`。
   rollout 首次缺失或首行未写完时允许后续重新识别；显式 WLB/MiMo 命名空间保持原语义。
 
 - zstd 请求使用异步解压，并在进入原生解码器前检查帧头声明尺寸；保留解压输出上限。

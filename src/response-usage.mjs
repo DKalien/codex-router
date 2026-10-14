@@ -1,7 +1,9 @@
 import { Transform } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 
-import { HeaderlessSseDetector, stripLeadingBom } from "./sse-prefix.mjs";
+import { HeaderlessSseDetector } from "./sse-prefix.mjs";
+
+import { SseEventBuffer, parseSseEvent, renderSseEvent } from "./sse-events.mjs";
 
 const MAX_JSON_CAPTURE_BYTES = 8 * 1024 * 1024;
 
@@ -171,8 +173,6 @@ export function substituteZeroInputUsage(payload, estimate) {
   return undefined;
 }
 
-const LINE_FEED = 0x0a;
-
 export class ResponseUsageTransform extends Transform {
   #eventStream;
   #decoder = new StringDecoder("utf8");
@@ -185,7 +185,9 @@ export class ResponseUsageTransform extends Transform {
   // Rewrite mode holds the raw bytes rather than decoded text: everything the
   // router is not rewriting has to leave as the exact buffer that arrived, so
   // a malformed or non-UTF-8 byte can never be replaced on its way through.
-  #pending = Buffer.alloc(0);
+  #pending = [];
+  #pendingBytes = 0;
+  #events;
   #released = false;
   #headerlessDetector;
 
@@ -200,6 +202,10 @@ export class ResponseUsageTransform extends Transform {
       !this.#eventStream && !declared.includes("json")
         ? new HeaderlessSseDetector()
         : undefined;
+    this.#events = new SseEventBuffer(
+      (event) => this.#consumeEvent(event),
+      (bytes) => { if (this.#estimate !== undefined) this.push(bytes); },
+    );
     this.#estimate =
       Number.isInteger(estimatedInputTokens) && estimatedInputTokens > 0
         ? estimatedInputTokens
@@ -224,6 +230,11 @@ export class ResponseUsageTransform extends Transform {
   }
 
   #transformChunk(chunk) {
+    if (this.#eventStream) {
+      if (this.#estimate === undefined) this.push(chunk);
+      this.#events.write(chunk);
+      return;
+    }
     if (this.#estimate === undefined) {
       this.#observeOnly(chunk);
       return;
@@ -232,15 +243,12 @@ export class ResponseUsageTransform extends Transform {
       this.push(chunk);
       return;
     }
-    this.#pending = this.#pending.length ? Buffer.concat([this.#pending, chunk]) : chunk;
-    if (this.#eventStream) {
-      this.#consumeRewrittenLines();
-      return;
-    }
+    this.#pending.push(chunk);
+    this.#pendingBytes += chunk.length;
     // A non-streaming body has to be held to be rewritten. Oversized ones are
     // released and forwarded from then on, the way the observer stops
     // capturing past the same limit.
-    if (this.#pending.length > MAX_JSON_CAPTURE_BYTES) this.#release();
+    if (this.#pendingBytes > MAX_JSON_CAPTURE_BYTES) this.#release();
   }
 
   _flush(callback) {
@@ -250,11 +258,14 @@ export class ResponseUsageTransform extends Transform {
       this.#eventStream = detected.decision === "event-stream";
       for (const buffered of detected.chunks) this.#transformChunk(buffered);
     }
+    if (this.#eventStream) {
+      this.#events.end();
+      callback();
+      return;
+    }
     if (this.#estimate === undefined) {
       this.#buffer += this.#decoder.end();
-      if (this.#eventStream) {
-        this.#consumeEventLines(true);
-      } else if (this.#buffer) {
+      if (this.#buffer) {
         try {
           this.#observe(JSON.parse(this.#buffer));
         } catch {
@@ -264,13 +275,9 @@ export class ResponseUsageTransform extends Transform {
       callback();
       return;
     }
-    if (this.#eventStream) {
-      this.#consumeRewrittenLines(true);
-      callback();
-      return;
-    }
-    const body = this.#pending;
-    this.#pending = Buffer.alloc(0);
+    const body = Buffer.concat(this.#pending, this.#pendingBytes);
+    this.#pending = [];
+    this.#pendingBytes = 0;
     if (this.#released || !body.length) {
       if (body.length) this.push(body);
       callback();
@@ -305,11 +312,6 @@ export class ResponseUsageTransform extends Transform {
 
   #observeOnly(chunk) {
     this.push(chunk);
-    if (this.#eventStream) {
-      this.#buffer += this.#decoder.write(chunk);
-      this.#consumeEventLines();
-      return;
-    }
     if (this.#capturedBytes > MAX_JSON_CAPTURE_BYTES) return;
     this.#capturedBytes += chunk.length;
     if (this.#capturedBytes <= MAX_JSON_CAPTURE_BYTES) {
@@ -321,67 +323,19 @@ export class ResponseUsageTransform extends Transform {
 
   #release() {
     this.#released = true;
-    if (this.#pending.length) this.push(this.#pending);
-    this.#pending = Buffer.alloc(0);
+    for (const chunk of this.#pending) this.push(chunk);
+    this.#pending = [];
+    this.#pendingBytes = 0;
   }
 
-  #consumeEventLines(flush = false) {
-    const lines = this.#buffer.split(/\r?\n/);
-    this.#buffer = flush ? "" : lines.pop() || "";
-    for (const line of lines) this.#observeEventLine(line);
-  }
-
-  // Each complete line is forwarded as soon as it is whole, carrying its own
-  // terminator, so framing survives byte for byte and nothing is buffered
-  // beyond the line currently being written.
-  #consumeRewrittenLines(flush = false) {
-    while (true) {
-      const index = this.#pending.indexOf(LINE_FEED);
-      if (index === -1) break;
-      const line = this.#pending.subarray(0, index + 1);
-      this.#pending = this.#pending.subarray(index + 1);
-      this.push(this.#rewriteEventLine(line) || line);
-    }
-    if (flush && this.#pending.length) {
-      const line = this.#pending;
-      this.#pending = Buffer.alloc(0);
-      this.push(this.#rewriteEventLine(line) || line);
-    }
-  }
-
-  // Returns the replacement line, or undefined to forward the original bytes.
-  #rewriteEventLine(line) {
-    const text = line.toString("utf8");
-    const terminator = text.endsWith("\r\n") ? "\r\n" : text.endsWith("\n") ? "\n" : "";
-    const content = terminator ? text.slice(0, -terminator.length) : text;
-    const payload = this.#observeEventLine(content);
-    if (payload === undefined) return undefined;
+  #consumeEvent(bytes) {
+    const payload = parseSseEvent(bytes);
+    if (payload !== undefined) this.#observe(payload);
+    if (this.#estimate === undefined) return;
     const substituted = substituteZeroInputUsage(payload, this.#estimate);
-    if (substituted) {
-      this.#substituted = this.#estimate;
-      const bom = content.startsWith("\uFEFF") ? "\uFEFF" : "";
-      return Buffer.from(`${bom}data: ${JSON.stringify(substituted)}${terminator}`, "utf8");
-    }
-    // Codex reads the last usage it is given, so a later event that reports its
-    // own prompt count supersedes an earlier substituted one -- in telemetry as
-    // well as in the stream.
-    if (tokenUsageFromPayload(payload)) this.#substituted = undefined;
-    return undefined;
-  }
-
-  #observeEventLine(line) {
-    line = stripLeadingBom(line);
-    if (!line.startsWith("data:")) return undefined;
-    const data = line.slice(5).trim();
-    if (!data || data === "[DONE]") return undefined;
-    try {
-      const payload = JSON.parse(data);
-      this.#observe(payload);
-      return payload;
-    } catch {
-      // Ignore non-JSON SSE fields while preserving the original stream.
-      return undefined;
-    }
+    if (substituted) this.#substituted = this.#estimate;
+    else if (tokenUsageFromPayload(payload)) this.#substituted = undefined;
+    this.push(substituted ? renderSseEvent(bytes, substituted) : bytes);
   }
 
   #observe(payload) {

@@ -195,14 +195,6 @@ export function selectedListedModels() {
   return LISTED_MODELS.filter((model) => selected.has(model.provider));
 }
 
-export function selectedConfiguredListedModels() {
-  const selected = new Set(readProviderSelection());
-  const configured = new Set(configuredProviderIds());
-  return LISTED_MODELS.filter(
-    (model) => selected.has(model.provider) && configured.has(model.provider),
-  );
-}
-
 export function providerSelectionStatus() {
   const detail = readProviderSelectionDetail();
   return {

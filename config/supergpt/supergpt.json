@@ -3,7 +3,7 @@
   "providers": [
     {
       "id": "supergpt-relay",
-      "displayName": "SuperGPT Relay",
+      "displayName": "SuperGPT",
       "kind": "openai-compatible",
       "ownedBy": "supergpt",
       "baseUrl": "https://api.supergpt.dev/v1",

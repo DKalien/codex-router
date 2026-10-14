@@ -1,7 +1,8 @@
 import { Transform } from "node:stream";
-import { StringDecoder } from "node:string_decoder";
 
-import { HeaderlessSseDetector, stripLeadingBom } from "./sse-prefix.mjs";
+import { HeaderlessSseDetector } from "./sse-prefix.mjs";
+
+import { SseEventBuffer, parseSseEvent, renderSseEvent } from "./sse-events.mjs";
 
 const CUSTOM_PARAMETERS = {
   type: "object",
@@ -186,46 +187,6 @@ export function convertMimoResponseJson(payload, names) {
   return changed ? next : payload;
 }
 
-function parseSseData(block) {
-  const data = block
-    .split(/\r?\n/)
-    .map((line) => stripLeadingBom(line))
-    .filter((line) => line.startsWith("data:"))
-    .map((line) => line.slice(5).trimStart())
-    .join("\n")
-    .trim();
-  if (!data || data === "[DONE]") return undefined;
-  try {
-    return JSON.parse(data);
-  } catch {
-    return undefined;
-  }
-}
-
-function renderSseEvent(block, event) {
-  const lines = block.split(/\r?\n/);
-  const rendered = [];
-  let dataWritten = false;
-  for (const line of lines) {
-    const bom = line.startsWith("\uFEFF") ? "\uFEFF" : "";
-    const content = stripLeadingBom(line);
-    if (content.startsWith("event:")) {
-      rendered.push(`${bom}event: ${event.type}`);
-      continue;
-    }
-    if (content.startsWith("data:")) {
-      if (!dataWritten) {
-        rendered.push(`${bom}data: ${JSON.stringify(event)}`);
-        dataWritten = true;
-      }
-      continue;
-    }
-    rendered.push(line);
-  }
-  if (!dataWritten) rendered.push(`data: ${JSON.stringify(event)}`);
-  return rendered.join("\n");
-}
-
 function eventItemKey(item) {
   return [item?.id, item?.call_id].filter((value) => typeof value === "string" && value);
 }
@@ -235,15 +196,17 @@ export class MimoCustomToolCallTransform extends Transform {
   #eventStream;
   #json;
   #headerlessDetector;
-  #decoder = new StringDecoder("utf8");
-  #sseBuffer = "";
-  #jsonBuffer = Buffer.alloc(0);
+  #events;
+  #jsonBuffer = [];
+  #jsonBytes = 0;
   #passthrough = false;
   #states = new Map();
+  #stateBytes = 0;
 
   constructor(names, contentType = "") {
     super();
     this.#names = names instanceof Set ? names : new Set(names || []);
+    this.#events = new SseEventBuffer((bytes) => this.#emitSseBlock(bytes));
     const declared = String(contentType).toLowerCase();
     this.#eventStream = declared.includes("text/event-stream");
     this.#json = declared.includes("json");
@@ -254,25 +217,29 @@ export class MimoCustomToolCallTransform extends Transform {
   }
 
   _transform(chunk, _encoding, callback) {
-    if (this.#headerlessDetector) {
-      const detected = this.#headerlessDetector.write(chunk);
-      if (detected.decision === "pending") {
+    try {
+      if (this.#headerlessDetector) {
+        const detected = this.#headerlessDetector.write(chunk);
+        if (detected.decision === "pending") {
+          callback();
+          return;
+        }
+        this.#headerlessDetector = undefined;
+        this.#eventStream = detected.decision === "event-stream";
+        if (!this.#eventStream) {
+          const prefix = detected.chunks[0] || Buffer.alloc(0);
+          this.#json = /^\s*[\[{]/.test(prefix.subarray(0, 512).toString("utf8"));
+          this.#passthrough = !this.#json;
+        }
+        for (const buffered of detected.chunks) this.#transformChunk(buffered);
         callback();
         return;
       }
-      this.#headerlessDetector = undefined;
-      this.#eventStream = detected.decision === "event-stream";
-      if (!this.#eventStream) {
-        const prefix = detected.chunks[0] || Buffer.alloc(0);
-        this.#json = /^\s*[\[{]/.test(prefix.subarray(0, 512).toString("utf8"));
-        this.#passthrough = !this.#json;
-      }
-      for (const buffered of detected.chunks) this.#transformChunk(buffered);
+      this.#transformChunk(chunk);
       callback();
-      return;
+    } catch (error) {
+      callback(error);
     }
-    this.#transformChunk(chunk);
-    callback();
   }
 
   #transformChunk(chunk) {
@@ -281,18 +248,20 @@ export class MimoCustomToolCallTransform extends Transform {
       return;
     }
     if (this.#eventStream) {
-      this.#sseBuffer += this.#decoder.write(chunk);
-      this.#emitSseEvents();
+      this.#events.write(chunk);
       return;
     }
     if (this.#json) {
-      this.#jsonBuffer = this.#jsonBuffer.length
-        ? Buffer.concat([this.#jsonBuffer, chunk])
-        : chunk;
-      if (this.#jsonBuffer.length > MAX_JSON_CAPTURE_BYTES) {
-        this.push(this.#jsonBuffer);
-        this.#jsonBuffer = Buffer.alloc(0);
-        this.#passthrough = true;
+      if (this.#jsonBytes + chunk.length > MAX_JSON_CAPTURE_BYTES) {
+        throw new Error("MiMo JSON response exceeds 8 MiB buffer limit");
+      }
+      let offset = 0;
+      while (offset < chunk.length) {
+        const used = this.#jsonBytes % (64 * 1024);
+        if (used === 0) this.#jsonBuffer.push(Buffer.allocUnsafe(64 * 1024));
+        const copied = chunk.copy(this.#jsonBuffer.at(-1), used, offset, offset + 64 * 1024 - used);
+        offset += copied;
+        this.#jsonBytes += copied;
       }
       return;
     }
@@ -300,50 +269,70 @@ export class MimoCustomToolCallTransform extends Transform {
   }
 
   _flush(callback) {
-    if (this.#headerlessDetector) {
-      const detected = this.#headerlessDetector.end();
-      this.#headerlessDetector = undefined;
-      this.#eventStream = detected.decision === "event-stream";
-      if (!this.#eventStream) {
-        const prefix = detected.chunks[0] || Buffer.alloc(0);
-        this.#json = /^\s*[\[{]/.test(prefix.subarray(0, 512).toString("utf8"));
-        this.#passthrough = !this.#json;
+    try {
+      if (this.#headerlessDetector) {
+        const detected = this.#headerlessDetector.end();
+        this.#headerlessDetector = undefined;
+        this.#eventStream = detected.decision === "event-stream";
+        if (!this.#eventStream) {
+          const prefix = detected.chunks[0] || Buffer.alloc(0);
+          this.#json = /^\s*[\[{]/.test(prefix.subarray(0, 512).toString("utf8"));
+          this.#passthrough = !this.#json;
+        }
+        for (const buffered of detected.chunks) this.#transformChunk(buffered);
       }
-      for (const buffered of detected.chunks) this.#transformChunk(buffered);
-    }
-    if (this.#passthrough || !this.#names.size) {
-      callback();
-      return;
-    }
-    if (this.#eventStream) {
-      this.#sseBuffer += this.#decoder.end();
-      this.#emitSseEvents(true);
-      callback();
-      return;
-    }
-    if (this.#json && this.#jsonBuffer.length) {
-      const body = this.#jsonBuffer;
-      this.#jsonBuffer = Buffer.alloc(0);
-      try {
-        const payload = JSON.parse(body.toString("utf8"));
-        const mapped = convertMimoResponseJson(payload, this.#names);
-        this.push(mapped === payload ? body : Buffer.from(JSON.stringify(mapped), "utf8"));
-      } catch {
-        this.push(body);
+      if (this.#passthrough || !this.#names.size) {
+        callback();
+        return;
       }
+      if (this.#eventStream) {
+        this.#events.end();
+        callback();
+        return;
+      }
+      if (this.#json && this.#jsonBytes) {
+        const body = Buffer.concat(this.#jsonBuffer, this.#jsonBytes);
+        this.#jsonBuffer = [];
+        this.#jsonBytes = 0;
+        try {
+          const payload = JSON.parse(body.toString("utf8"));
+          const mapped = convertMimoResponseJson(payload, this.#names);
+          this.push(mapped === payload ? body : Buffer.from(JSON.stringify(mapped), "utf8"));
+        } catch {
+          this.push(body);
+        }
+      }
+      callback();
+    } catch (error) {
+      callback(error);
     }
-    callback();
+  }
+
+  #reserveState(bytes) {
+    if (this.#stateBytes + bytes > MAX_JSON_CAPTURE_BYTES) {
+      throw new Error("MiMo tool arguments exceed 8 MiB buffer limit");
+    }
+    this.#stateBytes += bytes;
   }
 
   #remember(item) {
+    const keys = eventItemKey(item);
+    for (const key of keys) {
+      const previous = this.#states.get(key);
+      if (previous) this.#forget(previous);
+    }
+    const bytes = keys.length ? Buffer.byteLength(JSON.stringify(item)) : 0;
+    this.#reserveState(bytes);
     const state = {
+      bytes,
+      fragmentBytes: 0,
       item,
       fragments: "",
       firstDelta: undefined,
       input: undefined,
       inputReady: false,
     };
-    for (const key of eventItemKey(item)) this.#states.set(key, state);
+    for (const key of keys) this.#states.set(key, state);
     return state;
   }
 
@@ -354,6 +343,7 @@ export class MimoCustomToolCallTransform extends Transform {
   }
 
   #forget(state) {
+    this.#stateBytes -= state.bytes;
     for (const [key, candidate] of this.#states) {
       if (candidate === state) this.#states.delete(key);
     }
@@ -388,6 +378,11 @@ export class MimoCustomToolCallTransform extends Transform {
     if (event?.type === "response.function_call_arguments.delta") {
       const state = this.#stateFor(event);
       if (!state || typeof event.delta !== "string") return undefined;
+      const bytes = Buffer.byteLength(event.delta) +
+        (state.firstDelta ? 0 : Buffer.byteLength(JSON.stringify(event)));
+      this.#reserveState(bytes);
+      state.bytes += bytes;
+      state.fragmentBytes += bytes;
       state.fragments += event.delta;
       state.firstDelta ||= event;
       return [];
@@ -399,6 +394,11 @@ export class MimoCustomToolCallTransform extends Transform {
         ? event.arguments
         : state.fragments;
       const input = decodeInput(raw);
+      const bytes = Buffer.byteLength(JSON.stringify(input) ?? "");
+      this.#stateBytes -= state.fragmentBytes;
+      state.bytes -= state.fragmentBytes;
+      this.#reserveState(bytes);
+      state.bytes += bytes;
       state.input = input;
       state.inputReady = true;
       const output = [];
@@ -412,6 +412,9 @@ export class MimoCustomToolCallTransform extends Transform {
       }
       const { arguments: _arguments, ...base } = event;
       output.push({ ...base, type: "response.custom_tool_call_input.done", input });
+      state.fragments = "";
+      state.firstDelta = undefined;
+      state.fragmentBytes = 0;
       return output;
     }
     if (event?.type === "response.completed" && event.response) {
@@ -424,30 +427,15 @@ export class MimoCustomToolCallTransform extends Transform {
     return undefined;
   }
 
-  #emitSseEvents(flush = false) {
-    while (true) {
-      const match = /\r?\n\r?\n/.exec(this.#sseBuffer);
-      if (!match) break;
-      const block = this.#sseBuffer.slice(0, match.index);
-      this.#sseBuffer = this.#sseBuffer.slice(match.index + match[0].length);
-      this.#emitSseBlock(block, match[0]);
-    }
-    if (flush && this.#sseBuffer) {
-      const block = this.#sseBuffer;
-      this.#sseBuffer = "";
-      this.#emitSseBlock(block, "");
-    }
-  }
-
-  #emitSseBlock(block, separator) {
-    const event = parseSseData(block);
+  #emitSseBlock(bytes) {
+    const event = parseSseEvent(bytes);
     const rewritten = event ? this.#rewriteEvent(event) : undefined;
     if (rewritten === undefined) {
-      this.push(Buffer.from(block + separator, "utf8"));
+      this.push(bytes);
       return;
     }
     for (const next of rewritten) {
-      this.push(Buffer.from(`${renderSseEvent(block, next)}${separator}`, "utf8"));
+      this.push(renderSseEvent(bytes, next, { rewriteEventType: true }));
     }
   }
 }

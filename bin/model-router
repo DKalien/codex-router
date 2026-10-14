@@ -12,6 +12,8 @@ Commands:
 
   ./bin/model-router codex install
   ./bin/model-router codex provider-key mimo-token-plan set
+  ./bin/model-router codex provider-key supergpt-relay set
+  ./bin/model-router codex route official|wlb|supergpt|status
 EOF
 }
 

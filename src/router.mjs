@@ -20,6 +20,7 @@ import {
   endStreamedResponse,
   formatErrorChain,
   HOP_BY_HOP_HEADERS,
+  MAX_UPSTREAM_ERROR_BYTES,
   httpErrorStatus,
   installGracefulShutdown,
   pipeResponse,
@@ -38,11 +39,10 @@ import {
 import { MODEL_BY_SLUG, PROVIDERS, providerForModel } from "./model-registry.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
 import { readNativeRedirect } from "./native-redirect.mjs";
-import { GPT_ROUTE_PROVIDERS, readGptRoute, setGptRoute } from "./gpt-route.mjs";
+import { GPT_ROUTES, readGptRouteSnapshot, setGptRoute } from "./gpt-route.mjs";
 import {
   canonicalProviderId,
   readProviderSelection,
-  selectedConfiguredListedModels,
 } from "./provider-selection.mjs";
 import { resolveProviderCredential } from "./provider-credentials.mjs";
 import {
@@ -51,11 +51,6 @@ import {
   tokenUsageFromPayload,
 } from "./response-usage.mjs";
 import { fetchWithRetry, sleep } from "./upstream-retry.mjs";
-import {
-  CollaborationToolCallTransform,
-  flattenCollaborationHistory,
-  flattenCollaborationNamespaceTools,
-} from "./collaboration-namespace.mjs";
 import {
   MimoCustomToolCallTransform,
   convertMimoRequestInput,
@@ -357,6 +352,19 @@ function routedHeaders(credential) {
     "Accept-Encoding": "identity",
     "User-Agent": `codex-router/${VERSION}`,
   };
+}
+
+function writeRoutedError(response, status, bodyText, route, retryAfter) {
+  const provider = providerForModel(route);
+  const retryAfterSeconds = Number(retryAfter);
+  if (retryAfter) response.setHeader("Retry-After", retryAfter);
+  writeJson(response, status, translateGatewayError({
+    status, bodyText,
+    modelName: route.displayName || route.slug,
+    providerName: provider?.ownedBy || provider?.displayName || route.provider,
+    providerKind: provider?.kind,
+    retryAfterSeconds: Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : undefined,
+  }));
 }
 
 function nativeTarget(pathname, search) {
@@ -982,6 +990,14 @@ async function summarize(request, payload, route, signal) {
     body: JSON.stringify(body),
     signal,
   });
+  if (!upstream.ok) {
+    return {
+      ok: false,
+      status: upstream.status,
+      bodyText: await readResponseTextLimited(upstream, MAX_UPSTREAM_ERROR_BYTES, { signal }),
+      retryAfter: upstream.headers.get("retry-after"),
+    };
+  }
   let bytes;
   try {
     bytes = await readResponseBody(upstream, {
@@ -999,18 +1015,20 @@ async function summarize(request, payload, route, signal) {
     throw error;
   }
   const bodyText = bytes.toString("utf8");
-  if (!upstream.ok) {
-    let parsed;
-    try { parsed = JSON.parse(bodyText); } catch { parsed = { error: { message: bodyText } }; }
-    return { ok: false, status: upstream.status, payload: parsed, bodyText, usage: tokenUsageFromPayload(parsed) };
-  }
   const parsed = JSON.parse(bodyText);
+  const summary = extractResponseText(parsed);
+  if (parsed?.error || (parsed?.status !== undefined && parsed.status !== "completed") || !summary.trim()) {
+    return {
+      ok: false, status: 502,
+      payload: { error: { type: "invalid_compaction", message: "The provider did not return a complete, non-empty summary; conversation history was not replaced." } },
+    };
+  }
   // Compaction is a plain non-streaming call, so the usage block (when the
   // provider sends one) is already in hand. `tokenUsageFromPayload` returns
   // undefined when it is absent, and `recordUsageEvent` then omits the token
   // fields entirely rather than metering an invented zero.
   const usage = tokenUsageFromPayload(parsed);
-  return { ok: true, summary: extractResponseText(parsed), input: originalInput, usage };
+  return { ok: true, summary, input: originalInput, usage };
 }
 
 function compactionSnapshot(model, item, status = "completed") {
@@ -1056,7 +1074,7 @@ function writeCompactionSse(response, model, summary) {
 async function handleRoutedCompaction(request, response, payload, route, signal, v2) {
   const result = await summarize(request, payload, route, signal);
   if (!result.ok) {
-    return { status: result.status, usage: result.usage, payload: result.payload, bodyText: result.bodyText };
+    return { status: result.status, usage: result.usage, payload: result.payload, bodyText: result.bodyText, retryAfter: result.retryAfter };
   }
   if (v2) {
     if (payload.stream === false) {
@@ -1107,6 +1125,7 @@ async function handleResponses(request, response, requestUrl) {
   const controller = new AbortController();
   let clientGone = false;
   let requestedModel = "";
+  let gptRouteSnapshot;
   let route;
   let upstreamRetries;
   let upstreamStatus;
@@ -1135,16 +1154,18 @@ async function handleResponses(request, response, requestUrl) {
     if (nativeGpt) {
       let gptRoute;
       try {
-        gptRoute = activityMetadata.isSubagent ? "official" : readGptRoute();
+        gptRouteSnapshot = activityMetadata.isSubagent ? undefined : readGptRouteSnapshot();
+        gptRoute = gptRouteSnapshot?.route || "official";
       } catch (error) {
         writeJson(response, 503, { error: { type: "invalid_gpt_route", message: error.message } });
         return;
       }
-      if (gptRoute !== "official") {
+      const provider = GPT_ROUTES.get(gptRoute).provider;
+      if (provider) {
         // 官方选择器负责模型名；新 GPT 模型无需先登记到旧静态目录。
         registeredRoute = {
-          provider: GPT_ROUTE_PROVIDERS[gptRoute],
-          slug: `${GPT_ROUTE_PROVIDERS[gptRoute]}/${requestedModel}`,
+          provider,
+          slug: `${provider}/${requestedModel}`,
           upstreamModel: requestedModel,
         };
       }
@@ -1185,8 +1206,7 @@ async function handleResponses(request, response, requestUrl) {
           typeof request.headers.authorization !== "string" || !request.headers.authorization.trim()) return false;
       try {
         // 重新验证状态，损坏或写入失败时停止，沿用 owner 校验和原子写入。
-        readGptRoute();
-        setGptRoute("official");
+        if (!await setGptRoute("official", { expected: gptRouteSnapshot, signal: controller.signal })) return false;
       } catch (error) {
         const failure = new Error(`WLB 额度耗尽，但无法保存官方路由：${error.message}`);
         failure.status = 503;
@@ -1235,9 +1255,13 @@ async function handleResponses(request, response, requestUrl) {
           `[codex-router] model=${requestedModel || "unknown"} provider=${route.provider} status=${compaction.status}`,
         );
       }
-      if (!compaction.payload) return;
+      if (compaction.status < 400) return;
       if (!await fallbackToOfficial(compaction.status, compaction.bodyText ?? JSON.stringify(compaction.payload))) {
-        writeJson(response, compaction.status, compaction.payload);
+        if (compaction.bodyText !== undefined) {
+          writeRoutedError(response, compaction.status, compaction.bodyText, route, compaction.retryAfter);
+        } else {
+          writeJson(response, compaction.status, compaction.payload);
+        }
         return;
       }
     }
@@ -1245,7 +1269,6 @@ async function handleResponses(request, response, requestUrl) {
     let target;
     let headers;
     let routedBody;
-    let collaborationFlattened = false;
     let mimoCustomToolNames;
     if (route) {
       const routedInput =
@@ -1258,20 +1281,10 @@ async function handleResponses(request, response, requestUrl) {
         request,
       );
       const provider = providerForModel(route);
-      // LiteLLM's Responses -> Chat Completions bridge drops namespace tools.
-      // Chat-completions providers need the collaboration namespace flattened
-      // into ordinary functions; the response transform maps calls back.
-      if (provider?.protocol !== "openai-responses") {
-        const flattened = flattenCollaborationNamespaceTools(payload.tools);
-        collaborationFlattened = flattened.flattened;
-        if (collaborationFlattened) payload.tools = flattened.tools;
-      }
       const routed = {
         ...payload,
         model: route.upstreamModel,
-        // The stored call history must use the same tool names as the tool
-        // list, or the model copies the bare names out of its own transcript.
-        input: collaborationFlattened ? flattenCollaborationHistory(input) : input,
+        input,
       };
       if (route.provider === "mimo-token-plan") {
         const converted = convertMimoRequestTools(routed.tools);
@@ -1336,8 +1349,7 @@ async function handleResponses(request, response, requestUrl) {
     // reads like a router bug. Rewrite them to name the provider that failed.
     // Native traffic passes through untouched: OpenAI errors are already clear.
     if (route && !upstream.ok) {
-      const provider = providerForModel(route);
-      const bodyText = await readResponseTextLimited(upstream);
+      const bodyText = await readResponseTextLimited(upstream, MAX_UPSTREAM_ERROR_BYTES, { signal: controller.signal });
       recordUsageEvent({
         model: route.slug,
         provider: canonicalProviderId(route.provider),
@@ -1355,17 +1367,7 @@ async function handleResponses(request, response, requestUrl) {
         upstreamRetries = retries;
         upstreamStatus = upstream.status;
       } else {
-        const retryAfterHeader = upstream.headers.get("retry-after");
-        const retryAfterSeconds = Number(retryAfterHeader);
-        if (retryAfterHeader) response.setHeader("Retry-After", retryAfterHeader);
-        writeJson(response, upstream.status, translateGatewayError({
-          status: upstream.status,
-          bodyText,
-          modelName: route.displayName || route.slug,
-          providerName: provider?.ownedBy || provider?.displayName || route.provider,
-          providerKind: provider?.kind,
-          retryAfterSeconds: Number.isFinite(retryAfterSeconds) ? retryAfterSeconds : undefined,
-        }));
+        writeRoutedError(response, upstream.status, bodyText, route, upstream.headers.get("retry-after"));
         if (!QUIET) console.error(`[codex-router] model=${requestedModel || "unknown"} provider=${route.provider} status=${upstream.status}`);
         return;
       }
@@ -1391,9 +1393,6 @@ async function handleResponses(request, response, requestUrl) {
       },
     );
     const transforms = [usageTransform];
-    if (collaborationFlattened) {
-      transforms.push(new CollaborationToolCallTransform());
-    }
     if (mimoCustomToolNames?.size) {
       transforms.push(
         new MimoCustomToolCallTransform(

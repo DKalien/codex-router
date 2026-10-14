@@ -5,11 +5,12 @@
 
 ## 范围
 
-只保留两个第三方服务商。它们都原生支持 Responses API，并由 `src/router.mjs`
+只保留三个第三方服务商。它们都原生支持 Responses API，并由 `src/router.mjs`
 直接转发（没有 LiteLLM、转发器或 Python）：
 
 - `mimo-token-plan` — `config/mimo/` — `https://token-plan-cn.xiaomimimo.com/v1`
 - `wlb-relay` — `config/wlb/` — `https://codex.wlbclub.com`
+- `supergpt-relay` — `config/supergpt/` — `https://api.supergpt.dev/v1`
 
 不得重新引入网关/转发层、服务商预设、OAuth 流程、托盘应用或自动更新器。
 
@@ -43,13 +44,15 @@
   自己更新。只有手动旧目录构建时才要求固定 8 个模型：原生
   `gpt-5.6-sol/terra/luna`、MiMo `mimo-v2.5-pro` 和 `mimo-v2.5`，以及 WLB
   `gpt-5.6-sol/terra/luna`；其中 5 个模型位于两个服务商的命名空间下并由路由器转发。
-- `route official|wlb|status` 管理或读取全局 GPT 路由；缺少状态文件时默认为
+- `route official|wlb|supergpt|status` 管理或读取全局 GPT 路由；缺少状态文件时默认为
   `official`。设置从下一次非子代理的原生 GPT 请求起对所有任务共享，不绑定线程；已识别的
   原生 `gpt-*` 子代理固定走官方，不读取全局路由状态。识别复用子代理/父线程请求头和
   rollout 的 `source.subagent.thread_spawn`；缺失或未写完的 rollout 不缓存负结果，
   没有可识别证据时仍遵循全局路由。显式 `wlb-relay/*` 与 MiMo 路由保持原语义。
-  同一任务中途切换服务商可能带来历史上下文兼容风险。`wlb` 原样转发请求中的 `gpt-*` 模型名，不依赖旧目录注册，
-  上游不支持时返回错误；仅明确额度耗尽且尚未输出时自动保存为 `official`，默认等待
+  同一任务中途切换服务商可能带来历史上下文兼容风险。`wlb` 和 `supergpt` 原样转发请求中的 `gpt-*` 模型名，不依赖旧目录注册，
+  上游不支持时返回错误；SuperGPT 不添加旧目录模型，使用 `SUPERGPT_API_KEY` 或安全凭据文件
+  `supergpt-api-key.secret`，不触发 WLB 专属额度回退，沿用监督进程的代理环境。
+  仅 WLB 明确额度耗尽且尚未输出时自动保存为 `official`，默认等待
   5 秒后使用原始 Codex 身份继续普通或压缩请求。普通限流、认证失败、套餐不包含 API
   和已输出的流不切换；缺少官方身份、路由状态损坏或状态写入失败时不回退。显式
   `wlb-relay/*` 和 MiMo 保持原语义。等待复用可取消的 `sleep`，由

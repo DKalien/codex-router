@@ -1642,3 +1642,93 @@ test("WLB 自动切换区分临时请求配额和账单硬额度，并保留升�
     assert.equal(isUsageExhausted(429, JSON.stringify({ error })), expected, JSON.stringify(error));
   }
 });
+
+
+test("SuperGPT 独立凭据和动态 GPT 路由保持官方子代理、目录及 WLB 回退隔离", async () => {
+  const received = [];
+  const upstream = (provider) => http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : undefined;
+    received.push({ provider, url: request.url, authorization: request.headers.authorization, body });
+    const exhausted = body?.model === "gpt-exhausted";
+    response.writeHead(exhausted ? 403 : 200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(exhausted
+      ? { error: { message: "usage limit exhausted" } }
+      : { models: [{ slug: "gpt-new-model" }], output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "摘要" }] }] }));
+  });
+  const official = upstream("official");
+  const supergpt = upstream("supergpt");
+  const officialPort = await listen(official);
+  const supergptPort = await listen(supergpt);
+  const router = await startRouter({
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${officialPort}`,
+    SUPERGPT_BASE_URL: `http://127.0.0.1:${supergptPort}/v1/`,
+    SUPERGPT_API_KEY: "test-supergpt-key",
+    WLB_API_KEY: "test-wlb-key",
+  });
+  const env = { ...process.env, CODEX_HOME: router.stateDir, MODEL_ROUTER_STATE_DIR: router.stateDir,
+    CODEX_ROUTER_STATE_DIR: router.stateDir, SUPERGPT_API_KEY: "test-supergpt-key" };
+  const cli = (command, extraEnv = {}) => spawnSync(process.execPath, [path.join(root, "src/gpt-route.mjs"), command], {
+    encoding: "utf8", env: { ...env, ...extraEnv },
+  });
+  const send = async (model, endpoint = "responses", headers = {}) => {
+    const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/${endpoint}`, {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer test-official-key", ...headers },
+      body: JSON.stringify({ model, input: [{ role: "user", content: "你好" }], stream: false }),
+    });
+    await response.text();
+    return response.status;
+  };
+  const routePath = path.join(router.stateDir, "gpt-route.json");
+  const selectionPath = path.join(router.stateDir, "enabled-providers.json");
+  const status = () => {
+    const result = spawnSync(process.execPath, [path.join(root, "src/status.mjs"), "--json"], {
+      encoding: "utf8", env: { ...env, CODEX_ROUTER_PORT: String(router.routerPort) },
+    });
+    return JSON.parse(result.stdout).gptRoute;
+  };
+  try {
+    assert.match(cli("status").stdout, /official/);
+    assert.equal(cli("supergpt", { SUPERGPT_API_KEY: "" }).status, 1);
+    assert.equal(existsSync(routePath), false);
+    writeFileSync(selectionPath, JSON.stringify({ version: 1, providers: ["wlb-relay"] }));
+    assert.equal(cli("supergpt").status, 1);
+    assert.equal(existsSync(routePath), false);
+    writeFileSync(selectionPath, JSON.stringify({ version: 1, providers: ["wlb-relay", "supergpt-relay"] }));
+    const switched = cli("supergpt");
+    assert.equal(switched.status, 0, switched.stderr);
+    assert.equal(status().ready, false); // 状态仅认可持久化凭据，不把临时环境密钥报为 ready。
+    writeFileSync(path.join(router.stateDir, "supergpt-api-key.secret"), "test-supergpt-persistent-key\n");
+    assert.deepEqual(status(), { readable: true, mode: "supergpt", ready: true });
+    for (const endpoint of ["responses", "responses/compact"]) {
+      assert.equal(await send("gpt-new-model", endpoint), 200);
+      assert.equal(received.at(-1).provider, "supergpt");
+      assert.equal(received.at(-1).url, "/v1/responses");
+      assert.equal(received.at(-1).authorization, "Bearer test-supergpt-key");
+      assert.equal(received.at(-1).body.model, "gpt-new-model");
+      assert.equal(await send("gpt-new-model", endpoint, { "x-openai-subagent": "true" }), 200);
+      assert.equal(received.at(-1).provider, "official");
+      assert.equal(received.at(-1).authorization, "Bearer test-official-key");
+    }
+    const models = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/models`, {
+      headers: { Authorization: "Bearer test-official-key" },
+    });
+    assert.equal(models.status, 200);
+    await models.text();
+    assert.equal(received.at(-1).provider, "official");
+    const before = received.length;
+    assert.equal(await send("gpt-exhausted"), 403);
+    assert.equal(received.length, before + 1);
+    assert.match(cli("status").stdout, /supergpt/);
+    writeFileSync(selectionPath, JSON.stringify({ version: 1, providers: ["wlb-relay"] }));
+    assert.equal(status().ready, false);
+    assert.equal(await send("gpt-new-model"), 409);
+    assert.equal(received.length, before + 1);
+    assert.equal(cli("official").status, 0);
+  } finally {
+    await router.close();
+    await close(official);
+    await close(supergpt);
+  }
+});

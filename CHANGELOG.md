@@ -1,5 +1,10 @@
 # Changelog
 
+## SuperGPT 重新接入
+
+- 恢复 `supergpt-relay` 服务商、安全密钥与 `route supergpt`；原生 GPT 子代理和模型列表继续走官方。
+- 使用 `https://api.supergpt.dev/v1/responses`，保留 WLB 专属额度回退；现有全局路由不自动切换。
+
 ## Lite 分支（未发布）
 
 - 原生上游代理改为启动时探测本机候选端口（v2rayN `10808`/`10809` 优先，兼容

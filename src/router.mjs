@@ -1680,7 +1680,7 @@ const server = http.createServer((request, response) => {
     const status = httpErrorStatus(error);
     // Keep the cause chain for transport diagnosis; response bodies never enter
     // this formatter, and the bounded chain avoids runaway nested errors.
-    console.error(`[codex-router] request failed: ${formatErrorChain(error, { messages: false })}`);
+    console.error(`[codex-router] request failed: ${formatErrorChain(error, { messages: true })}`);
     if (!response.headersSent) {
       writeJson(response, status, {
         error: {
@@ -1721,15 +1721,15 @@ server.on("error", (error) => {
     );
     process.exit(97);
   }
-  console.error(`[codex-router] server error: ${formatErrorChain(error, { messages: false })}`);
+  console.error(`[codex-router] server error: ${formatErrorChain(error, { messages: true })}`);
   process.exit(96);
 });
 process.on("uncaughtException", (error) => {
-  console.error(`[codex-router] uncaught exception: ${formatErrorChain(error, { messages: false })}`);
+  console.error(`[codex-router] uncaught exception: ${formatErrorChain(error, { messages: true })}`);
   process.exit(95);
 });
 process.on("unhandledRejection", (reason) => {
-  console.error(`[codex-router] unhandled rejection: ${formatErrorChain(reason, { messages: false })}`);
+  console.error(`[codex-router] unhandled rejection: ${formatErrorChain(reason, { messages: true })}`);
   process.exit(94);
 });
 server.requestTimeout = 0;

@@ -343,7 +343,7 @@ async function prepareNativeRequest(request, requestUrl, payload, compactV1) {
 const fallbackDelayValue = process.env.CODEX_ROUTER_WLB_FALLBACK_DELAY_MS;
 const fallbackDelayNumber = Number(fallbackDelayValue);
 const WLB_FALLBACK_DELAY_MS = fallbackDelayValue?.trim() && Number.isInteger(fallbackDelayNumber) &&
-  fallbackDelayNumber >= 0 && fallbackDelayNumber <= 30_000 ? fallbackDelayNumber : 5_000;
+  fallbackDelayNumber >= 0 && fallbackDelayNumber <= 30_000 ? fallbackDelayNumber : 0;
 
 function routedHeaders(credential) {
   return {

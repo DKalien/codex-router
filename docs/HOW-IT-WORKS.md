@@ -36,8 +36,10 @@ sequenceDiagram
   R-->>C: 响应或数据流
 ```
 
-`src/start.mjs` 监督这一个路由器子进程，并等待其健康检查通过。每次健康探针的超时
-不会超过整体等待 deadline，成功响应会排空响应体以保持连接可复用；路由器对客户端连接池使用 120 秒 keep-alive，并为中途
+`src/start.mjs` 监督这一个路由器子进程，并以 30 秒为启动预算等待健康检查通过。
+监督器使用自适应单次探针超时（最多 10 秒），最后一次探针可能越过启动预算；
+服务管理器使用的 `src/router-health.mjs` 才会按整体剩余时间截短每次探针。
+成功响应会排空响应体以保持连接可复用；路由器对客户端连接池使用 120 秒 keep-alive，并为中途
 断流写入独立的 usage 标记。收到 `SIGINT`/`SIGTERM` 时，路由器停止接收新请求，
 在途请求最多 drain 2 秒；已开始的 SSE 会收到本地重启 terminal error 后 clean EOF，
 尚未发送响应头的请求返回 503。`src/start.mjs` 的强杀 backstop 会覆盖 drain 和 flush
@@ -62,7 +64,13 @@ Windows 后台服务由 `src/service-windows.mjs` 通过计划任务管理。后
 清理残留的请求文件，避免上次停止的遗留让新实例一启动就关闭。`start`/`restart` 会
 等待 `/health` 通过后才返回就绪。旧启动器
 没有 PID 文件时，只按精确的 `wscript -> cmd -> start.mjs` 父子链查找一次，避免误杀
-无关的 Node 进程，也避免旧路由器继续占用 4102 端口。
+无关的 Node 进程，也避免旧路由器继续占用 4102 端口。进程查询优先 `pwsh.exe`，
+失败时回退 `powershell.exe`；任务状态使用 Task Scheduler COM。计划任务停止查询
+及 PowerShell 回退共用 10 秒截止时间，未知状态或超时均停止后续启动；单次外部
+命令最多 15 秒。通用入口 `src/service.mjs` 异步等待平台子进程，以保持服务操作锁续期。
+Windows 的 `start`/`restart` 只由平台管理器执行最多 60 秒的就绪检查；`install`
+和 POSIX 的 `start`/`restart` 由通用入口执行最多 60 秒的就绪检查。监督器自身的
+30 秒启动预算检查仍保留，因此不能将所有启动调用都视为只有一轮健康检查。
 
 ## 官方目录与旧模型目录
 
@@ -98,16 +106,18 @@ MiMo 的两个及 WLB 的三个命名空间 slug 保留给已有目录或直接�
 `wlb` 或 `supergpt` 时，`src/router.mjs` 将请求中的 `gpt-*` 模型名原样发送给对应
 服务商，不依赖旧静态模型名单；SuperGPT 不新增旧命名空间模型条目。官方新增模型
 无需修改 Router，模型可用性取决于上游及 API key 分组；上游不支持时返回其错误。只有 WLB
-明确的额度耗尽会自动保存为 `official`，默认等待 5 秒，再以原始 Codex 身份重发
+明确的额度耗尽会自动保存为 `official`，默认立即以原始 Codex 身份重发
 当前尚未输出的请求；后续 GPT 主代理请求也走官方。普通限流、认证失败、套餐不包含
 API 和已开始输出的流不切换；没有非空官方 `Authorization` 或状态保存失败时不访问
 官方。状态损坏或 owner 校验失败时停止切换并报告错误。显式 `wlb-relay/*`、MiMo
 和固定官方的子代理保持原语义；额度恢复后需手动运行 `route wlb`。路由文件保持
 version 1，并在每次写入时生成新 revision，兼容没有 revision 的旧文件。手动设置
-和自动回退共用跨进程锁；回退在锁内核对请求发出时的 route/revision。期间手动
+和自动回退共用跨进程锁；回退在锁内核对请求发出时的 route/revision。Windows
+在锁内异步设置临时文件的私有 ACL，优先 `pwsh.exe`，失败时回退 `powershell.exe`，
+两次尝试共用 10 秒预算；取消或权限设置失败时不替换原状态，并清理临时文件。期间手动
 切换或重复选择 WLB 后，旧请求返回原错误，不覆盖新状态，也不向官方重发。等待可通过
 `CODEX_ROUTER_WLB_FALLBACK_DELAY_MS` 调整，接受 0 至 30000 毫秒的整数，其他值使用
-默认。客户端取消会终止等待；路由器关闭后不会再向官方重发。这个等待发生在
+默认 0。客户端取消会终止等待；路由器关闭后不会再向官方重发。这个等待发生在
 路由器内，不修改 Codex 客户端的重连间隔；更新源码后需重启服务。正在执行的任务中途切换服务商可能带来
 历史上下文兼容风险。SuperGPT 错误直接返回，不使用 WLB 专属回退或修改路由状态。
 首次新增服务商配置需重启 Router，之后 `route official|wlb|supergpt` 热切换无需重启。
@@ -216,7 +226,7 @@ Windows 原生解码器崩溃。后台凭据 ACL 与服务管理的非交互 Pow
 node --input-type=module -e 'await import("./src/model-registry.mjs")'
 node --test test/official-catalog.mjs
 node --test test/start-proxy.mjs
-node --test test/router-fixes.mjs test/response-usage-hardening.mjs test/http-health-bounds.mjs test/credential-file-security.mjs test/graceful-shutdown.mjs test/upstream-hardening.mjs test/windows-service-process.mjs
+node --test test/router-fixes.mjs test/response-usage-hardening.mjs test/http-health-bounds.mjs test/credential-file-security.mjs test/graceful-shutdown.mjs test/upstream-hardening.mjs test/windows-service-process.mjs test/service-command.mjs test/gpt-route-async.mjs test/windows-hidden-consoles.mjs
 node scripts-check.mjs
 ```
 
@@ -263,3 +273,5 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | `test/start-proxy.mjs` | 检查固定代理、环境变量覆盖、直连名单和无端口探测的启动/退出 |
 | `test/windows-service-process.mjs` | 检查 Windows PID 登记、优雅停止与进程树强杀兜底和误杀防护 |
 | `test/windows-hidden-consoles.mjs` | 检查后台子进程隐藏窗口及交互输入保持可见 |
+| `test/service-command.mjs` | 检查通用服务入口等待时事件循环可用、就绪检查次数和失败返回 |
+| `test/gpt-route-async.mjs` | 检查路由 ACL 异步写入、取消后保留原状态及临时文件清理 |

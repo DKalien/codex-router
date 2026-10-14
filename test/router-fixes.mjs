@@ -1905,3 +1905,40 @@ test("审计：Lite 拒绝已退役的非 Responses 协议", () => {
     }
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+
+test("WLB 自动回退默认立即重发且继续保存官方路由", async () => {
+  const received = [];
+  const official = http.createServer((request, response) => {
+    received.push("official"); request.resume();
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ output: [] }));
+  });
+  const wlb = http.createServer((request, response) => {
+    received.push("wlb"); request.resume();
+    response.writeHead(429, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: { code: "insufficient_quota", message: "quota exhausted" } }));
+  });
+  const officialPort = await listen(official);
+  const wlbPort = await listen(wlb);
+  const router = await startRouter({
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${officialPort}`,
+    WLB_BASE_URL: `http://127.0.0.1:${wlbPort}`,
+    WLB_API_KEY: "test-wlb-key",
+    CODEX_ROUTER_WLB_FALLBACK_DELAY_MS: undefined,
+  });
+  const statePath = path.join(router.stateDir, "gpt-route.json");
+  writeFileSync(statePath, JSON.stringify({ version: 1, route: "wlb" }));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/responses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer test-official" },
+      body: JSON.stringify({ model: "gpt-test", input: [], stream: false }),
+    });
+    assert.equal(response.status, 200);
+    await response.json();
+    assert.deepEqual(received, ["wlb", "official"]);
+    assert.equal(JSON.parse(readFileSync(statePath)).route, "official");
+    assert.match(router.stderr(), /route=official wait-ms=0(?:\r?\n|$)/);
+  } finally { await router.close(); await close(wlb); await close(official); }
+});

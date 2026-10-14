@@ -54,8 +54,8 @@
   BOM、注释和空行，并在 Token 统计及 MiMo custom tool 还原路径保持原始字节顺序。
   第三方输入 Token 兜底估算不再把模型不可见的 `encrypted_content` 密文计入提示词。
 - 请求正文超限后停止缓存并排空余流，客户端断开可中止读取；协作载荷 relay 和
-  compact 响应分别按 4 MiB、32 MiB 在读取时限流，超限立即取消上游流。启动健康
-  探针也不会再越过整体等待 deadline。
+  compact 响应分别按 4 MiB、32 MiB 在读取时限流，超限立即取消上游流。服务管理器
+  的就绪探针按整体剩余时间限时；监督器仍保留自适应单次探针超时。
 - 持久化凭据解析会忽略符号链接、目录和不可读候选；Windows 私有文件写入改为用
   仅含当前用户 `FullControl` 的非继承 DACL 替换旧 ACL，并验证无外来 Allow 规则。
 - Windows 启动失败后的监督进程退出改为等待 Node 自然排空句柄；原生 Search/Image

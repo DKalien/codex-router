@@ -55,7 +55,7 @@ function schedulerStubs(directory, { taskState = "Ready", processPid = "" } = {}
     [
       "#!/usr/bin/env node",
       "const command = process.argv.at(-1) || \"\";",
-      "if (command.includes(\"Get-ScheduledTask\")) process.stdout.write(process.env.CODEX_ROUTER_TEST_TASK_STATE || \"Ready\");",
+      "if (command.includes(\"Schedule.Service\")) process.stdout.write(process.env.CODEX_ROUTER_TEST_TASK_STATE === \"Running\" ? \"4\" : \"3\");",
       "if (command.includes(\"Get-CimInstance\")) process.stdout.write(process.env.CODEX_ROUTER_TEST_PROCESS_PID || \"\");",
       "",
     ].join("\n"),
@@ -294,4 +294,77 @@ test("Windows reinstall stops the previous launcher before replacing it and reta
     { stdout: { write() {} } }, "fixture.cmd", "fixture-task");
     assert.deepEqual(calls, failWrite ? ["stop-old", "write-new", "run"] : ["stop-old", "write-new", "register", "run"]);
   }
+});
+
+
+function windowsServiceFunction(name, next) {
+  const source = readFileSync(path.join(root, "src", "service-windows.mjs"), "utf8");
+  return source.slice(source.indexOf(`function ${name}(`), source.indexOf(next, source.indexOf(`function ${name}(`)));
+}
+
+test("Windows task state uses COM and shares the deadline across shell fallback", () => {
+  const body = windowsServiceFunction("taskState", "\n// Node ");
+  let now = 100;
+  const calls = [];
+  const query = (executable, args, options) => {
+    calls.push({ executable, timeout: options.timeout });
+    assert.match(args.at(-1), /Schedule\.Service/);
+    assert.doesNotMatch(args.at(-1), /Get-ScheduledTask/);
+    if (executable === "pwsh.exe") {
+      now += 60;
+      throw new Error("fixture Core failure");
+    }
+    return "4";
+  };
+  const state = new Function("execFileSync", "taskName", "TASK_STATE_TIMEOUT_MS", "Date", `${body}; return taskState;`)(query, "fixture", 15_000, { now: () => now });
+  assert.equal(state(200), "running");
+  assert.deepEqual(calls, [{ executable: "pwsh.exe", timeout: 100 }, { executable: "powershell.exe", timeout: 40 }]);
+  calls.length = 0;
+  now = 100;
+  assert.equal(state(150), undefined);
+  assert.deepEqual(calls, [{ executable: "pwsh.exe", timeout: 50 }], "deadline exhaustion must skip fallback");
+  for (const [output, expected] of [["0", "unknown"], ["1", "disabled"], ["2", "queued"], ["3", "ready"], ["missing", "missing"], ["", undefined], ["unexpected", undefined]]) {
+    const read = new Function("execFileSync", "taskName", "TASK_STATE_TIMEOUT_MS", `${body}; return taskState;`)(() => output, "fixture", 15_000);
+    assert.equal(read(), expected);
+  }
+});
+
+test("Windows task stop has a strict deadline and fails closed on unknown state", () => {
+  const body = windowsServiceFunction("waitForTaskToStop", "\nfunction readServicePid(");
+  function wait(query) {
+    let now = 0;
+    const sleeps = [];
+    const execute = new Function("taskState", "TASK_STOP_TIMEOUT_MS", "TASK_STOP_POLL_MS", "Date", "sleep", `${body}; return waitForTaskToStop;`)(
+      (deadline) => query(deadline, (elapsed) => { now += elapsed; }), 100, 60, { now: () => now }, (ms) => { sleeps.push(ms); now += ms; },
+    );
+    return { execute, sleeps };
+  }
+  for (const state of [undefined, "unknown"]) assert.throws(wait(() => state).execute, /Unable to verify/);
+  for (const state of ["missing", "ready", "disabled"]) assert.doesNotThrow(wait(() => state).execute);
+  for (const state of ["running", "queued"]) {
+    const fixture = wait(() => state);
+    assert.throws(fixture.execute, /Timed out/);
+    assert.deepEqual(fixture.sleeps, [60, 40]);
+  }
+  assert.throws(wait((deadline, advance) => { assert.equal(deadline, 100); advance(100); return "ready"; }).execute, /Timed out/, "a query returning after the deadline cannot report success");
+});
+
+test("Windows stop cleans verified orphans before waiting and install never runs after stop failure", () => {
+  const body = windowsServiceFunction("endTask", "\n// Only a task");
+  for (const endFails of [false, true]) {
+    const calls = [];
+    const stop = new Function("serviceProcessPid", "requestGracefulStop", "removeServicePid", "waitForTaskToStop", "schtasks", "taskName", "stopServiceProcess", `${body}; return endTask;`)(
+      () => 42, () => false, () => {}, () => { calls.push("wait"); throw new Error("unknown state"); }, () => { calls.push("end"); if (endFails) throw new Error("missing task"); }, "fixture", (pid) => { assert.equal(pid, 42); calls.push("kill"); },
+    );
+    assert.throws(stop, /unknown state/);
+    assert.deepEqual(calls, ["end", "kill", "wait"]);
+  }
+  const source = readFileSync(path.join(root, "src", "service-windows.mjs"), "utf8");
+  const branch = source.slice(source.indexOf('} else if (command === "install") {') + 2, source.indexOf('} else if (command === "uninstall") {') + 1);
+  const execute = new Function("command", "endTask", "schtasks", branch.replace(/^else /, ""));
+  assert.throws(() => execute("install", () => { throw new Error("stop timed out"); }, () => assert.fail("must not run")), /stop timed out/);
+  assert.match(windowsServiceFunction("schtasks", "\nfunction writeAtomic("), /timeout: TASK_STATE_TIMEOUT_MS/);
+  assert.match(windowsServiceFunction("stopServiceProcess", "\nfunction isProcessAlive("), /timeout: TASK_STATE_TIMEOUT_MS/);
+  const processQuery = windowsServiceFunction("findServiceProcess", "\nfunction serviceProcessPid(");
+  assert.match(processQuery, /\["pwsh\.exe", "powershell\.exe"\]/);
 });

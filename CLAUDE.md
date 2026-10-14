@@ -36,7 +36,12 @@
   `CODEX_ROUTER_PROXY_PORTS` 已退役，旧配置改用 `HTTPS_PROXY`；不定时探测或因
   端口变化自动重启。保留启动健康检查、进程退出及信号清理。Windows 后台服务
   原子登记 `service.pid`，退出时只清理仍属于自己的 PID；服务管理按已登记启动器的
-  Node 路径验证进程，不依赖当前 CLI 的 Node；`status` 不删除 PID 文件
+  Node 路径验证进程，不依赖当前 CLI 的 Node；`status` 不删除 PID 文件。Windows
+  进程查询优先 PowerShell Core，任务状态使用 Task Scheduler COM；停止查询共用
+  10 秒 deadline，状态未知或超时必须停止后续启动，单次外部命令最多 15 秒。
+  通用入口异步等待以保持操作锁续期；Windows start/restart 只由平台管理器检查
+  就绪，install 及 POSIX start/restart 由通用入口检查，均最多 60 秒。监督器自身
+  启动预算为 30 秒，最后一次探针可能越过预算，单次探针最多 10 秒。
 - `codex-router.ps1` / `install.ps1` — Windows 入口；`bin/` — POSIX 入口
 
 ## 规则
@@ -50,14 +55,16 @@
   rollout 的 `source.subagent.thread_spawn`；缺失或未写完的 rollout 不缓存负结果，
   没有可识别证据时仍遵循全局路由。显式 `wlb-relay/*` 与 MiMo 路由保持原语义。
   同一任务中途切换服务商可能带来历史上下文兼容风险。`wlb` 原样转发请求中的 `gpt-*` 模型名，不依赖旧目录注册，
-  上游不支持时返回错误；仅明确额度耗尽且尚未输出时自动保存为 `official`，默认等待
-  5 秒后使用原始 Codex 身份继续普通或压缩请求。手动设置和回退共用跨进程锁，
+  上游不支持时返回错误；仅明确额度耗尽且尚未输出时自动保存为 `official`，默认立即
+  使用原始 Codex 身份继续普通或压缩请求。手动设置和回退共用跨进程锁，
   回退在锁内核对请求发出时的 route/revision；期间手动切换或同路由重选后，保留新
-  状态并返回原错误。每次写入更新 revision，兼容旧状态文件缺少该字段。
+  状态并返回原错误。Windows 路由临时文件的 ACL 异步设置优先 pwsh，失败时回退
+  powershell，两次尝试共用 10 秒预算；取消或 ACL 失败不替换状态并清理临时文件。
+  每次写入更新 revision，兼容旧状态文件缺少该字段。
   普通限流、认证失败、套餐不包含 API
   和已输出的流不切换；缺少官方身份、路由状态损坏或状态写入失败时不回退。显式
   `wlb-relay/*` 和 MiMo 保持原语义。等待复用可取消的 `sleep`，由
-  `CODEX_ROUTER_WLB_FALLBACK_DELAY_MS` 调整（0 至 30000 毫秒整数，其他值默认 5000），
+  `CODEX_ROUTER_WLB_FALLBACK_DELAY_MS` 调整（0 至 30000 毫秒整数，其他值默认 0），
   不修改 Codex 客户端的重连间隔；切换后需手动 `route wlb` 才恢复 WLB。
   `supergpt` 同样按原始 `gpt-*` 模型名转发，不新增旧命名空间模型条目或生成目录；
   上游错误直接返回，不应用 WLB 专属的额度耗尽回退。首次新增服务商配置需重启
@@ -76,7 +83,7 @@
 - 配置管理必须识别裸名、双引号和单引号的 `features` 表、`multi_agent_v2` 键及
   `[features.multi_agent_v2]` 子表；保留已有配置，不重复注入表或内联键，
   启用、重复启用和关闭均需保持 TOML 有效。
-- 修改 GPT 路由开关后运行 `node --test test/router-fixes.mjs`；修改配置管理、服务商
+- 修改 GPT 路由开关后运行 `node --test test/router-fixes.mjs test/gpt-route-async.mjs`；修改配置管理、服务商
   密钥操作或状态检查后运行 `node --test test/official-catalog.mjs`。
 - 修改 `src/response-usage.mjs`、`src/sse-prefix.mjs`、`src/sse-events.mjs` 或
   `src/mimo-custom-tools.mjs` 后，运行
@@ -96,6 +103,7 @@
 - 切回原生 GPT 时，只能回放 `encrypted_content` 符合原生 `gAAAAA...` token
   形状的 `reasoning`；其他服务商的 reasoning 必须整项丢弃，合法项也必须移除仅
   用于输出的 `content`，避免 `store=false` 下引用未持久化的外部 item。
+- 修改 `src/service.mjs` 后，运行 `node --test test/service-command.mjs`。
 - 修改 `src/start.mjs` 或 `src/service-windows.mjs` 后，运行
   `node --test test/windows-service-process.mjs`；修改 `src/start.mjs` 还需运行
   `node --test test/start-proxy.mjs`。

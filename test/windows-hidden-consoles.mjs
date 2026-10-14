@@ -9,12 +9,14 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // 非交互后台调用应隐藏窗口；provider-key.mjs 的密钥输入继承操作员控制台。
 const backgroundCalls = [
   ["src/file-security.mjs", "protectPrivateFile"],
+  ["src/file-security.mjs", "protectPrivateFileAsync"],
   ["src/file-security.mjs", "privateFileIsProtected"],
   ["src/service-windows.mjs", "schtasks"],
   ["src/service-windows.mjs", "installTask"],
   ["src/service-windows.mjs", "findServiceProcess"],
   ["src/service-windows.mjs", "stopServiceProcess"],
   ["src/service-windows.mjs", "taskState"],
+  ["src/service.mjs", "runServiceCommand"],
 ];
 
 function functionBody(source, name) {

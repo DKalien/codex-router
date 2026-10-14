@@ -108,6 +108,7 @@ function schtasks(args, options = {}) {
     encoding: "utf8",
     stdio: options.quiet ? ["ignore", "ignore", "ignore"] : ["ignore", "pipe", "pipe"],
     windowsHide: true,
+    timeout: TASK_STATE_TIMEOUT_MS,
   });
 }
 
@@ -167,6 +168,7 @@ function installTask() {
           CODEX_ROUTER_TASK_ARGUMENT: argument,
         },
         windowsHide: true,
+        timeout: TASK_STATE_TIMEOUT_MS,
         stdio: ["ignore", "ignore", "ignore"],
       },
     );
@@ -215,13 +217,16 @@ function sleep(milliseconds) {
 
 function waitForTaskToStop() {
   const deadline = Date.now() + TASK_STOP_TIMEOUT_MS;
-  // An undefined state means no PowerShell could answer -- the same restricted
-  // shell that blocks registration -- so there is nothing to poll and waiting
-  // would only spend the deadline on a question that cannot be answered.
-  while (taskState() === "running") {
-    if (Date.now() >= deadline) return;
-    sleep(TASK_STOP_POLL_MS);
+  while (Date.now() < deadline) {
+    const state = taskState(deadline);
+    if (Date.now() >= deadline) break;
+    if (state === undefined || state === "unknown") {
+      throw new Error("Unable to verify the scheduled task state; refusing to continue.");
+    }
+    if (state !== "running" && state !== "queued") return;
+    sleep(Math.min(TASK_STOP_POLL_MS, deadline - Date.now()));
   }
+  throw new Error("Timed out waiting for the Codex Router scheduled task to stop.");
 }
 
 function readServicePid() {
@@ -309,7 +314,7 @@ function findServiceProcess(pid) {
     "} catch { exit 5 }",
   ].join("; ");
   let lastError;
-  for (const executable of ["powershell.exe", "pwsh.exe"]) {
+  for (const executable of ["pwsh.exe", "powershell.exe"]) {
     try {
       const output = execFileSync(
         executable,
@@ -359,6 +364,7 @@ function stopServiceProcess(pid) {
     execFileSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
       stdio: ["ignore", "ignore", "ignore"],
       windowsHide: true,
+      timeout: TASK_STATE_TIMEOUT_MS,
     });
   } catch (error) {
     if (findServiceProcess(pid)) {
@@ -419,15 +425,13 @@ function endTask() {
     waitForTaskToStop();
     return;
   }
-  let ended = false;
   try {
     schtasks(["/End", "/TN", taskName], { quiet: true });
-    ended = true;
   } catch {
     // A missing or already-idle task can still have an orphaned process tree.
   }
-  if (ended) waitForTaskToStop();
   stopServiceProcess(pid);
+  waitForTaskToStop();
 }
 
 // Only a task that still exists can be started. `Register-ScheduledTask -Force`
@@ -443,24 +447,34 @@ function taskExists() {
   }
 }
 
-function taskState() {
-  const script =
-    "try { [Console]::Out.Write((Get-ScheduledTask -TaskName $env:CODEX_ROUTER_TASK).State.ToString()) } catch { exit 1 }";
+function taskState(deadline = Date.now() + TASK_STATE_TIMEOUT_MS) {
+  const script = [
+    "try {",
+    "  $scheduler = New-Object -ComObject Schedule.Service",
+    "  $scheduler.Connect()",
+    "  [Console]::Out.Write($scheduler.GetFolder('\\').GetTask($env:CODEX_ROUTER_TASK).State)",
+    "} catch {",
+    "  if ($_.Exception.GetBaseException().HResult -in @(-2147024894, -2147024893)) { [Console]::Out.Write('missing') } else { exit 1 }",
+    "}",
+  ].join("; ");
   for (const executable of ["pwsh.exe", "powershell.exe"]) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return undefined;
     try {
-      return execFileSync(
+      const output = execFileSync(
         executable,
         ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
         {
           encoding: "utf8",
           env: { ...process.env, CODEX_ROUTER_TASK: taskName },
           stdio: ["ignore", "pipe", "ignore"],
-          timeout: TASK_STATE_TIMEOUT_MS,
+          timeout: Math.min(TASK_STATE_TIMEOUT_MS, remaining),
           windowsHide: true,
         },
       ).trim().toLowerCase();
+      return { 0: "unknown", 1: "disabled", 2: "queued", 3: "ready", 4: "running", missing: "missing" }[output];
     } catch {
-      // Try Windows PowerShell after PowerShell Core, or fall back to schtasks.
+      // PowerShell Core 不可用时，在同一 deadline 内尝试 Windows PowerShell。
     }
   }
   return undefined;
@@ -511,13 +525,14 @@ if (command === "render") {
 } else if (command === "render-task") {
   process.stdout.write(`${JSON.stringify(taskAction())}\n`);
 } else if (command === "install") {
+  // 停止失败时不能恢复 /Run，否则可能与仍在退出的旧实例重叠。
+  endTask();
   try {
     // An upgrade from the console-visible task may still have that instance
     // running. Register-ScheduledTask -Force replaces the definition under the
     // same task name, so no duplicate is left behind, but it does not stop the
     // running instance, and MultipleInstances IgnoreNew would then drop the new
     // hidden run — the console window would survive until the next logon.
-    endTask();
     // Stop using the previous launcher's Node path before replacing it.
     writeLaunchers();
     installTask();

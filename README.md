@@ -26,7 +26,8 @@ clean EOF，未发出响应头的请求返回 503。可用 `MODEL_ROUTER_SHUTDOW
 `test/http-health-bounds.mjs`、`test/credential-file-security.mjs`、
 `test/graceful-shutdown.mjs`、`test/upstream-hardening.mjs`、
 `test/windows-service-process.mjs`、`test/windows-hidden-consoles.mjs`、
-`test/start-proxy.mjs` 和 `scripts-check.mjs`。
+`test/start-proxy.mjs`、`test/service-command.mjs`、`test/gpt-route-async.mjs`
+和 `scripts-check.mjs`。
 
 ## 架构
 
@@ -48,7 +49,7 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
   一次非子代理的原生 GPT 请求生效，首次新增服务商配置需重启 Router；之后热切换不需要重启服务或 Codex。
   `wlb` 和 `supergpt` 按请求中的 GPT 模型名直接转发，
   不依赖本地模型名单；上游不支持时仍返回其错误。仅 WLB 明确报告额度耗尽时，路由器自动保存为
-  `official`，默认等待 5 秒后用原始 Codex 身份继续当前请求，后续 GPT 主代理请求也走官方。
+  `official`，默认立即用原始 Codex 身份继续当前请求，后续 GPT 主代理请求也走官方。
   普通限流、认证失败、套餐不包含 API 和已开始输出的流不会触发切换；缺少官方身份或
   无法保存路由状态时不会回退。切换覆盖普通请求和压缩请求，显式 `wlb-relay/*` 保持原语义。
   自动回退只在请求发出后的路由状态未变时执行；期间手动切换或重选 WLB，旧请求会
@@ -147,7 +148,13 @@ SuperGPT 默认基础 URL 是 `https://api.supergpt.dev/v1`，可用 `SUPERGPT_B
 结束该进程树，避免旧路由器继续占用 4102 端口。Windows 下停止先写入
 `shutdown.request` 请求路由器排空退出（在途请求按重启 drain 规则收尾），超时才强杀；
 `start`/`restart` 会等待 `/health` 通过后才返回。CLI 与后台使用不同 Node 安装时
-仍能识别服务；`status` 不会清理 PID 文件。
+仍能识别服务；`status` 不会清理 PID 文件。进程查询优先使用 PowerShell Core，计划任务
+状态使用 Task Scheduler COM 查询；计划任务停止查询及 PowerShell 回退共用 10 秒
+截止时间，状态未知或超时即返回错误，不继续启动新实例；单次外部命令最多 15 秒。
+Windows 的 `start`/`restart` 由平台管理器执行最多 60 秒的就绪检查，通用入口不重复等待；
+`install` 和 POSIX 的 `start`/`restart` 由通用入口执行最多 60 秒的就绪检查。
+监督器 `src/start.mjs` 仍单独执行子进程启动健康检查，启动预算为 30 秒；最后一次
+探针可能越过预算，单次探针最多 10 秒。通用入口异步等待平台子进程，使服务操作锁持续续期。
 
 另一台设备不应复制上述状态目录。拉取 `lite` 后，仅使用官方路由可直接从当前
 checkout 运行 `.\codex-router.ps1 install`；需要第三方路由时，再先运行
@@ -175,12 +182,12 @@ owner 冲突。安装完成后完全退出并重新打开 Codex，使新的本�
   `protocol` 时，仅在上游原生支持 Responses API 的前提下补入该字段；旧 Chat/Anthropic
   协议配置需要迁移至兼容的 Responses 服务，不能只改协议名。
 - 检查：`node --test test/official-catalog.mjs`、
-  `node --test test/router-fixes.mjs test/response-usage-hardening.mjs test/http-health-bounds.mjs test/credential-file-security.mjs test/graceful-shutdown.mjs test/upstream-hardening.mjs test/windows-service-process.mjs` 和
+  `node --test test/router-fixes.mjs test/response-usage-hardening.mjs test/http-health-bounds.mjs test/credential-file-security.mjs test/graceful-shutdown.mjs test/upstream-hardening.mjs test/windows-service-process.mjs test/service-command.mjs test/gpt-route-async.mjs test/windows-hidden-consoles.mjs test/start-proxy.mjs` 和
   `node scripts-check.mjs`。
 - 请求级调试：使用 `CODEX_ROUTER_REQUEST_LOG=1` 启动；HTTP/WS caller capability
   会自动脱敏，仍不要分享包含私有路径的日志。
-- WLB 额度耗尽后转官方的等待默认是 5 秒；可通过 `CODEX_ROUTER_WLB_FALLBACK_DELAY_MS`
-  调整（0 至 30000 毫秒，非整数或越界值使用默认）。客户端取消会终止等待；
+- WLB 额度耗尽后默认立即转官方；可通过 `CODEX_ROUTER_WLB_FALLBACK_DELAY_MS`
+  设置等待时间（0 至 30000 毫秒，非整数或越界值默认 0）。客户端取消会终止等待；
   路由器关闭后不会再向官方重发。这是路由器内的切换等待，Codex 客户端自身的重连
   间隔保持原设置。修改源码后需重启路由服务才能启用新行为。
 - 响应流及错误体、压缩、协作 relay 的缓冲读取默认允许 300 秒无数据；可用

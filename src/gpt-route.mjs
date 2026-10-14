@@ -5,7 +5,7 @@ import lockfile from "proper-lockfile";
 import { fileURLToPath } from "node:url";
 
 import { STATE_DIR } from "./paths.mjs";
-import { protectPrivateFile } from "./file-security.mjs";
+import { protectPrivateFileAsync } from "./file-security.mjs";
 import { assertStateOwnership } from "./state-owner.mjs";
 import { PROVIDERS } from "./model-registry.mjs";
 import { readProviderSelection } from "./provider-selection.mjs";
@@ -69,7 +69,8 @@ export async function setGptRoute(route, { expected, signal } = {}) {
     const temporary = `${GPT_ROUTE_PATH}.${process.pid}.tmp`;
     try {
       writeFileSync(temporary, `${JSON.stringify({ version: 1, route, revision: randomUUID() })}\n`, { mode: 0o600 });
-      protectPrivateFile(temporary);
+      await protectPrivateFileAsync(temporary, { signal });
+      signal?.throwIfAborted();
       renameSync(temporary, GPT_ROUTE_PATH);
     } finally {
       try { unlinkSync(temporary); } catch (error) { if (error.code !== "ENOENT") throw error; }

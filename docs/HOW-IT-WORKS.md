@@ -102,11 +102,12 @@ MiMo 的两个及 WLB 的三个命名空间 slug 保留给已有目录或直接�
 ## 路由和凭据
 
 `src/gpt-route.mjs` 分别将主代理选择写入 `gpt-route.json`、子代理选择写入
-`subagent-route.json`，取值均为 `official`、`wlb` 或 `supergpt`；文件不存在时默认使用
+`subagent-route.json`；主代理支持 `official`、`wlb`、`supergpt`、`auto`，
+子代理仅支持前三种手动模式。文件不存在时默认使用
 `official`。两个开关各自对所有任务共享，从下一次对应角色的原生 GPT 请求起生效。使用
 `wlb` 或 `supergpt` 时，`src/router.mjs` 将请求中的 `gpt-*` 模型名原样发送给对应
 服务商，不依赖旧静态模型名单；SuperGPT 不新增旧命名空间模型条目。官方新增模型
-无需修改 Router，模型可用性取决于上游及 API key 分组；上游不支持时返回其错误。只有主代理的
+无需修改 Router，模型可用性取决于上游及 API key 分组；上游不支持时返回其错误。在手动模式下，只有主代理的
 WLB 请求明确额度耗尽时，才自动保存主代理路由为 `official`，默认立即以原始 Codex 身份重发
 当前尚未输出的请求；后续 GPT 主代理请求也走官方。普通限流、认证失败、套餐不包含
 API 和已开始输出的流不切换；没有非空官方 `Authorization` 或状态保存失败时不访问
@@ -117,14 +118,27 @@ version 1，并在每次写入时生成新 revision，兼容没有 revision 的�
 和自动回退共用跨进程锁；回退在锁内核对请求发出时的 route/revision。Windows
 在锁内异步设置临时文件的私有 ACL，优先 `pwsh.exe`，失败时回退 `powershell.exe`，
 两次尝试共用 10 秒预算；取消或权限设置失败时不替换原状态，并清理临时文件。期间手动
-切换或重复选择 WLB 后，旧请求返回原错误，不覆盖新状态，也不向官方重发。等待可通过
+切至 official 后，旧请求读取当前选择并向官方重发，不改写 revision；切至 SuperGPT 或
+重复选择 WLB 后，旧请求返回原错误且不覆盖新状态。等待可通过
 `CODEX_ROUTER_WLB_FALLBACK_DELAY_MS` 调整，接受 0 至 30000 毫秒的整数，其他值使用
 默认 0。客户端取消会终止等待；路由器关闭后不会再向官方重发。这个等待发生在
 路由器内，不修改 Codex 客户端的重连间隔；更新源码后需重启服务。正在执行的任务中途切换服务商可能带来
 历史上下文兼容风险。SuperGPT 错误直接返回，不使用 WLB 专属回退或修改路由状态。
-首次新增服务商配置需重启 Router，之后主代理的 `route official|wlb|supergpt` 和子代理的
+首次新增服务商配置需重启 Router，之后主代理的 `route official|wlb|supergpt|auto` 和子代理的
 `route subagent official|wlb|supergpt` 热切换无需重启。`route status` 与 `route subagent status`
 只读；`--json` 仅由总状态命令支持。
+
+主代理可用 `route auto` 启用自动模式，按 **WLB → 官方 GPT → SuperGPT** 的顺序选择；
+额度恢复后，后续请求自动回到最高可用档，配置模式始终保持 `auto`。WLB 读取原始 `1d` / `7d`
+窗口，任一额度耗尽即跳过。GPT 同时监控 5 小时和周窗口：5 小时剩余 **≤5%** 或
+周剩余 **≤2%** 时跳过；所有实际存在的窗口均高于阈值时才恢复，缺失窗口不参与判断。
+Node Router 在请求到来时刷新额度，默认缓存 30 秒；没有整机常驻定时器，悬浮窗也不参与额度决策。
+同一请求至多尝试三家、每家一次，只有明确额度失败且尚未输出时才继续降级，SuperGPT 为终点。
+查询失败时保留已有档位；首次无法可靠判断则明确报错，不凭网络、认证或普通限流错误猜测额度。
+独立子代理不支持 `auto`，默认官方且继续遵循自己的开关；`codex-auto-review` 特殊模型继续使用官方。
+
+`status --json` 在自动模式返回 `gptRoute.mode="auto"`、`effectiveMode` 和脱敏的
+`auto` 诊断；首次请求前有效档位可能为 `null`。状态查询只读，不主动触发额度刷新。
 
 对于原生 `gpt-*`，已识别的子代理使用独立的子代理供应商路由，默认官方：复用 `x-openai-subagent`（忽略明确
 的 `false`/`0`）、有效的 `x-codex-parent-thread-id` 或线程 rollout 中的
@@ -262,6 +276,8 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | `src/sse-prefix.mjs` | 有界识别无 `content-type` 的 SSE 并保持探测字节顺序 |
 | `src/sse-events.mjs` | 有界 SSE 事件解析、多行 data、CR/LF/CRLF 和原字节还原 |
 | `src/gpt-route.mjs` | 分别读写主代理和子代理路由状态，各自加锁并原子写入；主代理支持有条件的自动回退 |
+| `src/auto-route.mjs` | 请求触发的额度缓存、阈值判断和三档选择 |
+| `src/auto-route-state.mjs` | 按路由 revision 保存和读取脱敏有效档位快照 |
 | `src/model-registry.mjs` | 加载并验证服务商和模型 |
 | `src/start.mjs` | 监督一个路由器子进程并提供代理环境 |
 | `src/status.mjs` | 只读汇总路由器、配置、目录模式、主代理/子代理 GPT 路由、Provider、安装和服务状态 |
@@ -278,4 +294,5 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | `test/windows-service-process.mjs` | 检查 Windows PID 登记、优雅停止与进程树强杀兜底和误杀防护 |
 | `test/windows-hidden-consoles.mjs` | 检查后台子进程隐藏窗口及交互输入保持可见 |
 | `test/service-command.mjs` | 检查通用服务入口等待时事件循环可用、就绪检查次数和失败返回 |
+| `test/auto-route.mjs` | 检查额度窗口、阈值、缓存、降级恢复与查询失败保留 |
 | `test/gpt-route-async.mjs` | 检查路由 ACL 异步写入、取消后保留原状态及临时文件清理 |

@@ -64,6 +64,8 @@ import {
 } from "./mimo-custom-tools.mjs";
 import { activityMetadataFromHeaders } from "./codex-session-names.mjs";
 import { isUsageExhausted, translateGatewayError } from "./error-translation.mjs";
+import { createAutoRouteController } from "./auto-route.mjs";
+import { writeAutoRouteStatus } from "./auto-route-state.mjs";
 import { recordUsageEvent } from "./usage-events.mjs";
 import { VERSION } from "./version.mjs";
 
@@ -83,6 +85,27 @@ function providerBaseUrl(provider) {
     (provider.baseUrlEnv && process.env[provider.baseUrlEnv]?.trim()) ||
       provider.baseUrl,
   ).replace(/\/+$/, "");
+}
+const autoRefresh = process.env.CODEX_ROUTER_AUTO_REFRESH_MS;
+const autoRouteController = createAutoRouteController({
+  getWlbConnection() {
+    const provider = PROVIDERS.get("wlb-relay");
+    if (!readProviderSelection().includes(provider.id)) throw new Error("WLB 尚未启用。");
+    return { baseUrl: providerBaseUrl(provider), credential: resolveProviderCredential(provider)?.value };
+  },
+  officialUsageUrl: process.env.CODEX_ROUTER_GPT_USAGE_URL || "https://chatgpt.com/backend-api/wham/usage",
+  ttlMs: /^\d+$/.test(autoRefresh || "") && Number(autoRefresh) <= 300000 ? Number(autoRefresh) : 30000,
+});
+function autoRouteUnavailable() {
+  return Object.assign(new Error("自动路由暂时不可用，请检查额度查询及供应商配置。"), { status: 503, type: "auto_route_unavailable" });
+}
+function officialUsageExhausted(status, bodyText) {
+  if (![400, 402, 403, 429].includes(status)) return false;
+  try {
+    const error = JSON.parse(bodyText)?.error;
+    if (error?.code === "usage_limit_reached" || error?.type === "usage_limit_reached") return true;
+  } catch {}
+  return isUsageExhausted(status, bodyText);
 }
 const CALLER_KEY = process.env.CODEX_ROUTER_CALLER_KEY;
 const QUIET =
@@ -1155,7 +1178,22 @@ async function handleResponses(request, response, requestUrl) {
     requestedModel = typeof payload.model === "string" ? payload.model : "";
     const activityMetadata = activityMetadataFromHeaders(request.headers);
     const nativeGpt = requestedModel.startsWith("gpt-") && !MODEL_BY_SLUG.has(requestedModel);
+    let autoMode = false;
     let registeredRoute = MODEL_BY_SLUG.get(requestedModel);
+    const routeForMode = (mode) => {
+      const provider = GPT_ROUTES.get(mode)?.provider;
+      if (provider && !readProviderSelection().includes(provider)) throw autoRouteUnavailable();
+      return provider ? { provider, slug: `${provider}/${requestedModel}`, upstreamModel: requestedModel } : undefined;
+    };
+    const resolveAutomatic = async (exclude = []) => {
+      const snapshot = await autoRouteController.resolve(request.headers, { signal: controller.signal, exclude });
+      const current = readGptRouteSnapshot();
+      if (current.route !== gptRouteSnapshot.route || current.revision !== gptRouteSnapshot.revision) return { current };
+      await writeAutoRouteStatus(snapshot, gptRouteSnapshot, { signal: controller.signal });
+      const afterWrite = readGptRouteSnapshot();
+      if (afterWrite.route !== gptRouteSnapshot.route || afterWrite.revision !== gptRouteSnapshot.revision) return { current: afterWrite };
+      return { snapshot };
+    };
     if (nativeGpt) {
       let gptRoute;
       try {
@@ -1163,8 +1201,24 @@ async function handleResponses(request, response, requestUrl) {
           ? readSubagentRouteSnapshot
           : readGptRouteSnapshot)();
         gptRoute = gptRouteSnapshot?.route || "official";
+        autoMode = gptRoute === "auto" && !activityMetadata.isSubagent;
+        if (autoMode) {
+          for (const id of ["wlb-relay", "supergpt-relay"]) {
+            if (!readProviderSelection().includes(id) || !resolveProviderCredential(PROVIDERS.get(id))) throw autoRouteUnavailable();
+          }
+          const decision = await resolveAutomatic();
+          if (decision.current) {
+            if (decision.current.route === "auto") throw autoRouteUnavailable();
+            gptRoute = decision.current.route;
+            autoMode = false;
+            gptRouteSnapshot = decision.current;
+          } else {
+            gptRoute = decision.snapshot.route;
+            delete payload.previous_response_id;
+          }
+        }
       } catch (error) {
-        writeJson(response, 503, { error: { type: "invalid_gpt_route", message: error.message } });
+        writeJson(response, 503, { error: { type: autoMode ? "auto_route_unavailable" : "invalid_gpt_route", message: autoMode ? "自动路由暂时不可用，请检查额度查询及供应商配置。" : error.message } });
         return;
       }
       const provider = GPT_ROUTES.get(gptRoute).provider;
@@ -1208,12 +1262,13 @@ async function handleResponses(request, response, requestUrl) {
       ...activityMetadata,
     });
     const fallbackToOfficial = async (status, bodyText) => {
-      if (!nativeGpt || activityMetadata.isSubagent || route?.provider !== "wlb-relay" ||
+      if (autoMode || !nativeGpt || activityMetadata.isSubagent || route?.provider !== "wlb-relay" ||
           !isUsageExhausted(status, bodyText) || !nothingRelayed(response) || controller.signal.aborted ||
           typeof request.headers.authorization !== "string" || !request.headers.authorization.trim()) return false;
       try {
         // 重新验证状态，损坏或写入失败时停止，沿用 owner 校验和原子写入。
-        if (!await setGptRoute("official", { expected: gptRouteSnapshot, signal: controller.signal })) return false;
+        if (!await setGptRoute("official", { expected: gptRouteSnapshot, signal: controller.signal }) &&
+            readGptRouteSnapshot().route !== "official") return false;
       } catch (error) {
         const failure = new Error(`WLB 额度耗尽，但无法保存官方路由：${error.message}`);
         failure.status = 503;
@@ -1234,36 +1289,78 @@ async function handleResponses(request, response, requestUrl) {
     };
     const compactV1 = /\/responses\/compact$/.test(requestUrl.pathname);
     const compactV2 =
-      route &&
       Array.isArray(payload.input) &&
       payload.input.at(-1)?.type === "compaction_trigger";
 
-    if (route && (compactV1 || compactV2)) {
-      const compaction = await handleRoutedCompaction(
-        request,
-        response,
-        payload,
-        route,
-        controller.signal,
-        compactV2,
-      );
-      // Compaction used to return here without metering or logging, so neither
-      // a successful nor a failed one appeared anywhere in the router's own
-      // telemetry. Mirror the ordinary request path exactly.
-      recordUsageEvent({
-        model: route.slug,
-        provider: canonicalProviderId(route.provider),
-        status: compaction.status,
-        durationMs: Date.now() - startedAt,
-        ...compaction.usage,
-      });
-      if (!QUIET) {
-        console.error(
-          `[codex-router] model=${requestedModel || "unknown"} provider=${route.provider} status=${compaction.status}`,
-        );
+    const attempted = new Set();
+    const advanceAutomatic = async (status, bodyText) => {
+      if (!autoMode || !nothingRelayed(response) || controller.signal.aborted ||
+          typeof request.headers.authorization !== "string" || !request.headers.authorization.trim()) return false;
+      const failed = route?.provider === "wlb-relay" ? "wlb" : route ? "supergpt" : "official";
+      if (failed === "supergpt" || !(failed === "official" ? officialUsageExhausted(status, bodyText) : isUsageExhausted(status, bodyText))) return false;
+      const current = readGptRouteSnapshot();
+      if (current.route !== "auto" || current.revision !== gptRouteSnapshot.revision) {
+        if (current.route !== "official" || attempted.has("official")) return false;
+        autoMode = false;
+        route = undefined;
+        return true;
       }
-      if (compaction.status < 400) return;
-      if (!await fallbackToOfficial(compaction.status, compaction.bodyText ?? JSON.stringify(compaction.payload))) {
+      const exclude = failed === "official" ? ["wlb", "official"] : ["wlb"];
+      const decision = await resolveAutomatic([...new Set([...attempted, ...exclude])]);
+      if (decision.current) {
+        if (decision.current.route !== "official" || attempted.has("official")) return false;
+        autoMode = false;
+        route = undefined;
+        return true;
+      }
+      if (attempted.has(decision.snapshot.route)) return false;
+      route = routeForMode(decision.snapshot.route);
+      return true;
+    };
+    let upstream;
+    let retries;
+    let routedBody;
+    let mimoCustomToolNames;
+    for (;;) {
+      if (autoMode) {
+        const current = readGptRouteSnapshot();
+        if (current.route !== "auto" || current.revision !== gptRouteSnapshot.revision) {
+          if (current.route !== "official" || attempted.has("official")) throw autoRouteUnavailable();
+          autoMode = false;
+          route = undefined;
+        }
+        const selected = route?.provider === "wlb-relay" ? "wlb" : route ? "supergpt" : "official";
+        if (attempted.has(selected) || attempted.size >= 3) throw autoRouteUnavailable();
+        attempted.add(selected);
+      }
+      activity.setRoute({ provider: route ? canonicalProviderId(route.provider) : "openai", model: route?.slug || requestedModel, ...activityMetadata });
+      if (route && (compactV1 || compactV2)) {
+        const compaction = await handleRoutedCompaction(
+          request,
+          response,
+          payload,
+          route,
+          controller.signal,
+          compactV2,
+        );
+        // Compaction used to return here without metering or logging, so neither
+        // a successful nor a failed one appeared anywhere in the router's own
+        // telemetry. Mirror the ordinary request path exactly.
+        recordUsageEvent({
+          model: route.slug,
+          provider: canonicalProviderId(route.provider),
+          status: compaction.status,
+          durationMs: Date.now() - startedAt,
+          ...compaction.usage,
+        });
+        if (!QUIET) {
+          console.error(
+            `[codex-router] model=${requestedModel || "unknown"} provider=${route.provider} status=${compaction.status}`,
+          );
+        }
+        if (compaction.status < 400) return;
+        const compactionError = compaction.bodyText ?? JSON.stringify(compaction.payload);
+        if (await advanceAutomatic(compaction.status, compactionError) || await fallbackToOfficial(compaction.status, compactionError)) continue;
         if (compaction.bodyText !== undefined) {
           writeRoutedError(response, compaction.status, compaction.bodyText, route, compaction.retryAfter);
         } else {
@@ -1271,113 +1368,111 @@ async function handleResponses(request, response, requestUrl) {
         }
         return;
       }
-    }
 
-    let target;
-    let headers;
-    let routedBody;
-    let mimoCustomToolNames;
-    if (route) {
-      const routedInput =
-        route.provider === "mimo-token-plan" && Array.isArray(payload.input)
-          ? pruneMimoAgentProgress(payload.input)
-          : payload.input;
-      const input = await bridgeVisionInput(
-        await normalizeRoutedAgentInput(request, routedInput, controller.signal),
-        route,
-        request,
-      );
-      const provider = providerForModel(route);
-      const routed = {
-        ...payload,
-        model: route.upstreamModel,
-        input,
-      };
-      if (route.provider === "mimo-token-plan") {
-        const converted = convertMimoRequestTools(routed.tools);
-        routed.tools = converted.tools;
-        routed.input = convertMimoRequestInput(routed.input);
-        mimoCustomToolNames = converted.names;
-      }
-      // Codex adds hosted search from the built-in OpenAI provider capability,
-      // even when the selected MiMo catalog entry says search is unsupported.
-      // Xiaomi rejects the whole turn before the model runs if it sees this tool.
-      if (route.provider === "mimo-token-plan" && Array.isArray(routed.tools)) {
-        routed.tools = routed.tools.filter((tool) => tool?.type !== "web_search");
-      }
-      // Native OpenAI traffic keeps client_metadata; routed providers do not
-      // consume it and the strict ones reject the unknown field.
-      delete routed.client_metadata;
-      if (provider?.keyless) {
-        delete routed.reasoning;
-        delete routed.reasoning_effort;
-      }
-      const credential = resolveProviderCredential(provider);
-      if (!credential) {
-        writeJson(response, 409, {
-          error: {
-            type: "provider_not_configured",
-            provider: provider.id,
-            message: `Provider ${provider.id} has no credential. Run ./bin/provider-key ${provider.id} set.`,
-          },
-        });
-        return;
-      }
-      target = `${providerBaseUrl(provider)}/responses`;
-      headers = routedHeaders(credential);
-      routedBody = Buffer.from(JSON.stringify(routed), "utf8");
-    } else {
-      ({ target, headers, routedBody } = await prepareNativeRequest(request, requestUrl, payload, compactV1));
-    }
-
-    // `routedBody` is a fully materialized Buffer -- plain JSON, or the zstd
-    // frame `compressedNativeBody` produced together with the matching
-    // `Content-Encoding` header. Both are computed once, above, so every
-    // attempt replays the identical bytes under the identical encoding. Nothing
-    // here consumes a stream, which is what makes the request replayable at
-    // all.
-    let { response: upstream, retries } = await fetchWithRetry(
-      target,
-      {
-        method: "POST",
-        headers,
-        body: routedBody,
-        signal: controller.signal,
-      },
-      {
-        retries: undefined,
-        canRetry: () => nothingRelayed(response),
-        onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
-      },
-    );
-    upstreamRetries = retries;
-    upstreamStatus = upstream.status;
-    // Gateway error bodies leak LiteLLM's internal exception chain, which
-    // reads like a router bug. Rewrite them to name the provider that failed.
-    // Native traffic passes through untouched: OpenAI errors are already clear.
-    if (route && !upstream.ok) {
-      const bodyText = await readResponseTextLimited(upstream, MAX_UPSTREAM_ERROR_BYTES, { signal: controller.signal });
-      recordUsageEvent({
-        model: route.slug,
-        provider: canonicalProviderId(route.provider),
-        status: upstream.status,
-        durationMs: Date.now() - startedAt,
-      });
-      if (await fallbackToOfficial(upstream.status, bodyText)) {
+      let target;
+      let headers;
+      mimoCustomToolNames = undefined;
+      if (route) {
+        const routedInput =
+          route.provider === "mimo-token-plan" && Array.isArray(payload.input)
+            ? pruneMimoAgentProgress(payload.input)
+            : payload.input;
+        const input = await bridgeVisionInput(
+          await normalizeRoutedAgentInput(request, routedInput, controller.signal),
+          route,
+          request,
+        );
+        const provider = providerForModel(route);
+        const routed = {
+          ...payload,
+          model: route.upstreamModel,
+          input,
+        };
+        if (route.provider === "mimo-token-plan") {
+          const converted = convertMimoRequestTools(routed.tools);
+          routed.tools = converted.tools;
+          routed.input = convertMimoRequestInput(routed.input);
+          mimoCustomToolNames = converted.names;
+        }
+        // Codex adds hosted search from the built-in OpenAI provider capability,
+        // even when the selected MiMo catalog entry says search is unsupported.
+        // Xiaomi rejects the whole turn before the model runs if it sees this tool.
+        if (route.provider === "mimo-token-plan" && Array.isArray(routed.tools)) {
+          routed.tools = routed.tools.filter((tool) => tool?.type !== "web_search");
+        }
+        // Native OpenAI traffic keeps client_metadata; routed providers do not
+        // consume it and the strict ones reject the unknown field.
+        delete routed.client_metadata;
+        if (autoMode) delete routed.previous_response_id;
+        if (provider?.keyless) {
+          delete routed.reasoning;
+          delete routed.reasoning_effort;
+        }
+        const credential = resolveProviderCredential(provider);
+        if (!credential) {
+          writeJson(response, 409, {
+            error: {
+              type: "provider_not_configured",
+              provider: provider.id,
+              message: `Provider ${provider.id} has no credential. Run ./bin/provider-key ${provider.id} set.`,
+            },
+          });
+          return;
+        }
+        target = `${providerBaseUrl(provider)}/responses`;
+        headers = routedHeaders(credential);
+        routedBody = Buffer.from(JSON.stringify(routed), "utf8");
+      } else {
         ({ target, headers, routedBody } = await prepareNativeRequest(request, requestUrl, payload, compactV1));
-        ({ response: upstream, retries } = await fetchWithRetry(target, {
-          method: "POST", headers, body: routedBody, signal: controller.signal,
-        }, {
+      }
+
+      // `routedBody` is a fully materialized Buffer -- plain JSON, or the zstd
+      // frame `compressedNativeBody` produced together with the matching
+      // `Content-Encoding` header. Both are computed once, above, so every
+      // attempt replays the identical bytes under the identical encoding. Nothing
+      // here consumes a stream, which is what makes the request replayable at
+      // all.
+      ({ response: upstream, retries } = await fetchWithRetry(
+        target,
+        {
+          method: "POST",
+          headers,
+          body: routedBody,
+          signal: controller.signal,
+        },
+        {
+          retries: autoMode ? 0 : undefined,
           canRetry: () => nothingRelayed(response),
           onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
-        }));
-        upstreamRetries = retries;
-        upstreamStatus = upstream.status;
-      } else {
+        },
+      ));
+      upstreamRetries = retries;
+      upstreamStatus = upstream.status;
+      // Gateway error bodies leak LiteLLM's internal exception chain, which
+      // reads like a router bug. Rewrite them to name the provider that failed.
+      // Native traffic passes through untouched: OpenAI errors are already clear.
+      if (route && !upstream.ok) {
+        const bodyText = await readResponseTextLimited(upstream, MAX_UPSTREAM_ERROR_BYTES, { signal: controller.signal });
+        recordUsageEvent({
+          model: route.slug,
+          provider: canonicalProviderId(route.provider),
+          status: upstream.status,
+          durationMs: Date.now() - startedAt,
+        });
+        if (await advanceAutomatic(upstream.status, bodyText) || await fallbackToOfficial(upstream.status, bodyText)) continue;
         writeRoutedError(response, upstream.status, bodyText, route, upstream.headers.get("retry-after"));
         if (!QUIET) console.error(`[codex-router] model=${requestedModel || "unknown"} provider=${route.provider} status=${upstream.status}`);
         return;
       }
+      if (autoMode && !route && !upstream.ok) {
+        const bytes = await readResponseBody(upstream, { maxBytes: MAX_UPSTREAM_ERROR_BYTES, signal: controller.signal });
+        if (await advanceAutomatic(upstream.status, bytes.toString("utf8"))) {
+          recordUsageEvent({ model: requestedModel, provider: "openai", status: upstream.status, durationMs: Date.now() - startedAt });
+          continue;
+        }
+        upstream = new Response(bytes, { status: upstream.status, statusText: upstream.statusText, headers: upstream.headers });
+      }
+      break;
     }
     // Native OpenAI responses carry the same `usage` shape as routed ones, so
     // meter both paths; without this, native traffic reports zero tokens.
@@ -1691,7 +1786,7 @@ const server = http.createServer((request, response) => {
     if (!response.headersSent) {
       writeJson(response, status, {
         error: {
-          type: "local_router_error",
+          type: error.type === "auto_route_unavailable" ? "auto_route_unavailable" : "local_router_error",
           message: "The local router could not complete the request.",
         },
       });

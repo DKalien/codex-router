@@ -19,6 +19,8 @@
 - `src/router.mjs` — 完整请求路径（官方请求透传、全局 GPT 路由，以及注入各服务商
   凭据后的旧命名空间直接转发）
 - `src/gpt-route.mjs` — 读写主代理和子代理各自的原生 GPT 路由状态，默认均使用官方路由
+- `src/auto-route.mjs` — 请求触发的自动额度查询、默认 30 秒缓存和三档选择
+- `src/auto-route-state.mjs` — 带路由 revision 校验的脱敏有效档位快照；状态查询不联网
 - `src/model-registry.mjs` — 加载并验证 `config/**`；已列出模型的字段可选，但
   提供时必须通过验证；服务商必须显式声明 `protocol: openai-responses`，不保留旧网关协议转换
 - `src/response-usage.mjs` — 从 JSON/SSE 响应提取 Token 用量；上游省略
@@ -49,7 +51,7 @@
 - 不提供模型元数据更新或静态目录生成入口，也不写入 `model_catalog_json`；官方
   目录由 Codex 自己更新。服务商密钥操作不得触发目录重建。保留旧目录状态读取和
   配置迁移兼容；MiMo 的两个及 WLB 的三个命名空间 slug 继续由路由器转发。
-- `route official|wlb|supergpt|status` 管理或读取主代理全局 GPT 路由；`route subagent
+- `route official|wlb|supergpt|auto|status` 管理或读取主代理全局 GPT 路由；`route subagent
   official|wlb|supergpt|status` 管理独立的子代理供应商路由。缺少状态文件时均默认为
   `official`。主代理设置从下一次非子代理的原生 GPT 请求起对所有任务共享，不绑定线程；
   子代理设置对所有任务的已识别原生 `gpt-*` 子代理共享，不读取主代理路由状态，
@@ -57,11 +59,11 @@
   rollout 的 `source.subagent.thread_spawn`；缺失或未写完的 rollout 不缓存负结果，
   没有可识别证据时仍遵循主代理全局路由。显式 `wlb-relay/*` 与 MiMo 路由保持原语义。
   同一任务中途切换服务商可能带来历史上下文兼容风险。`wlb` 原样转发请求中的 `gpt-*` 模型名，不依赖旧目录注册，
-  上游不支持时返回错误；仅主代理明确额度耗尽且尚未输出时自动保存为 `official`，默认立即
+  上游不支持时返回错误；仅手动 WLB 模式的主代理明确额度耗尽且尚未输出时自动保存为 `official`，默认立即
   使用原始 Codex 身份继续普通或压缩请求。手动设置和回退共用跨进程锁，
-  回退在锁内核对请求发出时的 route/revision；期间手动切换或同路由重选后，保留新
-  状态并返回原错误。Windows 路由临时文件的 ACL 异步设置优先 pwsh，失败时回退
-  powershell，两次尝试共用 10 秒预算；取消或 ACL 失败不替换状态并清理临时文件。
+  回退在锁内核对请求发出时的 route/revision；期间手动切至 official，旧请求沿用官方
+  重发且不改写 revision；切至 SuperGPT 或重选 WLB 时保留新状态并返回原错误。Windows
+  路由临时文件的 ACL 异步设置优先 pwsh，失败时回退 powershell，两次尝试共用 10 秒预算；取消或 ACL 失败不替换状态并清理临时文件。
   每次写入更新 revision，兼容旧状态文件缺少该字段。
   普通限流、认证失败、套餐不包含 API
   和已输出的流不切换；缺少官方身份、路由状态损坏或状态写入失败时不回退。显式
@@ -73,6 +75,16 @@
   Router，之后 `route` 热切换无需重启。SuperGPT 默认域名固定 DIRECT；自定义
   `SUPERGPT_BASE_URL` 的其他域名如需直连，应显式加入 `NO_PROXY`。
   `route status` 只读且不支持 `--json`，只有总状态命令支持 `status --json`。
+- 自动模式：主代理可用 `route auto` 启用自动模式，按 **WLB → 官方 GPT → SuperGPT** 的顺序选择；
+  额度恢复后，后续请求自动回到最高可用档，配置模式始终保持 `auto`。WLB 读取原始 `1d` / `7d`
+  窗口，任一额度耗尽即跳过。GPT 同时监控 5 小时和周窗口：5 小时剩余 **≤5%** 或
+  周剩余 **≤2%** 时跳过；所有实际存在的窗口均高于阈值时才恢复，缺失窗口不参与判断。
+  Node Router 在请求到来时刷新额度，默认缓存 30 秒；没有整机常驻定时器，悬浮窗也不参与额度决策。
+  同一请求至多尝试三家、每家一次，只有明确额度失败且尚未输出时才继续降级，SuperGPT 为终点。
+  自动模式的官方错误体限读 64 KiB；超限明确返回 502 且不继续降级，限内的原生非额度错误保留原始字节。
+  查询失败时保留已有档位；首次无法可靠判断则明确报错，不凭网络、认证或普通限流错误猜测额度。
+  独立子代理不支持 `auto`，默认官方且继续遵循自己的开关；`codex-auto-review` 特殊模型继续使用官方。
+  `status --json` 使用 `gptRoute.mode=auto`、可空的 `effectiveMode` 和无凭据 `auto` 诊断。
 - `/models` 和 `/v1/models` 始终使用官方身份透传官方查询参数和完整元数据；WLB 和 SuperGPT
   路由不替换官方模型列表。
 - 每个改动过的 `src/*.mjs` 都必须运行 `node --check`；整个源码树的相对导入必须

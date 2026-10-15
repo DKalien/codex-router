@@ -4,7 +4,7 @@
 的精简分支：Codex 保持使用官方模型目录，本地路由器只负责把请求转发到官方
 Codex 后端或已配置的第三方服务商。
 
-默认路由是 `official`。对官方目录中的 GPT 模型，主代理遵循全局 `official`/`wlb`/`supergpt`
+默认路由是 `official`。对官方目录中的 GPT 模型，主代理遵循全局 `official`/`wlb`/`supergpt`/`auto`
 开关；已识别的原生 `gpt-*` 子代理默认走官方，也可通过独立的子代理供应商开关选择
 `official`/`wlb`/`supergpt`。选择器选中的 `gpt-*` 模型名原样传给
 WLB 或 SuperGPT，新增模型无需修改本地名单，实际可用性取决于上游及 API key 分组支持。全局设置不绑定
@@ -27,7 +27,8 @@ clean EOF，未发出响应头的请求返回 503。可用 `MODEL_ROUTER_SHUTDOW
 `test/http-health-bounds.mjs`、`test/credential-file-security.mjs`、
 `test/graceful-shutdown.mjs`、`test/upstream-hardening.mjs`、
 `test/windows-service-process.mjs`、`test/windows-hidden-consoles.mjs`、
-`test/start-proxy.mjs`、`test/service-command.mjs`、`test/gpt-route-async.mjs`
+`test/start-proxy.mjs`、`test/service-command.mjs`、`test/gpt-route-async.mjs`、
+`test/auto-route.mjs`
 和 `scripts-check.mjs`。
 
 ## 架构
@@ -38,6 +39,7 @@ clean EOF，未发出响应头的请求返回 503。可用 `MODEL_ROUTER_SHUTDOW
 Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.mjs
     ├─ 已识别的 GPT 子代理 + subagent official → ChatGPT Codex 后端（透传 Codex 身份验证）
     ├─ 已识别的 GPT 子代理 + subagent wlb/supergpt → 对应第三方服务商
+    ├─ GPT 主代理 + route auto     → 按额度选择 WLB → 官方 GPT → SuperGPT
     ├─ GPT 主代理 + route official → ChatGPT Codex 后端（透传 Codex 身份验证）
     ├─ GPT 主代理 + route wlb      → WLB Relay（注入 WLB_API_KEY）
     ├─ GPT 主代理 + route supergpt → SuperGPT（注入 SUPERGPT_API_KEY）
@@ -47,18 +49,28 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
 
 - **官方目录**：默认安装会移除本安装维护的 `model_catalog_json`，让 Codex 使用
   官方目录并自行更新；设置或删除服务商密钥也不会重建本地目录。
-- **GPT 路由开关**：`route official|wlb|supergpt|status` 写入或读取全局路由状态，切换从下
+- **GPT 手动路由开关**：`route official|wlb|supergpt|status` 写入或读取全局路由状态，切换从下
   一次非子代理的原生 GPT 请求生效，首次新增服务商配置需重启 Router；之后热切换不需要重启服务或 Codex。
   `wlb` 和 `supergpt` 按请求中的 GPT 模型名直接转发，
   不依赖本地模型名单；上游不支持时仍返回其错误。仅 WLB 明确报告额度耗尽时，路由器自动保存为
   `official`，默认立即用原始 Codex 身份继续当前请求，后续 GPT 主代理请求也走官方。
   普通限流、认证失败、套餐不包含 API 和已开始输出的流不会触发切换；缺少官方身份或
   无法保存路由状态时不会回退。切换覆盖普通请求和压缩请求，显式 `wlb-relay/*` 保持原语义。
-  自动回退只在请求发出后的路由状态未变时执行；期间手动切换或重选 WLB，旧请求会
-  保留新选择并返回原错误。SuperGPT 上游错误直接返回，不触发该回退或改变全局路由。
+  自动回退仅在请求发出后的路由状态未变时写入；期间手动切至 official，旧请求沿用
+  当前官方选择重发，不改写 revision；切至 SuperGPT 或重选 WLB 时保留新状态并返回原错误。
+  SuperGPT 上游错误直接返回，不触发该回退或改变全局路由。
   额度恢复后需手动运行 `route wlb` 切回。`route status` 只读；只有总状态命令支持
   `--json`（`status --json`）。该开关不绑定线程，同一任务中途切换服务商可能带来
   历史上下文兼容风险。
+- **GPT 自动路由**：主代理可用 `route auto` 启用自动模式，按 **WLB → 官方 GPT → SuperGPT** 的顺序选择；
+  额度恢复后，后续请求自动回到最高可用档，配置模式始终保持 `auto`。WLB 读取原始 `1d` / `7d`
+  窗口，任一额度耗尽即跳过。GPT 同时监控 5 小时和周窗口：5 小时剩余 **≤5%** 或
+  周剩余 **≤2%** 时跳过；所有实际存在的窗口均高于阈值时才恢复，缺失窗口不参与判断。
+  Node Router 在请求到来时刷新额度，默认缓存 30 秒；没有整机常驻定时器，悬浮窗也不参与额度决策。
+  同一请求至多尝试三家、每家一次，只有明确额度失败且尚未输出时才继续降级，SuperGPT 为终点。
+  自动模式的官方错误体限读 64 KiB；超限明确返回 502 且不继续降级，限内的原生非额度错误保留原始字节。
+  查询失败时保留已有档位；首次无法可靠判断则明确报错，不凭网络、认证或普通限流错误猜测额度。
+  独立子代理不支持 `auto`，默认官方且继续遵循自己的开关；`codex-auto-review` 特殊模型继续使用官方。
 - **GPT 子代理**：已识别的原生 `gpt-*` 子代理默认走官方，普通请求和压缩请求
   共用规则，且不读取主代理的全局路由状态。可运行 `route subagent official|wlb|supergpt|status`
   独立切换，选择对所有任务的后续子代理请求共享。供应商未启用、缺少凭据或子代理路由状态
@@ -119,6 +131,7 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
 .\codex-router.ps1 route official             # 全局：GPT 主代理请求走官方（默认）
 .\codex-router.ps1 route wlb                  # 全局：GPT 主代理请求走 WLB；子代理供应商另行设置
 .\codex-router.ps1 route supergpt             # 全局：GPT 主代理请求走 SuperGPT
+.\codex-router.ps1 route auto                 # 主代理：按额度自动选择并在恢复后回升
 .\codex-router.ps1 route status               # 查看当前 GPT 路由
 .\codex-router.ps1 route subagent wlb         # 子代理请求走 WLB（独立于主代理）
 .\codex-router.ps1 route subagent status      # 查看子代理供应商
@@ -131,12 +144,14 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
 
 POSIX：`bin/install`（兼容入口 `install.sh`）、`bin/provider-key`、`bin/enable`、`bin/disable`、
 `bin/uninstall`、`bin/start`。路由切换使用
-`bin/model-router codex route official|wlb|supergpt|status`；子代理使用
+`bin/model-router codex route official|wlb|supergpt|auto|status`；子代理使用
 `bin/model-router codex route subagent official|wlb|supergpt|status`；状态检查使用
 `bin/model-router codex status`。这些命令只读取或更新本地状态，不会请求上游服务；
 官方模式的状态检查不依赖静态 8 模型目录。返回码为 0 表示已就绪，1 表示需要处理，
 2 表示参数错误；只有总状态命令支持 `--json`，即 `status --json`。`route status`
-为只读文本查询，不接受 `--json`。
+为只读文本查询，不接受 `--json`。自动模式下 `status --json` 的 `gptRoute.mode` 为
+`auto`，`effectiveMode` 是已确认的当前供应商（首次请求前可为 `null`），`auto` 提供
+`checkedAt`、`degraded`、`errors` 及脱敏额度诊断，不包含凭据。
 
 SuperGPT 默认基础 URL 是 `https://api.supergpt.dev/v1`，可用 `SUPERGPT_BASE_URL` 覆盖；
 前台可用 `SUPERGPT_API_KEY`，后台应通过 `provider-key supergpt-relay set` 安全保存并启用。
@@ -190,8 +205,11 @@ owner 冲突。安装完成后完全退出并重新打开 Codex，使新的本�
   `protocol` 时，仅在上游原生支持 Responses API 的前提下补入该字段；旧 Chat/Anthropic
   协议配置需要迁移至兼容的 Responses 服务，不能只改协议名。
 - 检查：`node --test test/official-catalog.mjs`、
-  `node --test test/router-fixes.mjs test/response-usage-hardening.mjs test/http-health-bounds.mjs test/credential-file-security.mjs test/graceful-shutdown.mjs test/upstream-hardening.mjs test/windows-service-process.mjs test/service-command.mjs test/gpt-route-async.mjs test/windows-hidden-consoles.mjs test/start-proxy.mjs` 和
+  `node --test test/router-fixes.mjs test/response-usage-hardening.mjs test/http-health-bounds.mjs test/credential-file-security.mjs test/graceful-shutdown.mjs test/upstream-hardening.mjs test/windows-service-process.mjs test/service-command.mjs test/gpt-route-async.mjs test/windows-hidden-consoles.mjs test/start-proxy.mjs test/auto-route.mjs` 和
   `node scripts-check.mjs`。
+- 旧聊天仍报 WLB：若会话绑定第三方 provider，或错误 URL 直接指向第三方，切换 GPT
+  模型或 Router 的 `route` 不会迁移该会话的 provider。请使用官方 OpenAI provider
+  新建通过本地 Router 的聊天，再切换路由；直接请求第三方的会话不经过 Router 回退。
 - 请求级调试：使用 `CODEX_ROUTER_REQUEST_LOG=1` 启动；HTTP/WS caller capability
   会自动脱敏，仍不要分享包含私有路径的日志。
 - WLB 额度耗尽后默认立即转官方；可通过 `CODEX_ROUTER_WLB_FALLBACK_DELAY_MS`

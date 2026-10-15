@@ -1462,7 +1462,7 @@ test("持续 SSE chunk 会重置 idle timeout", async () => {
 
 test("WLB 明确额度耗尽在输出前持久化官方并等待，原生身份和压缩协议保持完整", async () => {
   const received = [];
-  let rejection = { status: 403, error: { message: "日限额额度已用完" } };
+  let rejection = { status: 403, error: { message: "当前拼车 Key 每日额度已经用完，请等待次日额度重置" } };
   let officialStatus = 200;
   let sabotage;
   const official = http.createServer(async (request, response) => {
@@ -1525,7 +1525,7 @@ test("WLB 明确额度耗尽在输出前持久化官方并等待，原生身份�
     }
     for (const endpoint of ["/responses", "/v1/responses"]) {
       reset();
-      rejection = { status: 429, error: { type: "rate_limit_error", code: "insufficient_quota", message: "quota exhausted" } };
+      rejection = { status: 403, error: { message: "当前拼车 Key 每日额度已经用完，请等待次日额度重置" } };
       const input = [...payload.input, { type: "compaction_trigger" }];
       const before = received.length;
       assert.equal((await send(endpoint, { ...payload, input })).status, 200);
@@ -1620,7 +1620,7 @@ test("WLB 明确额度耗尽在输出前持久化官方并等待，原生身份�
 
 
 test("自动切换只识别明确额度耗尽，套餐营销和普通 resource_exhausted 不触发", () => {
-  for (const message of ["日限额额度已用完", "quota exhausted; upgrade your plan", "余额不足"]) {
+  for (const message of ["日限额额度已用完", "当前拼车 Key 每日额度已经用完，请等待次日额度重置", "日额度已耗尽", "每日额度已用尽", "quota exhausted; upgrade your plan", "余额不足"]) {
     assert.equal(isUsageExhausted(403, JSON.stringify({ error: { message } })), true);
   }
   for (const message of ["upgrade your plan", "purchase extra usage", "Your plan does not include API access; quota exhausted", "too many requests"]) {
@@ -1843,6 +1843,8 @@ test("审计：旧 WLB 请求不能覆盖之后的手动切换或同路由重选
     rejectWlb = () => { response.writeHead(429, { "Content-Type": "application/json" }); response.end(JSON.stringify({ error: { code: "insufficient_quota", message: "quota exhausted" } })); };
   });
   const official = http.createServer((request, response) => {
+    assert.equal(request.headers.authorization, "Bearer test-official");
+    assert.equal(request.headers["chatgpt-account-id"], "test-account");
     officialRequests += 1; request.resume(); response.writeHead(200, { "Content-Type": "application/json" }); response.end('{"output":[]}');
   });
   const wlbPort = await listen(wlb);
@@ -1854,12 +1856,14 @@ test("审计：旧 WLB 请求不能覆盖之后的手动切换或同路由重选
     assert.equal(result.status, 0, result.stderr);
   };
   try {
-    for (const endpoint of ["responses", "responses/compact"]) {
-      for (const choice of ["supergpt", "wlb"]) {
+    for (const mode of ["normal", "compact", "v2"]) {
+      const endpoint = mode === "compact" ? "responses/compact" : "responses";
+      for (const choice of ["supergpt", "wlb", "official"]) {
         cli("wlb"); rejectWlb = undefined;
+        const beforeOfficial = officialRequests;
         const pending = fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/${endpoint}`, {
-          method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer test-official" },
-          body: JSON.stringify({ model: "gpt-test", input: [], stream: false }),
+          method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer test-official", "chatgpt-account-id": "test-account" },
+          body: JSON.stringify({ model: "gpt-test", input: mode === "v2" ? [{ type: "compaction_trigger" }] : [], stream: false }),
         });
         await waitUntil(() => rejectWlb, "WLB did not receive the request");
         cli(choice);
@@ -1867,9 +1871,9 @@ test("审计：旧 WLB 请求不能覆盖之后的手动切换或同路由重选
         rejectWlb();
         const response = await pending;
         await response.text();
-        assert.equal(readFileSync(statePath, "utf8"), chosenState, `old ${endpoint} overwrote ${choice}`);
-        assert.equal(response.status, 429);
-        assert.equal(officialRequests, 0);
+        assert.equal(readFileSync(statePath, "utf8"), chosenState, `old ${mode} overwrote ${choice}`);
+        assert.equal(response.status, choice === "official" ? 200 : 429, `${mode}: ${choice}`);
+        assert.equal(officialRequests - beforeOfficial, choice === "official" ? 1 : 0, `${mode}: ${choice}`);
       }
     }
   } finally { await router.close(); await close(wlb); await close(official); }
@@ -1949,4 +1953,180 @@ test("WLB 自动回退默认立即重发且继续保存官方路由", async () =
     assert.equal(JSON.parse(readFileSync(statePath)).route, "official");
     assert.match(router.stderr(), /route=official wait-ms=0(?:\r?\n|$)/);
   } finally { await router.close(); await close(wlb); await close(official); }
+});
+
+
+test("auto 主代理按额度阈值恢复优先级，普通和两种压缩完整降级且保持身份隔离", async () => {
+  const seen = [];
+  let daily = 10;
+  let weekly = 20;
+  let fiveHour = 80;
+  let gptWeekly = 80;
+  let reject = new Set();
+  let wlbStatus = 403;
+  let wlbMessage = "每日额度已经用完";
+  let sse = false;
+  let holdWlb = false;
+  let releaseWlb;
+  let wlbArrived = false;
+  let nativeError;
+  const upstream = (provider) => http.createServer(async (request, response) => {
+    if (request.method === "GET") {
+      if (provider === "wlb") {
+        assert.equal(request.headers.authorization, "Bearer test-wlb-key");
+        assert.equal(request.headers["chatgpt-account-id"], undefined);
+        response.end(JSON.stringify({ rate_limits: [{ window: "1d", remaining: daily }, { window: "7d", remaining: weekly }] }));
+      } else {
+        assert.equal(request.headers.authorization, "Bearer auto-official");
+        assert.equal(request.headers["chatgpt-account-id"], "auto-account");
+        response.end(JSON.stringify({ rate_limit: { ...(fiveHour === null ? {} : { primary_window: { used_percent: 100 - fiveHour } }), secondary_window: { used_percent: 100 - gptWeekly } } }));
+      }
+      return;
+    }
+    const chunks = []; for await (const chunk of request) chunks.push(chunk);
+    let bytes = Buffer.concat(chunks);
+    if (request.headers["content-encoding"] === "zstd") bytes = zstdDecompressSync(bytes);
+    const body = JSON.parse(bytes);
+    seen.push({ provider, url: request.url, body });
+    assert.equal(request.headers.authorization, provider === "official" ? "Bearer auto-official" : `Bearer test-${provider}-key`);
+    assert.equal(request.headers["chatgpt-account-id"], provider === "official" ? "auto-account" : undefined);
+    if (provider !== "official") assert.equal(request.url, "/responses");
+    if (provider === "wlb" && holdWlb) {
+      await new Promise((resolve) => { releaseWlb = resolve; wlbArrived = true; });
+    }
+    if (provider === "official" && nativeError) {
+      response.writeHead(429, { "Content-Type": "application/octet-stream", "Retry-After": "9", "X-Original-Error": "native" });
+      response.end(nativeError);
+      return;
+    }
+    if (sse && provider === "wlb") {
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.end('data: {"type":"error","error":{"message":"额度已用完"}}\n\n');
+      return;
+    }
+    if (reject.has(provider)) {
+      response.writeHead(provider === "wlb" ? wlbStatus : 429, { "Content-Type": "application/json", "Retry-After": "7", "X-Original-Error": "retained" });
+      response.end(JSON.stringify({ error: provider === "official" ? { code: "usage_limit_reached", message: "usage limit" } : { message: wlbMessage } }));
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "摘要" }] }], usage: { input_tokens: 3, output_tokens: 2 } }));
+  });
+  const servers = [upstream("wlb"), upstream("official"), upstream("supergpt")];
+  const ports = await Promise.all(servers.map(listen));
+  const router = await startRouter({ WLB_BASE_URL: `http://127.0.0.1:${ports[0]}`, WLB_API_KEY: "test-wlb-key", CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${ports[1]}`, CODEX_ROUTER_GPT_USAGE_URL: `http://127.0.0.1:${ports[1]}/usage`, SUPERGPT_BASE_URL: `http://127.0.0.1:${ports[2]}`, SUPERGPT_API_KEY: "test-supergpt-key", CODEX_ROUTER_AUTO_REFRESH_MS: "0" });
+  const statePath = path.join(router.stateDir, "gpt-route.json");
+  const configured = JSON.stringify({ version: 1, route: "auto", revision: "test-auto-revision" });
+  writeFileSync(statePath, configured);
+  const send = async (mode = "normal", extraHeaders = {}, model = "gpt-auto-test") => {
+    const result = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/responses${mode === "compact" ? "/compact" : ""}`, {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer auto-official", "chatgpt-account-id": "auto-account", ...extraHeaders },
+      body: JSON.stringify({ model, stream: false, client_metadata: { retained: true }, previous_response_id: "foreign-provider-response", tools: [{ type: "function", name: "original", parameters: {} }], input: [{ role: "user", content: "原始上下文" }, { type: "message", role: "assistant", content: [{ type: "output_text", text: "历史输出" }] }, ...(mode === "v2" ? [{ type: "compaction_trigger" }] : [])] }),
+    });
+    return { status: result.status, headers: result.headers, body: await result.text() };
+  };
+  try {
+    for (const [d, w, five, week, expected] of [
+      [10, 20, 80, 80, "wlb"], [0, 20, 80, 80, "official"],
+      [0, 20, 80, 2, "supergpt"], [0, 20, 80, 1, "supergpt"], [0, 20, 80, 0, "supergpt"],
+      [0, 20, 80, 3, "official"], [0, 20, 5, 2, "supergpt"],
+      [0, 20, 80, 2, "supergpt"], [0, 20, 5, 3, "supergpt"], [0, 20, 6, 3, "official"],
+      [10, 0, 5, 80, "supergpt"], [0, 20, null, 2, "supergpt"],
+      [0, 20, null, 3, "official"], [10, 20, 80, 80, "wlb"],
+    ]) {
+      daily = d; weekly = w; fiveHour = five; gptWeekly = week;
+      const before = seen.length;
+      assert.equal((await send()).status, 200);
+      assert.deepEqual(seen.slice(before).map((item) => item.provider), [expected]);
+      const status = JSON.parse(readFileSync(path.join(router.stateDir, "auto-route-status.json"), "utf8"));
+      assert.equal(status.snapshot.route, expected);
+      assert.equal(status.configuredRevision, "test-auto-revision");
+      assert.equal(JSON.stringify(status).includes("auto-official"), false);
+      assert.equal(readFileSync(statePath, "utf8"), configured);
+    }
+    reject = new Set(["wlb", "official"]);
+    for (const mode of ["normal", "compact", "v2"]) {
+      const before = seen.length;
+      assert.equal((await send(mode)).status, 200, mode);
+      const attempts = seen.slice(before);
+      assert.deepEqual(attempts.map((item) => item.provider), ["wlb", "official", "supergpt"], mode);
+      assert.deepEqual(attempts[1].body.client_metadata, { retained: true });
+      assert.equal(attempts[0].body.previous_response_id, undefined);
+      assert.equal(attempts[1].body.previous_response_id, undefined);
+      assert.equal(attempts[2].body.previous_response_id, undefined);
+      assert.equal(attempts[1].body.input[0].content, "原始上下文");
+      assert.equal(attempts[1].body.input[1].content[0].text, "历史输出");
+      assert.equal(attempts[1].body.tools[0].name, "original");
+      if (mode === "v2") assert.equal(attempts[1].body.input.at(-1).type, "compaction_trigger");
+      assert.equal(readFileSync(statePath, "utf8"), configured);
+    }
+    reject = new Set(["wlb"]); wlbMessage = "too many requests";
+    for (const status of [401, 429]) {
+      wlbStatus = status;
+      for (const mode of ["normal", "compact", "v2"]) {
+        const before = seen.length;
+        const result = await send(mode);
+        assert.equal(result.status, status);
+        assert.equal(result.headers.get("retry-after"), "7");
+        assert.deepEqual(seen.slice(before).map((item) => item.provider), ["wlb"]);
+      }
+    }
+    reject = new Set(); sse = true;
+    const beforeSse = seen.length;
+    assert.equal((await send()).status, 200);
+    assert.deepEqual(seen.slice(beforeSse).map((item) => item.provider), ["wlb"]);
+    sse = false;
+    const beforeSubagent = seen.length;
+    assert.equal((await send("normal", { "x-openai-subagent": "true" })).status, 200);
+    assert.equal((await send("normal", {}, "codex-auto-review")).status, 200);
+    assert.deepEqual(seen.slice(beforeSubagent).map((item) => item.provider), ["official", "official"]);
+    reject = new Set(["wlb"]); wlbStatus = 403; wlbMessage = "额度已用完"; holdWlb = true;
+    for (const mode of ["normal", "compact", "v2"]) {
+      for (const choice of ["official", "wlb", "supergpt"]) {
+        writeFileSync(statePath, configured); wlbArrived = false;
+        const before = seen.length;
+        const pending = send(mode);
+        await waitUntil(() => wlbArrived, "auto WLB did not receive request");
+        const chosen = JSON.stringify({ version: 1, route: choice, revision: `manual-${mode}-${choice}` });
+        writeFileSync(statePath, chosen);
+        releaseWlb();
+        const result = await pending;
+        assert.equal(result.status, choice === "official" ? 200 : 403, `${mode}: ${choice}`);
+        assert.deepEqual(seen.slice(before).map((item) => item.provider), choice === "official" ? ["wlb", "official"] : ["wlb"]);
+        assert.equal(readFileSync(statePath, "utf8"), chosen);
+      }
+    }
+    writeFileSync(statePath, configured); wlbArrived = false;
+    const abort = new AbortController();
+    const beforeCancel = seen.length;
+    const canceled = fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/responses`, {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer auto-official", "chatgpt-account-id": "auto-account" },
+      body: JSON.stringify({ model: "gpt-auto-test", input: [] }), signal: abort.signal,
+    });
+    await waitUntil(() => wlbArrived, "auto cancel request did not reach WLB");
+    abort.abort();
+    await assert.rejects(canceled, { name: "AbortError" });
+    releaseWlb(); holdWlb = false;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.deepEqual(seen.slice(beforeCancel).map((item) => item.provider), ["wlb"]);
+    daily = 0; nativeError = Buffer.from([0xff, 0xfe, 0x00, 0x41]);
+    const beforeNativeError = seen.length;
+    const nativeResponse = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/responses`, {
+      method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer auto-official", "chatgpt-account-id": "auto-account" },
+      body: JSON.stringify({ model: "gpt-auto-test", input: [] }),
+    });
+    assert.equal(nativeResponse.status, 429);
+    assert.equal(nativeResponse.headers.get("retry-after"), "9");
+    assert.equal(nativeResponse.headers.get("x-original-error"), "native");
+    assert.deepEqual(Buffer.from(await nativeResponse.arrayBuffer()), nativeError);
+    assert.deepEqual(seen.slice(beforeNativeError).map((item) => item.provider), ["official"]);
+    // 自动模式官方错误限读 64 KiB；超限明确失败，不能误判并发送到下一档。
+    nativeError = Buffer.alloc(64 * 1024 + 1, 0x41);
+    const beforeOversize = seen.length;
+    assert.equal((await send()).status, 502);
+    assert.deepEqual(seen.slice(beforeOversize).map((item) => item.provider), ["official"]);
+    const events = usageEvents(router.stateDir);
+    assert.ok(events.some((event) => event.provider === "openai" && event.status === 429));
+    assert.ok(events.some((event) => event.provider === "supergpt-relay" && event.status === 200));
+  } finally { await router.close(); await Promise.all(servers.map(close)); }
 });

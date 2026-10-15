@@ -103,3 +103,44 @@ test("缺少 pwsh 时兼容 Windows PowerShell；两个 shell 均失败时保留
   assert.equal(privateFileIsProtected(GPT_ROUTE_PATH), true);
   assertClean();
 });
+
+
+test("auto 仅限主代理且要求双供应商凭据，诊断状态绑定 revision 并保持私有", async () => {
+  const { writeAutoRouteStatus, readAutoRouteStatus, AUTO_ROUTE_STATUS_PATH } = await import("../src/auto-route-state.mjs");
+  const savedWlb = process.env.WLB_API_KEY;
+  const savedSuper = process.env.SUPERGPT_API_KEY;
+  process.env.WLB_API_KEY = "test-wlb-auto";
+  delete process.env.SUPERGPT_API_KEY;
+  try {
+    await assert.rejects(setGptRoute("auto"), /SuperGPT 未配置密钥/);
+    process.env.SUPERGPT_API_KEY = "test-super-auto";
+    await assert.rejects(setSubagentRoute("auto"), /路由必须/);
+    await setGptRoute("auto");
+    const configured = readGptRouteSnapshot();
+    const snapshot = { route: "official", checkedAt: new Date().toISOString(), degraded: false, wlb: { daily: { status: "valid", remaining: 0 }, weekly: { status: "valid", remaining: 5 }, available: false }, gpt: { fiveHour: { status: "valid", remainingPercent: 70 }, weekly: { status: "missing" }, available: true }, errors: [], authorization: "must-not-persist" };
+    await writeAutoRouteStatus(snapshot, configured);
+    assert.equal(privateFileIsProtected(AUTO_ROUTE_STATUS_PATH), true);
+    assert.equal(readAutoRouteStatus(configured).route, "official");
+    assert.equal(readFileSync(AUTO_ROUTE_STATUS_PATH, "utf8").includes("must-not-persist"), false);
+    assert.equal(readGptRouteSnapshot().route, "auto");
+    const { collectStatus } = await import("../src/status.mjs");
+    const status = await collectStatus();
+    assert.equal(status.gptRoute.mode, "auto");
+    assert.equal(status.gptRoute.effectiveMode, "official");
+    assert.equal(status.gptRoute.auto.gpt.fiveHour.remainingPercent, 70);
+    assert.equal(status.gptRoute.ready, false, "environment-only credentials are not persistent readiness");
+    await setGptRoute("auto");
+    assert.equal(readAutoRouteStatus(readGptRouteSnapshot()), null, "old revision must be hidden");
+    const pending = await collectStatus();
+    assert.equal(pending.gptRoute.effectiveMode, null);
+    assert.equal(pending.gptRoute.auto.reason, "pending");
+    await writeAutoRouteStatus(snapshot, configured);
+    assert.equal(readAutoRouteStatus(readGptRouteSnapshot()), null, "stale writer must not become current");
+    await setGptRoute("official");
+    assert.equal(readAutoRouteStatus(readGptRouteSnapshot()), null);
+    assertClean();
+  } finally {
+    if (savedWlb === undefined) delete process.env.WLB_API_KEY; else process.env.WLB_API_KEY = savedWlb;
+    if (savedSuper === undefined) delete process.env.SUPERGPT_API_KEY; else process.env.SUPERGPT_API_KEY = savedSuper;
+  }
+});

@@ -106,7 +106,7 @@ const EXPLICIT_QUOTA_PATTERNS = [
   // exhausted balance or quota in Chinese.
   /余额不足/,
   /欠费/,
-  /额度(?:不足|已用完)/,
+  /额度(?:不足|(?:已|已经)(?:用完|耗尽|用尽))/,
 ];
 
 const QUOTA_HINT_PATTERNS = [

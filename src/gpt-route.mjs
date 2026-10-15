@@ -18,7 +18,8 @@ export const GPT_ROUTES = new Map([
   ["wlb", { label: "WLB", provider: "wlb-relay" }],
   ["supergpt", { label: "SuperGPT", provider: "supergpt-relay" }],
 ]);
-export const SUBAGENT_ROUTES = GPT_ROUTES;
+export const SUBAGENT_ROUTES = new Map(GPT_ROUTES);
+GPT_ROUTES.set("auto", { label: "自动（WLB → 官方 → SuperGPT）" });
 
 function readRouteSnapshot(statePath, routes, description, repairCommand) {
   const routePrefix = repairCommand.startsWith("subagent ") ? "route subagent " : "route ";
@@ -57,7 +58,7 @@ export function readSubagentRoute() {
 }
 
 async function setRoute(statePath, routes, route, description, repairCommand, { expected, signal } = {}) {
-  if (!routes.has(route)) throw new Error("路由必须为 official、wlb 或 supergpt。");
+  if (!routes.has(route)) throw new Error(`路由必须为 ${[...routes.keys()].join("、")}。`);
   assertStateOwnership(`切换${description}`);
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   // 手动切换和自动回退使用同一把跨进程锁，检查版本与写入不能被另一写入插入。
@@ -72,8 +73,10 @@ async function setRoute(statePath, routes, route, description, repairCommand, { 
       const current = readRouteSnapshot(statePath, routes, ` ${description}设置`, repairCommand);
       if (current.route !== expected.route || current.revision !== expected.revision) return false;
     }
-    const { provider, label } = routes.get(route);
-    if (provider) {
+    const required = route === "auto" ? ["wlb", "supergpt"] : [route];
+    for (const choice of required) {
+      const { provider, label } = routes.get(choice);
+      if (!provider) continue;
       if (!readProviderSelection().includes(provider)) {
         throw new Error(`${label} 尚未启用，请先配置并启用 ${provider}。`);
       }
@@ -111,7 +114,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const expectedLength = isSubagent ? (args.length === 1 ? 1 : 2) : (args.length === 0 ? 0 : 1);
   const routes = isSubagent ? SUBAGENT_ROUTES : GPT_ROUTES;
   if (args.length !== expectedLength || (command !== "status" && !routes.has(command))) {
-    console.error("用法：route [subagent] official|wlb|supergpt|status");
+    console.error("用法：route official|wlb|supergpt|auto|status；route subagent official|wlb|supergpt|status");
     process.exitCode = 2;
   } else {
     try {

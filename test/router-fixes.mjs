@@ -2028,11 +2028,11 @@ test("auto 主代理按额度阈值恢复优先级，普通和两种压缩完整
   try {
     for (const [d, w, five, week, expected] of [
       [10, 20, 80, 80, "wlb"], [0, 20, 80, 80, "official"],
-      [0, 20, 80, 2, "supergpt"], [0, 20, 80, 1, "supergpt"], [0, 20, 80, 0, "supergpt"],
-      [0, 20, 80, 3, "official"], [0, 20, 5, 2, "supergpt"],
-      [0, 20, 80, 2, "supergpt"], [0, 20, 5, 3, "supergpt"], [0, 20, 6, 3, "official"],
+      [0, 20, 80, 5, "supergpt"], [0, 20, 80, 4, "supergpt"], [0, 20, 80, 0, "supergpt"],
+      [0, 20, 80, 6, "official"], [0, 20, 10, 5, "supergpt"],
+      [0, 20, 80, 5, "supergpt"], [0, 20, 10, 6, "supergpt"], [0, 20, 11, 6, "official"],
       [10, 0, 5, 80, "supergpt"], [0, 20, null, 2, "supergpt"],
-      [0, 20, null, 3, "official"], [10, 20, 80, 80, "wlb"],
+      [0, 20, null, 5, "supergpt"], [0, 20, null, 6, "official"], [10, 20, 80, 80, "wlb"],
     ]) {
       daily = d; weekly = w; fiveHour = five; gptWeekly = week;
       const before = seen.length;

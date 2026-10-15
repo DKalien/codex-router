@@ -27,31 +27,31 @@ function fixture(options = {}) {
   return { controller, calls, set: (w, g) => { wlbValue = w; gptValue = g; }, tick: () => { time += 100; }, fail: (name) => { failure = name; } };
 }
 
-test("GPT 5h阈值等号和原始浮点边界，周实际0仍禁用", () => {
-  for (const [used, expected] of [[95, false], [94.999999, true], [95.000001, false]]) assert.equal(parseGptUsage(gpt(used)).available, expected);
+test("GPT 5h 10%阈值等号和原始浮点边界，周实际0仍禁用", () => {
+  for (const [used, expected] of [[90, false], [89.999999, true], [90.000001, false]]) assert.equal(parseGptUsage(gpt(used)).available, expected);
   assert.equal(parseGptUsage(gpt(1, 100)).available, false);
-  assert.equal(parseGptUsage(gpt(1, 97.9)).available, true);
+  assert.equal(parseGptUsage(gpt(1, 94.9)).available, true);
 });
 
-test("无5h时使用周2%阈值，5h-only有效", () => {
-  for (const [used, expected] of [[98, false], [97.999999, true], [98.000001, false]]) {
+test("无5h时使用周5%阈值，5h-only有效", () => {
+  for (const [used, expected] of [[95, false], [94.999999, true], [95.000001, false]]) {
     assert.equal(parseGptUsage({ rate_limits: { secondary: { used_percent: used } } }).available, expected);
   }
-  assert.equal(parseGptUsage({ rate_limits: { primary: { used_percent: 94 } } }).available, true);
+  assert.equal(parseGptUsage({ rate_limits: { primary: { used_percent: 89 } } }).available, true);
 });
 
 test("GPT对象/列表/旧协议/data封装，primary周时长归类", () => {
   const cases = [
-    { rate_limits: [{ window: "7d", usedPercent: 97 }] },
-    { rate_limit: { primary_window: { limit_window_seconds: 604800, used_percent: 97 } } },
-    { rate_limits: { primary: { window_minutes: 10080, used_percent: 97 } } },
-    { data: { rate_limits: [{ type: "weekly", used_percent: 97 }] } },
+    { rate_limits: [{ window: "7d", usedPercent: 93 }] },
+    { rate_limit: { primary_window: { limit_window_seconds: 604800, used_percent: 93 } } },
+    { rate_limits: { primary: { window_minutes: 10080, used_percent: 93 } } },
+    { data: { rate_limits: [{ type: "weekly", used_percent: 93 }] } },
   ];
   for (const value of cases) {
     const parsed = parseGptUsage(value);
     assert.equal(parsed.available, true);
     assert.equal(parsed.fiveHour.status, "missing");
-    assert.equal(parsed.weekly.remainingPercent, 3);
+    assert.equal(parsed.weekly.remainingPercent, 7);
   }
 });
 
@@ -213,22 +213,22 @@ test("刷新进行期间新报告的排除不会被较早发出的刷新清除",
 });
 
 test("null窗口表示不存在，null百分比仍属非法，primary周窗口可搭配null secondary", () => {
-  const weekly = parseGptUsage({ rate_limit: { primary_window: { limit_window_seconds: 604800, used_percent: 97 }, secondary_window: null } });
-  assert.equal(weekly.weekly.remainingPercent, 3);
+  const weekly = parseGptUsage({ rate_limit: { primary_window: { limit_window_seconds: 604800, used_percent: 93 }, secondary_window: null } });
+  assert.equal(weekly.weekly.remainingPercent, 7);
   assert.equal(weekly.fiveHour.status, "missing");
   assert.equal(weekly.available, true);
-  assert.equal(parseGptUsage({ rate_limits: { primary: null, secondary: { used_percent: 97 } } }).available, true);
-  assert.equal(parseGptUsage({ rate_limits: { primary: { used_percent: null }, secondary: { used_percent: 97 } } }).available, null);
+  assert.equal(parseGptUsage({ rate_limits: { primary: null, secondary: { used_percent: 93 } } }).available, true);
+  assert.equal(parseGptUsage({ rate_limits: { primary: { used_percent: null }, secondary: { used_percent: 93 } } }).available, null);
 });
 
 test("双窗口同时监控，任一窗口低于阈值都跳过，必须同时恢复", () => {
-  assert.equal(parseGptUsage(gpt(50, 98)).available, false);
-  assert.equal(parseGptUsage(gpt(50, 97.999999)).available, true);
-  assert.equal(parseGptUsage(gpt(50, 98.000001)).available, false);
-  assert.equal(parseGptUsage(gpt(95, 50)).available, false);
-  assert.equal(parseGptUsage(gpt(94.999999, 50)).available, true);
-  assert.equal(parseGptUsage(gpt(95, 98)).available, false);
-  assert.equal(parseGptUsage(gpt(94, 98)).available, false);
-  assert.equal(parseGptUsage(gpt(94, 1)).available, true);
-  assert.equal(parseGptUsage(gpt(94, 3)).available, true);
+  assert.equal(parseGptUsage(gpt(50, 95)).available, false);
+  assert.equal(parseGptUsage(gpt(50, 94.999999)).available, true);
+  assert.equal(parseGptUsage(gpt(50, 95.000001)).available, false);
+  assert.equal(parseGptUsage(gpt(90, 50)).available, false);
+  assert.equal(parseGptUsage(gpt(89.999999, 50)).available, true);
+  assert.equal(parseGptUsage(gpt(90, 95)).available, false);
+  assert.equal(parseGptUsage(gpt(89, 95)).available, false);
+  assert.equal(parseGptUsage(gpt(89, 4)).available, true);
+  assert.equal(parseGptUsage(gpt(89, 6)).available, true);
 });

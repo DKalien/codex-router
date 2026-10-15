@@ -67,8 +67,8 @@ export function parseGptUsage(value) {
   }
   const fiveHour = gptWindow(primary);
   const weekly = gptWindow(secondary);
-  const lowFiveHour = fiveHour.status === "valid" && fiveHour.remainingPercent <= 5;
-  const lowWeekly = weekly.status === "valid" && weekly.remainingPercent <= 2;
+  const lowFiveHour = fiveHour.status === "valid" && fiveHour.remainingPercent <= 10;
+  const lowWeekly = weekly.status === "valid" && weekly.remainingPercent <= 5;
   const invalidWindow = fiveHour.status === "invalid" || weekly.status === "invalid";
   const available = lowFiveHour || lowWeekly
     ? false

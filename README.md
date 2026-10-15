@@ -5,7 +5,8 @@
 Codex 后端或已配置的第三方服务商。
 
 默认路由是 `official`。对官方目录中的 GPT 模型，主代理遵循全局 `official`/`wlb`/`supergpt`
-开关，已识别的原生 `gpt-*` 子代理固定走官方。选择器选中的 `gpt-*` 模型名原样传给
+开关；已识别的原生 `gpt-*` 子代理默认走官方，也可通过独立的子代理供应商开关选择
+`official`/`wlb`/`supergpt`。选择器选中的 `gpt-*` 模型名原样传给
 WLB 或 SuperGPT，新增模型无需修改本地名单，实际可用性取决于上游及 API key 分组支持。全局设置不绑定
 线程，从下一次非子代理的原生 GPT 请求起对所有任务共享；同一任务中途切换服务商可能带来
 历史上下文兼容风险。MiMo 和 WLB 的旧命名空间 slug 仍保留给旧目录或直接请求
@@ -35,7 +36,8 @@ clean EOF，未发出响应头的请求返回 503。可用 `MODEL_ROUTER_SHUTDOW
 
 ```
 Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.mjs
-    ├─ 已识别的 GPT 子代理      → ChatGPT Codex 后端（透传 Codex 身份验证）
+    ├─ 已识别的 GPT 子代理 + subagent official → ChatGPT Codex 后端（透传 Codex 身份验证）
+    ├─ 已识别的 GPT 子代理 + subagent wlb/supergpt → 对应第三方服务商
     ├─ GPT 主代理 + route official → ChatGPT Codex 后端（透传 Codex 身份验证）
     ├─ GPT 主代理 + route wlb      → WLB Relay（注入 WLB_API_KEY）
     ├─ GPT 主代理 + route supergpt → SuperGPT（注入 SUPERGPT_API_KEY）
@@ -57,8 +59,10 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
   额度恢复后需手动运行 `route wlb` 切回。`route status` 只读；只有总状态命令支持
   `--json`（`status --json`）。该开关不绑定线程，同一任务中途切换服务商可能带来
   历史上下文兼容风险。
-- **GPT 子代理**：已识别的原生 `gpt-*` 子代理固定走官方，普通请求和压缩请求
-  共用规则，且不读取全局路由状态，因此损坏的路由状态也不会阻断已识别的子代理。
+- **GPT 子代理**：已识别的原生 `gpt-*` 子代理默认走官方，普通请求和压缩请求
+  共用规则，且不读取主代理的全局路由状态。可运行 `route subagent official|wlb|supergpt|status`
+  独立切换，选择对所有任务的后续子代理请求共享。供应商未启用、缺少凭据或子代理路由状态
+  损坏时请求失败关闭。子代理上游错误直接返回，不触发 WLB 自动回退，也不改写主代理路由。
   识别复用 `x-openai-subagent`、有效的 `x-codex-parent-thread-id`，或线程 rollout 的
   `source.subagent.thread_spawn`；明确的 `false`/`0` 子代理头不作为证据。rollout 缺失
   或首行未写完时会在下次请求重试；没有可识别证据的请求仍按主代理请求遵循全局开关。
@@ -113,9 +117,11 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
 .\codex-router.ps1 provider-key wlb-relay set        # 使用 WLB 时再配置
 .\codex-router.ps1 provider-key supergpt-relay set   # 使用 SuperGPT 时再配置
 .\codex-router.ps1 route official             # 全局：GPT 主代理请求走官方（默认）
-.\codex-router.ps1 route wlb                  # 全局：GPT 主代理请求走 WLB；原生子代理固定官方
-.\codex-router.ps1 route supergpt             # 全局：GPT 主代理请求走 SuperGPT；原生子代理固定官方
+.\codex-router.ps1 route wlb                  # 全局：GPT 主代理请求走 WLB；子代理供应商另行设置
+.\codex-router.ps1 route supergpt             # 全局：GPT 主代理请求走 SuperGPT
 .\codex-router.ps1 route status               # 查看当前 GPT 路由
+.\codex-router.ps1 route subagent wlb         # 子代理请求走 WLB（独立于主代理）
+.\codex-router.ps1 route subagent status      # 查看子代理供应商
 .\codex-router.ps1 enable
 .\codex-router.ps1 start
 .\codex-router.ps1 disable
@@ -125,7 +131,8 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
 
 POSIX：`bin/install`（兼容入口 `install.sh`）、`bin/provider-key`、`bin/enable`、`bin/disable`、
 `bin/uninstall`、`bin/start`。路由切换使用
-`bin/model-router codex route official|wlb|supergpt|status`；状态检查使用
+`bin/model-router codex route official|wlb|supergpt|status`；子代理使用
+`bin/model-router codex route subagent official|wlb|supergpt|status`；状态检查使用
 `bin/model-router codex status`。这些命令只读取或更新本地状态，不会请求上游服务；
 官方模式的状态检查不依赖静态 8 模型目录。返回码为 0 表示已就绪，1 表示需要处理，
 2 表示参数错误；只有总状态命令支持 `--json`，即 `status --json`。`route status`
@@ -176,7 +183,8 @@ owner 冲突。安装完成后完全退出并重新打开 Codex，使新的本�
   `.\codex-router.ps1 enable`（POSIX：`bin/enable`），再完全重启 Codex。旧目录文件
   不会自动删除；用户自有目录配置仍会拒绝覆盖。
 - 切换 GPT 路由：运行 `route official`、`route wlb` 或 `route supergpt`；设置从下一次非子代理的原生 GPT 请求生效，
-  对所有任务共享且无需重启；已识别的原生 GPT 子代理固定走官方。运行 `route status` 可只读查看当前设置；同一任务中途
+  对所有任务共享且无需重启。子代理供应商使用独立的 `route subagent official|wlb|supergpt|status` 开关，
+  默认官方，同样无需重启；同一任务中途
   切换服务商可能带来历史上下文兼容风险。
 - 服务商协议只接受 `openai-responses`，旧网关协作转换已删除。自定义注册表遗漏
   `protocol` 时，仅在上游原生支持 Responses API 的前提下补入该字段；旧 Chat/Anthropic

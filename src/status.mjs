@@ -4,7 +4,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { credentialStatus } from "./provider-credentials.mjs";
-import { GPT_ROUTES, readGptRoute } from "./gpt-route.mjs";
+import {
+  GPT_ROUTES,
+  SUBAGENT_ROUTES,
+  readGptRoute,
+  readSubagentRoute,
+} from "./gpt-route.mjs";
 import { providerSelectionStatus } from "./provider-selection.mjs";
 import { LISTED_MODELS, PROVIDERS } from "./model-registry.mjs";
 import { readInstallManifest } from "./install-manifest.mjs";
@@ -147,6 +152,25 @@ function gptRouteStatus(providers) {
   }
 }
 
+function subagentRouteStatus(providers) {
+  try {
+    const mode = readSubagentRoute();
+    const selected = providers.providers.find((provider) => provider.id === SUBAGENT_ROUTES.get(mode).provider);
+    return {
+      readable: true,
+      mode,
+      ready: mode === "official" || Boolean(selected?.selected && selected?.configured),
+    };
+  } catch (error) {
+    return {
+      readable: false,
+      mode: "unknown",
+      ready: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 function serviceStatus() {
   const status = childJson("service.mjs", ["status"]);
   return status
@@ -172,6 +196,7 @@ export async function collectStatus() {
   const catalog = catalogStatus();
   const providers = providersStatus();
   const gptRoute = gptRouteStatus(providers);
+  const subagentRoute = subagentRouteStatus(providers);
   const service = serviceStatus();
   const manifest = manifestStatus();
   const selectedProviders = providers.providers.filter((provider) => provider.selected);
@@ -182,6 +207,7 @@ export async function collectStatus() {
     config,
     catalog,
     gptRoute,
+    subagentRoute,
     providers,
     manifest,
     service,
@@ -198,11 +224,15 @@ export function statusIsReady(status, routedProvidersConfigured) {
   const gptRouteReady =
     !status.gptRoute ||
     (status.gptRoute.readable === true && status.gptRoute.ready === true);
+  const subagentRouteReady =
+    !status.subagentRoute ||
+    (status.subagentRoute.readable === true && status.subagentRoute.ready === true);
   return Boolean(
     status.health.ok &&
       status.config.managed &&
       catalogReady &&
       gptRouteReady &&
+      subagentRouteReady &&
       !status.providers.selection.degraded &&
       (officialCatalog ? gptRouteReady : routedProvidersConfigured),
   );
@@ -227,6 +257,11 @@ function printText(status) {
     console.log(`GPT 路由：${status.gptRoute.mode}`);
     if (!status.gptRoute.readable) console.log(`  ${status.gptRoute.error}`);
     else if (!status.gptRoute.ready) console.log(`  ${GPT_ROUTES.get(status.gptRoute.mode).label} 凭据或 provider selection 缺失。`);
+  }
+  if (status.subagentRoute) {
+    console.log(`子代理供应商：${status.subagentRoute.mode}`);
+    if (!status.subagentRoute.readable) console.log(`  ${status.subagentRoute.error}`);
+    else if (!status.subagentRoute.ready) console.log(`  ${SUBAGENT_ROUTES.get(status.subagentRoute.mode).label} 凭据或 provider selection 缺失。`);
   }
   console.log(
     `Provider selection: ${status.providers.selection.explicit ? "explicit" : "default"} (${status.providers.selection.providers.join(", ") || "none"})`,

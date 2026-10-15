@@ -2,6 +2,8 @@
 
 ## Lite 分支（未发布）
 
+- 新增独立的 `route subagent official|wlb|supergpt|status` 开关；已识别的原生
+  `gpt-*` 子代理默认使用官方，也可单独切换到 WLB 或 SuperGPT，不改写主代理路由状态。
 - 审计修复：第三方压缩拒绝 HTTP 200 中的失败、不完整或空摘要，不再替换有效历史；
   普通及压缩上游错误共用 64 KiB 限读和脱敏，并保留 Retry-After。
 - 手动路由设置与 WLB 自动回退共用跨进程锁和 revision 校验，旧请求不能覆盖之后的
@@ -17,7 +19,7 @@
 
 - 新增 `supergpt-relay` 和 `route supergpt`：按官方选择器的原始 `gpt-*` 模型名直接
   转发到 `https://api.supergpt.dev/v1`，通过 `provider-key supergpt-relay set` 安全保存
-  并启用 API key；不新增旧模型条目或生成目录。子代理和模型列表继续走官方，
+  并启用 API key；不新增旧模型条目或生成目录。模型列表继续走官方；
   SuperGPT 上游错误直接返回，不使用 WLB 专属的额度耗尽回退。首次新增配置需重启
   Router，之后路由热切换无需重启；SuperGPT 默认域名直连。
 
@@ -29,8 +31,7 @@
   已退役，旧配置改用 `HTTPS_PROXY`。`NO_PROXY` 保留自定义值，并补入回环地址及
   WLB/MiMo/SuperGPT 默认域名，三个第三方默认直连；自定义 SuperGPT 域名如需
   直连，应加入 `NO_PROXY`。子进程监督、健康检查和 PID 清理保持原语义。
-- 已识别的原生 `gpt-*` 子代理固定走官方；主代理仍遵循全局 `official`/`wlb`/`supergpt`。
-  rollout 首次缺失或首行未写完时允许后续重新识别；显式 WLB/MiMo 命名空间保持原语义。
+- 子代理识别允许在 rollout 首次缺失或首行未写完后重试；显式 WLB/MiMo 命名空间保持原语义。
 
 - zstd 请求使用异步解压，并在进入原生解码器前检查帧头声明尺寸；保留解压输出上限。
 - 第三方普通和压缩请求会将缺少调用 ID 的具名 `codex_app` 工具结果恢复为可读历史，

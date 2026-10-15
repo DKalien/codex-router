@@ -39,7 +39,12 @@ import {
 import { MODEL_BY_SLUG, PROVIDERS, providerForModel } from "./model-registry.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
 import { readNativeRedirect } from "./native-redirect.mjs";
-import { GPT_ROUTES, readGptRouteSnapshot, setGptRoute } from "./gpt-route.mjs";
+import {
+  GPT_ROUTES,
+  readGptRouteSnapshot,
+  readSubagentRouteSnapshot,
+  setGptRoute,
+} from "./gpt-route.mjs";
 import {
   canonicalProviderId,
   readProviderSelection,
@@ -1154,7 +1159,9 @@ async function handleResponses(request, response, requestUrl) {
     if (nativeGpt) {
       let gptRoute;
       try {
-        gptRouteSnapshot = activityMetadata.isSubagent ? undefined : readGptRouteSnapshot();
+        gptRouteSnapshot = (activityMetadata.isSubagent
+          ? readSubagentRouteSnapshot
+          : readGptRouteSnapshot)();
         gptRoute = gptRouteSnapshot?.route || "official";
       } catch (error) {
         writeJson(response, 503, { error: { type: "invalid_gpt_route", message: error.message } });
@@ -1172,8 +1179,8 @@ async function handleResponses(request, response, requestUrl) {
     } else {
       registeredRoute ??= MODEL_BY_SLUG.get(readNativeAliases()[requestedModel]);
     }
-    // 原生 GPT 子代理固定官方，其余 GPT 使用全局开关；旧 alias/redirect 仅保留给其他模型，
-    // 避免选择 official 后仍被历史配置转发到第三方。
+    // 原生 GPT 子代理使用独立供应商开关，其余 GPT 使用全局开关；旧 alias/redirect
+    // 仅保留给其他模型，避免选择 official 后仍被历史配置转发到第三方。
     if (!nativeGpt && !registeredRoute && requestedModel) {
       const redirect = MODEL_BY_SLUG.get(readNativeRedirect());
       if (redirect && readProviderSelection().includes(redirect.provider)) {

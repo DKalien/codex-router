@@ -101,7 +101,7 @@ async function startRouter(overrides = {}) {
   };
 }
 
-test("原生 GPT 主代理遵循全局路由，子代理固定官方，旧命名空间和错误边界保持不变", async () => {
+test("原生 GPT 主代理和子代理分别遵循各自供应商路由，旧命名空间和错误边界保持不变", async () => {
   const received = [];
   const receivedUrls = [];
   const catalog = { models: [{ slug: "gpt-new-model", context_window: 123456, future_capability: true }] };
@@ -139,10 +139,13 @@ test("原生 GPT 主代理遵循全局路由，子代理固定官方，旧命名
     CODEX_ROUTER_SESSIONS_PATH: "",
     CODEX_ROUTER_SESSION_INDEX: "",
   });
-  const cli = (command, extraEnv = {}) => spawnSync(process.execPath, [path.join(root, "src/gpt-route.mjs"), command], {
-    encoding: "utf8",
-    env: { ...process.env, CODEX_HOME: router.stateDir, MODEL_ROUTER_STATE_DIR: router.stateDir, WLB_API_KEY: "test-wlb-key", ...extraEnv },
-  });
+  const cli = (...args) => {
+    const extraEnv = args.at(-1) && typeof args.at(-1) === "object" ? args.pop() : {};
+    return spawnSync(process.execPath, [path.join(root, "src/gpt-route.mjs"), ...args], {
+      encoding: "utf8",
+      env: { ...process.env, CODEX_HOME: router.stateDir, MODEL_ROUTER_STATE_DIR: router.stateDir, WLB_API_KEY: "test-wlb-key", ...extraEnv },
+    });
+  };
   const request = async (model, endpoint = "responses", headers = {}, input = [{ role: "user", content: "你好" }]) => {
     const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/${endpoint}`, {
       method: "POST",
@@ -173,6 +176,10 @@ test("原生 GPT 主代理遵循全局路由，子代理固定官方，旧命名
     assert.equal((await request("gpt-new-model", "responses/compact")).status, 200);
     assert.equal(received.at(-1).provider, "wlb");
     assert.equal(received.at(-1).model, "gpt-new-model");
+    assert.equal(cli("subagent", "wlb").status, 0);
+    assert.equal((await request("gpt-new-model", "responses", { "x-openai-subagent": "true" })).status, 200);
+    assert.equal(received.at(-1).provider, "wlb");
+    assert.equal(cli("subagent", "official").status, 0);
     const compactV2Input = [{ role: "user", content: "你好" }, { type: "compaction_trigger" }];
     const endpoints = [["responses", undefined], ["responses/compact", undefined], ["responses", compactV2Input]];
     const parentId = "00000000-0000-4000-8000-000000000001";
@@ -241,6 +248,7 @@ test("原生 GPT 主代理遵循全局路由，子代理固定官方，旧命名
     assert.equal((await request("wlb-relay/gpt-5.6-sol", "responses", markers[0])).status, 200);
     assert.equal(received.at(-1).provider, "wlb");
     assert.equal(cli("invalid").status, 2);
+    assert.equal(cli("subagent", "invalid").status, 2);
     assert.match(cli("status").stdout, /official/);
   } finally {
     await router.close();

@@ -18,7 +18,7 @@
 
 - `src/router.mjs` — 完整请求路径（官方请求透传、全局 GPT 路由，以及注入各服务商
   凭据后的旧命名空间直接转发）
-- `src/gpt-route.mjs` — 读写非子代理的原生 GPT 请求的全局路由状态，默认使用官方路由
+- `src/gpt-route.mjs` — 读写主代理和子代理各自的原生 GPT 路由状态，默认均使用官方路由
 - `src/model-registry.mjs` — 加载并验证 `config/**`；已列出模型的字段可选，但
   提供时必须通过验证；服务商必须显式声明 `protocol: openai-responses`，不保留旧网关协议转换
 - `src/response-usage.mjs` — 从 JSON/SSE 响应提取 Token 用量；上游省略
@@ -49,13 +49,15 @@
 - 不提供模型元数据更新或静态目录生成入口，也不写入 `model_catalog_json`；官方
   目录由 Codex 自己更新。服务商密钥操作不得触发目录重建。保留旧目录状态读取和
   配置迁移兼容；MiMo 的两个及 WLB 的三个命名空间 slug 继续由路由器转发。
-- `route official|wlb|supergpt|status` 管理或读取全局 GPT 路由；缺少状态文件时默认为
-  `official`。设置从下一次非子代理的原生 GPT 请求起对所有任务共享，不绑定线程；已识别的
-  原生 `gpt-*` 子代理固定走官方，不读取全局路由状态。识别复用子代理/父线程请求头和
+- `route official|wlb|supergpt|status` 管理或读取主代理全局 GPT 路由；`route subagent
+  official|wlb|supergpt|status` 管理独立的子代理供应商路由。缺少状态文件时均默认为
+  `official`。主代理设置从下一次非子代理的原生 GPT 请求起对所有任务共享，不绑定线程；
+  子代理设置对所有任务的已识别原生 `gpt-*` 子代理共享，不读取主代理路由状态，
+  上游错误直接返回，不触发 WLB 自动回退。识别复用子代理/父线程请求头和
   rollout 的 `source.subagent.thread_spawn`；缺失或未写完的 rollout 不缓存负结果，
-  没有可识别证据时仍遵循全局路由。显式 `wlb-relay/*` 与 MiMo 路由保持原语义。
+  没有可识别证据时仍遵循主代理全局路由。显式 `wlb-relay/*` 与 MiMo 路由保持原语义。
   同一任务中途切换服务商可能带来历史上下文兼容风险。`wlb` 原样转发请求中的 `gpt-*` 模型名，不依赖旧目录注册，
-  上游不支持时返回错误；仅明确额度耗尽且尚未输出时自动保存为 `official`，默认立即
+  上游不支持时返回错误；仅主代理明确额度耗尽且尚未输出时自动保存为 `official`，默认立即
   使用原始 Codex 身份继续普通或压缩请求。手动设置和回退共用跨进程锁，
   回退在锁内核对请求发出时的 route/revision；期间手动切换或同路由重选后，保留新
   状态并返回原错误。Windows 路由临时文件的 ACL 异步设置优先 pwsh，失败时回退

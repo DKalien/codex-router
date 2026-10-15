@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -7,7 +7,14 @@ import test from "node:test";
 const sandbox = mkdtempSync(path.join(os.tmpdir(), "codex-router-route-async-"));
 process.env.MODEL_ROUTER_STATE_DIR = sandbox;
 process.env.CODEX_HOME = path.join(sandbox, "codex-home");
-const { GPT_ROUTE_PATH, readGptRouteSnapshot, setGptRoute } = await import("../src/gpt-route.mjs");
+const {
+  GPT_ROUTE_PATH,
+  SUBAGENT_ROUTE_PATH,
+  readGptRouteSnapshot,
+  readSubagentRouteSnapshot,
+  setGptRoute,
+  setSubagentRoute,
+} = await import("../src/gpt-route.mjs");
 const { privateFileIsProtected } = await import("../src/file-security.mjs");
 test.after(() => rmSync(sandbox, { recursive: true, force: true }));
 
@@ -44,6 +51,26 @@ test("并发 expected 切换在锁内复核，旧 revision 只能提交一次", 
   ]);
   assert.deepEqual(results.sort(), [false, "official"].sort());
   assertClean();
+});
+
+test("子代理供应商使用独立状态文件并保持默认官方", async () => {
+  assert.equal(readSubagentRouteSnapshot().route, "official");
+  await setSubagentRoute("official");
+  const snapshot = readSubagentRouteSnapshot();
+  assert.equal(snapshot.route, "official");
+  assert.equal(typeof snapshot.revision, "string");
+  assert.equal(privateFileIsProtected(SUBAGENT_ROUTE_PATH), true);
+  assert.equal(readGptRouteSnapshot().route, "official");
+  assert.equal(privateFileIsProtected(GPT_ROUTE_PATH), true);
+});
+
+test("子代理状态损坏时提示独立修复命令", () => {
+  writeFileSync(SUBAGENT_ROUTE_PATH, "broken");
+  assert.throws(
+    () => readSubagentRouteSnapshot(),
+    /route subagent official、route subagent wlb 或 route subagent supergpt/,
+  );
+  rmSync(SUBAGENT_ROUTE_PATH, { force: true });
 });
 
 test("异步 ACL 期间取消保留旧路由并清理临时文件", { skip: process.platform !== "win32" }, async () => {

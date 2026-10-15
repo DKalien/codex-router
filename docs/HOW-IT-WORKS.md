@@ -3,7 +3,7 @@
 Codex Router Lite 只包含一个本地 Node 路由器。Codex 继续使用内置的 `openai`
 服务商，但由路由器管理的 `openai_base_url` 指向本地路由器。默认安装不写入
 `model_catalog_json`，因此 Codex 继续使用并自行更新官方模型目录。路由器根据请求
-中的模型 slug、子代理元数据和全局 GPT 路由设置选择官方处理或第三方路由处理。
+中的模型 slug、子代理元数据以及主代理/子代理各自的 GPT 路由设置选择官方处理或第三方路由处理。
 
 ## 请求流程
 
@@ -17,13 +17,13 @@ sequenceDiagram
   participant S as SuperGPT
 
   C->>R: 携带 caller URL 的 Responses 请求
-  alt 已识别的原生 GPT 子代理或 GPT 主代理 + route official
+  alt 已识别的原生 GPT 子代理 + subagent official 或 GPT 主代理 + route official
     R->>N: 白名单 Codex 请求头和原生模型
     N-->>R: Responses 响应或数据流
-  else GPT 主代理 + route wlb
+  else 已识别的原生 GPT 子代理 + subagent wlb 或 GPT 主代理 + route wlb
     R->>W: 同名 GPT 模型和 WLB 密钥
     W-->>R: Responses 响应或数据流
-  else GPT 主代理 + route supergpt
+  else 已识别的原生 GPT 子代理 + subagent supergpt 或 GPT 主代理 + route supergpt
     R->>S: /v1/responses、同名 GPT 模型和 SuperGPT 密钥
     S-->>R: Responses 响应或数据流
   else mimo-token-plan/*（旧命名空间）
@@ -101,16 +101,18 @@ MiMo 的两个及 WLB 的三个命名空间 slug 保留给已有目录或直接�
 
 ## 路由和凭据
 
-`src/gpt-route.mjs` 将 `official`、`wlb` 或 `supergpt` 写入状态目录；文件不存在时默认使用
-`official`。这是全局设置，不绑定线程，从下一次非子代理的原生 GPT 请求起对所有任务共享。使用
+`src/gpt-route.mjs` 分别将主代理选择写入 `gpt-route.json`、子代理选择写入
+`subagent-route.json`，取值均为 `official`、`wlb` 或 `supergpt`；文件不存在时默认使用
+`official`。两个开关各自对所有任务共享，从下一次对应角色的原生 GPT 请求起生效。使用
 `wlb` 或 `supergpt` 时，`src/router.mjs` 将请求中的 `gpt-*` 模型名原样发送给对应
 服务商，不依赖旧静态模型名单；SuperGPT 不新增旧命名空间模型条目。官方新增模型
-无需修改 Router，模型可用性取决于上游及 API key 分组；上游不支持时返回其错误。只有 WLB
-明确的额度耗尽会自动保存为 `official`，默认立即以原始 Codex 身份重发
+无需修改 Router，模型可用性取决于上游及 API key 分组；上游不支持时返回其错误。只有主代理的
+WLB 请求明确额度耗尽时，才自动保存主代理路由为 `official`，默认立即以原始 Codex 身份重发
 当前尚未输出的请求；后续 GPT 主代理请求也走官方。普通限流、认证失败、套餐不包含
 API 和已开始输出的流不切换；没有非空官方 `Authorization` 或状态保存失败时不访问
 官方。状态损坏或 owner 校验失败时停止切换并报告错误。显式 `wlb-relay/*`、MiMo
-和固定官方的子代理保持原语义；额度恢复后需手动运行 `route wlb`。路由文件保持
+保持原语义；子代理请求不触发自动回退，也不改写主代理状态。主代理额度恢复后需手动运行
+`route wlb`。路由文件保持
 version 1，并在每次写入时生成新 revision，兼容没有 revision 的旧文件。手动设置
 和自动回退共用跨进程锁；回退在锁内核对请求发出时的 route/revision。Windows
 在锁内异步设置临时文件的私有 ACL，优先 `pwsh.exe`，失败时回退 `powershell.exe`，
@@ -120,22 +122,24 @@ version 1，并在每次写入时生成新 revision，兼容没有 revision 的�
 默认 0。客户端取消会终止等待；路由器关闭后不会再向官方重发。这个等待发生在
 路由器内，不修改 Codex 客户端的重连间隔；更新源码后需重启服务。正在执行的任务中途切换服务商可能带来
 历史上下文兼容风险。SuperGPT 错误直接返回，不使用 WLB 专属回退或修改路由状态。
-首次新增服务商配置需重启 Router，之后 `route official|wlb|supergpt` 热切换无需重启。
-`route status` 只读；`--json` 仅由总状态命令支持。
+首次新增服务商配置需重启 Router，之后主代理的 `route official|wlb|supergpt` 和子代理的
+`route subagent official|wlb|supergpt` 热切换无需重启。`route status` 与 `route subagent status`
+只读；`--json` 仅由总状态命令支持。
 
-对于原生 `gpt-*`，已识别的子代理固定走官方：复用 `x-openai-subagent`（忽略明确
+对于原生 `gpt-*`，已识别的子代理使用独立的子代理供应商路由，默认官方：复用 `x-openai-subagent`（忽略明确
 的 `false`/`0`）、有效的 `x-codex-parent-thread-id` 或线程 rollout 中的
 `source.subagent.thread_spawn`。首次请求时 rollout 缺失或首行未写完不会缓存负结果，
-后续请求会重新识别；没有可识别证据时仍按主代理请求遵循全局路由。子代理固定官方
-不读取全局状态，因此损坏的全局状态只阻断 GPT 主代理请求。此规则同时覆盖
+后续请求会重新识别；没有可识别证据时仍按主代理请求遵循全局路由。子代理请求
+不读取主代理状态文件，任一状态文件损坏只阻断对应角色的原生 GPT 请求。子代理选择
+第三方时也需启用该服务商并配置凭据；上游错误直接返回。此规则同时覆盖
 `/responses`、`/responses/compact` 和 `/responses` 内以 `compaction_trigger` 触发的
-压缩 v2；没有独立的 `/responses/compact/v2` 端点。WLB 额度耗尽转官方同样覆盖
+压缩 v2；没有独立的 `/responses/compact/v2` 端点。主代理 WLB 额度耗尽转官方同样覆盖
 这三种请求，并从原始请求重建官方请求体，保留原端点、模型、工具及官方身份，复用
 原生历史清理；WLB 密钥不会带到官方。官方返回错误时直接透传，不循环切换。显式 `wlb-relay/*` 与 MiMo
 命名空间路由保持原语义。
 
 官方路由使用白名单 Codex 请求头并保留客户端 `Authorization`，将请求转发给原生
-Codex 后端；GPT 主代理的 `wlb` 或 `supergpt` 路由注入对应密钥并使用同名 GPT 模型。独立的 `/alpha/search` 搜索
+Codex 后端；主代理或子代理选择 `wlb` 或 `supergpt` 时注入对应密钥并使用同名 GPT 模型。独立的 `/alpha/search` 搜索
 请求和图片请求也只会转发给原生后端，并且必须
 携带非空的 `Authorization`，否则本地直接返回 `401`，不访问上游。原生 SSE
 已经观察到 `response.completed` 后，即使客户端紧接着关闭连接，也按 upstream status
@@ -257,10 +261,10 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | `src/response-usage.mjs` | 从 JSON 或 SSE 响应提取 Token 用量并保持响应透传 |
 | `src/sse-prefix.mjs` | 有界识别无 `content-type` 的 SSE 并保持探测字节顺序 |
 | `src/sse-events.mjs` | 有界 SSE 事件解析、多行 data、CR/LF/CRLF 和原字节还原 |
-| `src/gpt-route.mjs` | 读取全局路由，串行化手动设置与有条件的自动回退，默认官方路由 |
+| `src/gpt-route.mjs` | 分别读写主代理和子代理路由状态，各自加锁并原子写入；主代理支持有条件的自动回退 |
 | `src/model-registry.mjs` | 加载并验证服务商和模型 |
 | `src/start.mjs` | 监督一个路由器子进程并提供代理环境 |
-| `src/status.mjs` | 只读汇总路由器、配置、目录模式、GPT 路由、Provider、安装和服务状态 |
+| `src/status.mjs` | 只读汇总路由器、配置、目录模式、主代理/子代理 GPT 路由、Provider、安装和服务状态 |
 | `src/service-windows.mjs` | 管理 Windows 计划任务，先优雅排空再强杀已验证的监督进程树，启动/重启等待健康检查 |
 | `config/mimo/`、`config/wlb/`、`config/supergpt/` | 三个服务商的描述文件及已有模型片段 |
 | `test/official-catalog.mjs` | 检查官方目录状态、旧配置迁移、多代理子表去重及密钥操作不重建目录 |

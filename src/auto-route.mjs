@@ -100,6 +100,8 @@ export function createAutoRouteController({
   timeoutMs = 5000,
   now = Date.now,
   fetchImpl = globalThis.fetch,
+  queryWlb = true,
+  routeOrder = ROUTES,
 }) {
   const cache = new Map();
   async function query(url, headers, parser) {
@@ -120,29 +122,37 @@ export function createAutoRouteController({
   }
   async function refresh(entry, headers) {
     const exclusions = new Map(entry.excluded);
-    const results = await Promise.allSettled([
-      (async () => {
+    const requests = [];
+    if (queryWlb) {
+      requests.push((async () => {
         const { baseUrl, credential } = getWlbConnection();
         if (typeof credential !== "string" || !credential || typeof baseUrl !== "string" || !baseUrl.trim()) throw unavailable();
         let base = baseUrl.trim().replace(/\/+$/, "");
         if (!/\/v1\/usage$/i.test(base)) base += /\/v1$/i.test(base) ? "/usage" : "/v1/usage";
-        return query(base, { authorization: `Bearer ${credential}` }, parseWlbUsage);
-      })(),
-      (async () => {
-        if (typeof headers.authorization !== "string" || !headers.authorization.trim()) throw unavailable();
-        const identity = { authorization: headers.authorization, "User-Agent": "Mozilla/5.0 Codex-Usage/1.0", Originator: "codex-cli" };
-        if (typeof headers["chatgpt-account-id"] === "string") identity["chatgpt-account-id"] = headers["chatgpt-account-id"];
-        return query(officialUsageUrl, identity, parseGptUsage);
-      })(),
-    ]);
-    entry.errors = [];
-    for (const [index, name] of ["wlb", "gpt"].entries()) {
-      const result = results[index];
-      const route = index === 0 ? "wlb" : "official";
-      entry[name] = result.status === "fulfilled" ? result.value : null;
-      if (result.status !== "fulfilled" || result.value.available === null) entry.errors.push(`${name}: 额度查询失败或数据无效`);
-      else if (entry.excluded.get(route) === exclusions.get(route)) entry.excluded.delete(route);
+        return query(base, { authorization: "Bearer " + credential }, parseWlbUsage);
+      })());
     }
+    requests.push((async () => {
+      if (typeof headers.authorization !== "string" || !headers.authorization.trim()) throw unavailable();
+      const identity = { authorization: headers.authorization, "User-Agent": "Mozilla/5.0 Codex-Usage/1.0", Originator: "codex-cli" };
+      if (typeof headers["chatgpt-account-id"] === "string") identity["chatgpt-account-id"] = headers["chatgpt-account-id"];
+      return query(officialUsageUrl, identity, parseGptUsage);
+    })());
+    const results = await Promise.allSettled(requests);
+    entry.errors = [];
+    let index = 0;
+    if (queryWlb) {
+      const result = results[index++];
+      entry.wlb = result.status === "fulfilled" ? result.value : null;
+      if (result.status !== "fulfilled" || result.value.available === null) entry.errors.push("wlb: 额度查询失败或数据无效");
+      else if (entry.excluded.get("wlb") === exclusions.get("wlb")) entry.excluded.delete("wlb");
+    } else {
+      entry.wlb = null;
+    }
+    const gptResult = results[index];
+    entry.gpt = gptResult.status === "fulfilled" ? gptResult.value : null;
+    if (gptResult.status !== "fulfilled" || gptResult.value.available === null) entry.errors.push("gpt: 额度查询失败或数据无效");
+    else if (entry.excluded.get("official") === exclusions.get("official")) entry.excluded.delete("official");
     if (results.some((result) => result.status === "fulfilled" && result.value.available !== null)
       && entry.excluded.get("supergpt") === exclusions.get("supergpt")) entry.excluded.delete("supergpt");
     entry.checkedAt = new Date(now()).toISOString();
@@ -170,7 +180,7 @@ export function createAutoRouteController({
       const states = { wlb: entry.wlb?.available ?? null, official: entry.gpt?.available ?? null, supergpt: true };
       for (const route of entry.excluded.keys()) states[route] = false;
       let route;
-      for (const candidate of ROUTES) {
+      for (const candidate of routeOrder) {
         if (states[candidate] === false) continue;
         if (states[candidate] === true) route = candidate;
         break;

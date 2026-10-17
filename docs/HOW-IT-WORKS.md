@@ -103,7 +103,7 @@ MiMo 的两个及 WLB 的三个命名空间 slug 保留给已有目录或直接�
 
 `src/gpt-route.mjs` 分别将主代理选择写入 `gpt-route.json`、子代理选择写入
 `subagent-route.json`；主代理支持 `official`、`wlb`、`supergpt`、`auto`，
-子代理仅支持前三种手动模式。文件不存在时默认使用
+子代理支持前三种手动模式和 `auto`（GPT → SuperGPT）。文件不存在时默认使用
 `official`。两个开关各自对所有任务共享，从下一次对应角色的原生 GPT 请求起生效。使用
 `wlb` 或 `supergpt` 时，`src/router.mjs` 将请求中的 `gpt-*` 模型名原样发送给对应
 服务商，不依赖旧静态模型名单；SuperGPT 不新增旧命名空间模型条目。官方新增模型
@@ -125,7 +125,7 @@ version 1，并在每次写入时生成新 revision，兼容没有 revision 的�
 路由器内，不修改 Codex 客户端的重连间隔；更新源码后需重启服务。正在执行的任务中途切换服务商可能带来
 历史上下文兼容风险。SuperGPT 错误直接返回，不使用 WLB 专属回退或修改路由状态。
 首次新增服务商配置需重启 Router，之后主代理的 `route official|wlb|supergpt|auto` 和子代理的
-`route subagent official|wlb|supergpt` 热切换无需重启。`route status` 与 `route subagent status`
+`route subagent official|wlb|supergpt|auto` 热切换无需重启。`route status` 与 `route subagent status`
 只读；`--json` 仅由总状态命令支持。
 
 主代理可用 `route auto` 启用自动模式，按 **WLB → 官方 GPT → SuperGPT** 的顺序选择；
@@ -135,7 +135,7 @@ version 1，并在每次写入时生成新 revision，兼容没有 revision 的�
 Node Router 在请求到来时刷新额度，默认缓存 30 秒；没有整机常驻定时器，悬浮窗也不参与额度决策。
 同一请求至多尝试三家、每家一次，只有明确额度失败且尚未输出时才继续降级，SuperGPT 为终点。
 查询失败时保留已有档位；首次无法可靠判断则明确报错，不凭网络、认证或普通限流错误猜测额度。
-独立子代理不支持 `auto`，默认官方且继续遵循自己的开关；`codex-auto-review` 特殊模型继续使用官方。
+子代理 auto 按官方 GPT → SuperGPT 自动切换，阈值与主代理一致；WLB 不进入子代理自动循环。`codex-auto-review` 特殊模型继续使用官方。
 
 `status --json` 在自动模式返回 `gptRoute.mode="auto"`、`effectiveMode` 和脱敏的
 `auto` 诊断；首次请求前有效档位可能为 `null`。状态查询只读，不主动触发额度刷新。

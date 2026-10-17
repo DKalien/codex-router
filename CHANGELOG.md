@@ -2,6 +2,8 @@
 
 ## Lite 分支（未发布）
 
+- 子代理新增两级自动路由：官方 GPT → SuperGPT，沿用五小时 10% / 周 5% 阈值；WLB 不进入子代理自动循环，额度恢复后自动切回官方。
+
 - 新增主代理 `route auto`：按 WLB → 官方 GPT → SuperGPT 自动选择并在额度恢复后回升。
   WLB 原始日/周任一耗尽则跳过；GPT 同时监控 5h 和周窗口，5h 剩余 ≤10% 或周剩余 ≤5%
   即跳过，所有已有窗口均高于阈值时才恢复。请求触发额度刷新，默认缓存 30 秒；明确额度失败且未
@@ -11,7 +13,7 @@
 - WLB 自动回退识别明确中文日额度已用完、耗尽和用尽；在途请求遇到手动切至 official
   时沿用官方身份重发，保留手动选择的 revision。
 
-- 新增独立的 `route subagent official|wlb|supergpt|status` 开关；已识别的原生
+- 新增独立的 `route subagent official|wlb|supergpt|auto|status` 开关；已识别的原生
   `gpt-*` 子代理默认使用官方，也可单独切换到 WLB 或 SuperGPT，不改写主代理路由状态。
 - 审计修复：第三方压缩拒绝 HTTP 200 中的失败、不完整或空摘要，不再替换有效历史；
   普通及压缩上游错误共用 64 KiB 限读和脱敏，并保留 Retry-After。

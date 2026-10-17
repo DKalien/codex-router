@@ -70,9 +70,9 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
   同一请求至多尝试三家、每家一次，只有明确额度失败且尚未输出时才继续降级，SuperGPT 为终点。
   自动模式的官方错误体限读 64 KiB；超限明确返回 502 且不继续降级，限内的原生非额度错误保留原始字节。
   查询失败时保留已有档位；首次无法可靠判断则明确报错，不凭网络、认证或普通限流错误猜测额度。
-  独立子代理不支持 `auto`，默认官方且继续遵循自己的开关；`codex-auto-review` 特殊模型继续使用官方。
+  子代理可用 `route subagent auto` 按官方 GPT → SuperGPT 自动切换，阈值与主代理一致；WLB 不进入子代理自动循环。`codex-auto-review` 特殊模型继续使用官方。
 - **GPT 子代理**：已识别的原生 `gpt-*` 子代理默认走官方，普通请求和压缩请求
-  共用规则，且不读取主代理的全局路由状态。可运行 `route subagent official|wlb|supergpt|status`
+  共用规则，且不读取主代理的全局路由状态。可运行 `route subagent official|wlb|supergpt|auto|status`
   独立切换，选择对所有任务的后续子代理请求共享。供应商未启用、缺少凭据或子代理路由状态
   损坏时请求失败关闭。子代理上游错误直接返回，不触发 WLB 自动回退，也不改写主代理路由。
   识别复用 `x-openai-subagent`、有效的 `x-codex-parent-thread-id`，或线程 rollout 的
@@ -145,7 +145,7 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
 POSIX：`bin/install`（兼容入口 `install.sh`）、`bin/provider-key`、`bin/enable`、`bin/disable`、
 `bin/uninstall`、`bin/start`。路由切换使用
 `bin/model-router codex route official|wlb|supergpt|auto|status`；子代理使用
-`bin/model-router codex route subagent official|wlb|supergpt|status`；状态检查使用
+`bin/model-router codex route subagent official|wlb|supergpt|auto|status`；状态检查使用
 `bin/model-router codex status`。这些命令只读取或更新本地状态，不会请求上游服务；
 官方模式的状态检查不依赖静态 8 模型目录。返回码为 0 表示已就绪，1 表示需要处理，
 2 表示参数错误；只有总状态命令支持 `--json`，即 `status --json`。`route status`
@@ -198,7 +198,7 @@ owner 冲突。安装完成后完全退出并重新打开 Codex，使新的本�
   `.\codex-router.ps1 enable`（POSIX：`bin/enable`），再完全重启 Codex。旧目录文件
   不会自动删除；用户自有目录配置仍会拒绝覆盖。
 - 切换 GPT 路由：运行 `route official`、`route wlb` 或 `route supergpt`；设置从下一次非子代理的原生 GPT 请求生效，
-  对所有任务共享且无需重启。子代理供应商使用独立的 `route subagent official|wlb|supergpt|status` 开关，
+  对所有任务共享且无需重启。子代理供应商使用独立的 `route subagent official|wlb|supergpt|auto|status` 开关，
   默认官方，同样无需重启；同一任务中途
   切换服务商可能带来历史上下文兼容风险。
 - 服务商协议只接受 `openai-responses`，旧网关协作转换已删除。自定义注册表遗漏

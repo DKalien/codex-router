@@ -18,8 +18,9 @@ export const GPT_ROUTES = new Map([
   ["wlb", { label: "WLB", provider: "wlb-relay" }],
   ["supergpt", { label: "SuperGPT", provider: "supergpt-relay" }],
 ]);
-export const SUBAGENT_ROUTES = new Map(GPT_ROUTES);
 GPT_ROUTES.set("auto", { label: "自动（WLB → 官方 → SuperGPT）" });
+export const SUBAGENT_ROUTES = new Map(GPT_ROUTES);
+SUBAGENT_ROUTES.set("auto", { label: "自动（GPT → SuperGPT）" });
 
 function readRouteSnapshot(statePath, routes, description, repairCommand) {
   const routePrefix = repairCommand.startsWith("subagent ") ? "route subagent " : "route ";
@@ -73,7 +74,9 @@ async function setRoute(statePath, routes, route, description, repairCommand, { 
       const current = readRouteSnapshot(statePath, routes, ` ${description}设置`, repairCommand);
       if (current.route !== expected.route || current.revision !== expected.revision) return false;
     }
-    const required = route === "auto" ? ["wlb", "supergpt"] : [route];
+    const required = route === "auto"
+      ? (routes === SUBAGENT_ROUTES ? ["supergpt"] : ["wlb", "supergpt"])
+      : [route];
     for (const choice of required) {
       const { provider, label } = routes.get(choice);
       if (!provider) continue;
@@ -114,7 +117,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const expectedLength = isSubagent ? (args.length === 1 ? 1 : 2) : (args.length === 0 ? 0 : 1);
   const routes = isSubagent ? SUBAGENT_ROUTES : GPT_ROUTES;
   if (args.length !== expectedLength || (command !== "status" && !routes.has(command))) {
-    console.error("用法：route official|wlb|supergpt|auto|status；route subagent official|wlb|supergpt|status");
+    console.error("用法：route official|wlb|supergpt|auto|status；route subagent official|wlb|supergpt|auto|status");
     process.exitCode = 2;
   } else {
     try {

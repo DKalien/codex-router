@@ -2130,3 +2130,94 @@ test("auto 主代理按额度阈值恢复优先级，普通和两种压缩完整
     assert.ok(events.some((event) => event.provider === "supergpt-relay" && event.status === 200));
   } finally { await router.close(); await Promise.all(servers.map(close)); }
 });
+
+
+test("子代理 auto 仅在官方 GPT 与 SuperGPT 间切换且不请求 WLB", async () => {
+  let gptUsed = 0;
+  const seen = [];
+  const official = http.createServer(async (request, response) => {
+    if (request.method === "GET") {
+      seen.push("official-usage");
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        rate_limit: {
+          primary_window: { used_percent: gptUsed },
+          secondary_window: { used_percent: 10 },
+        },
+      }));
+      return;
+    }
+    seen.push("official");
+    request.resume();
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ output: [], usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const supergpt = http.createServer(async (request, response) => {
+    seen.push("supergpt");
+    request.resume();
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ output: [], usage: { input_tokens: 1, output_tokens: 1 } }));
+  });
+  const wlb = http.createServer(async (request, response) => {
+    seen.push("wlb");
+    request.resume();
+    response.writeHead(500, { "Content-Type": "application/json" });
+    response.end("{}");
+  });
+  const officialPort = await listen(official);
+  const supergptPort = await listen(supergpt);
+  const wlbPort = await listen(wlb);
+  const router = await startRouter({
+    CODEX_NATIVE_BASE_URL: "http://127.0.0.1:" + officialPort,
+    CODEX_ROUTER_GPT_USAGE_URL: "http://127.0.0.1:" + officialPort + "/usage",
+    SUPERGPT_BASE_URL: "http://127.0.0.1:" + supergptPort + "/v1",
+    SUPERGPT_API_KEY: "test-supergpt-key",
+    WLB_BASE_URL: "http://127.0.0.1:" + wlbPort,
+    WLB_API_KEY: "test-wlb-key",
+    CODEX_ROUTER_AUTO_REFRESH_MS: "0",
+  });
+  const cli = (route) => spawnSync(process.execPath, [path.join(root, "src/gpt-route.mjs"), "subagent", route], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      CODEX_HOME: router.stateDir,
+      MODEL_ROUTER_STATE_DIR: router.stateDir,
+      SUPERGPT_API_KEY: "test-supergpt-key",
+      WLB_API_KEY: "test-wlb-key",
+    },
+  });
+  const request = async () => {
+    const response = await fetch("http://127.0.0.1:" + router.routerPort + "/_codex-router/" + callerKey + "/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer test-official-key",
+        "chatgpt-account-id": "subagent-auto-account",
+        "x-openai-subagent": "true",
+      },
+      body: JSON.stringify({ model: "gpt-subagent-auto", input: [], stream: false }),
+    });
+    return response.status;
+  };
+  try {
+    const configured = cli("auto");
+    assert.equal(configured.status, 0, configured.stderr);
+    assert.equal(await request(), 200);
+    assert.deepEqual(seen, ["official-usage", "official"]);
+    gptUsed = 95;
+    assert.equal(await request(), 200);
+    assert.deepEqual(seen.slice(2), ["official-usage", "supergpt"]);
+    assert.equal(seen.includes("wlb"), false);
+    gptUsed = 0;
+    assert.equal(await request(), 200);
+    assert.deepEqual(seen.slice(4), ["official-usage", "official"]);
+    assert.equal(JSON.parse(readFileSync(path.join(router.stateDir, "subagent-route.json"))).route, "auto");
+    assert.equal(existsSync(path.join(router.stateDir, "auto-route-status.json")), false);
+    assert.equal(existsSync(path.join(router.stateDir, "subagent-auto-route-status.json")), true);
+  } finally {
+    await router.close();
+    await close(official);
+    await close(supergpt);
+    await close(wlb);
+  }
+});

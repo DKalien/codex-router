@@ -65,7 +65,10 @@ import {
 import { activityMetadataFromHeaders } from "./codex-session-names.mjs";
 import { isUsageExhausted, translateGatewayError } from "./error-translation.mjs";
 import { createAutoRouteController } from "./auto-route.mjs";
-import { writeAutoRouteStatus } from "./auto-route-state.mjs";
+import {
+  writeAutoRouteStatus,
+  writeSubagentAutoRouteStatus,
+} from "./auto-route-state.mjs";
 import { recordUsageEvent } from "./usage-events.mjs";
 import { VERSION } from "./version.mjs";
 
@@ -95,6 +98,18 @@ const autoRouteController = createAutoRouteController({
   },
   officialUsageUrl: process.env.CODEX_ROUTER_GPT_USAGE_URL || "https://chatgpt.com/backend-api/wham/usage",
   ttlMs: /^\d+$/.test(autoRefresh || "") && Number(autoRefresh) <= 300000 ? Number(autoRefresh) : 30000,
+});
+// 子代理 auto 复用同一额度阈值，但使用独立缓存和状态，不把 WLB 纳入候选循环。
+const subagentAutoRouteController = createAutoRouteController({
+  getWlbConnection() {
+    const provider = PROVIDERS.get("wlb-relay");
+    if (!readProviderSelection().includes(provider.id)) throw new Error("WLB 尚未启用。");
+    return { baseUrl: providerBaseUrl(provider), credential: resolveProviderCredential(provider)?.value };
+  },
+  officialUsageUrl: process.env.CODEX_ROUTER_GPT_USAGE_URL || "https://chatgpt.com/backend-api/wham/usage",
+  ttlMs: /^\d+$/.test(autoRefresh || "") && Number(autoRefresh) <= 300000 ? Number(autoRefresh) : 30000,
+  queryWlb: false,
+  routeOrder: ["official", "supergpt"],
 });
 function autoRouteUnavailable() {
   return Object.assign(new Error("自动路由暂时不可用，请检查额度查询及供应商配置。"), { status: 503, type: "auto_route_unavailable" });
@@ -1179,18 +1194,26 @@ async function handleResponses(request, response, requestUrl) {
     const activityMetadata = activityMetadataFromHeaders(request.headers);
     const nativeGpt = requestedModel.startsWith("gpt-") && !MODEL_BY_SLUG.has(requestedModel);
     let autoMode = false;
+    const subagentAuto = activityMetadata.isSubagent === true;
+    const autoController = subagentAuto ? subagentAutoRouteController : autoRouteController;
+    const autoExcluded = subagentAuto ? ["wlb"] : [];
+    const readAutoRoute = subagentAuto ? readSubagentRouteSnapshot : readGptRouteSnapshot;
+    const writeAutoRoute = subagentAuto ? writeSubagentAutoRouteStatus : writeAutoRouteStatus;
     let registeredRoute = MODEL_BY_SLUG.get(requestedModel);
     const routeForMode = (mode) => {
       const provider = GPT_ROUTES.get(mode)?.provider;
       if (provider && !readProviderSelection().includes(provider)) throw autoRouteUnavailable();
-      return provider ? { provider, slug: `${provider}/${requestedModel}`, upstreamModel: requestedModel } : undefined;
+      return provider ? { provider, slug: provider + "/" + requestedModel, upstreamModel: requestedModel } : undefined;
     };
     const resolveAutomatic = async (exclude = []) => {
-      const snapshot = await autoRouteController.resolve(request.headers, { signal: controller.signal, exclude });
-      const current = readGptRouteSnapshot();
+      const snapshot = await autoController.resolve(request.headers, {
+        signal: controller.signal,
+        exclude: [...new Set([...autoExcluded, ...exclude])],
+      });
+      const current = readAutoRoute();
       if (current.route !== gptRouteSnapshot.route || current.revision !== gptRouteSnapshot.revision) return { current };
-      await writeAutoRouteStatus(snapshot, gptRouteSnapshot, { signal: controller.signal });
-      const afterWrite = readGptRouteSnapshot();
+      await writeAutoRoute(snapshot, gptRouteSnapshot, { signal: controller.signal });
+      const afterWrite = readAutoRoute();
       if (afterWrite.route !== gptRouteSnapshot.route || afterWrite.revision !== gptRouteSnapshot.revision) return { current: afterWrite };
       return { snapshot };
     };
@@ -1201,9 +1224,10 @@ async function handleResponses(request, response, requestUrl) {
           ? readSubagentRouteSnapshot
           : readGptRouteSnapshot)();
         gptRoute = gptRouteSnapshot?.route || "official";
-        autoMode = gptRoute === "auto" && !activityMetadata.isSubagent;
+        autoMode = gptRoute === "auto";
         if (autoMode) {
-          for (const id of ["wlb-relay", "supergpt-relay"]) {
+          const requiredProviders = subagentAuto ? ["supergpt-relay"] : ["wlb-relay", "supergpt-relay"];
+          for (const id of requiredProviders) {
             if (!readProviderSelection().includes(id) || !resolveProviderCredential(PROVIDERS.get(id))) throw autoRouteUnavailable();
           }
           const decision = await resolveAutomatic();
@@ -1293,26 +1317,27 @@ async function handleResponses(request, response, requestUrl) {
       payload.input.at(-1)?.type === "compaction_trigger";
 
     const attempted = new Set();
+    const adoptManualRoute = (current) => {
+      const allowed = subagentAuto ? ["official", "supergpt"] : ["official"];
+      if (current.route === "auto" || !allowed.includes(current.route)) return false;
+      if (attempted.has(current.route)) return false;
+      autoMode = false;
+      gptRouteSnapshot = current;
+      route = routeForMode(current.route);
+      return true;
+    };
     const advanceAutomatic = async (status, bodyText) => {
       if (!autoMode || !nothingRelayed(response) || controller.signal.aborted ||
           typeof request.headers.authorization !== "string" || !request.headers.authorization.trim()) return false;
       const failed = route?.provider === "wlb-relay" ? "wlb" : route ? "supergpt" : "official";
       if (failed === "supergpt" || !(failed === "official" ? officialUsageExhausted(status, bodyText) : isUsageExhausted(status, bodyText))) return false;
-      const current = readGptRouteSnapshot();
+      const current = readAutoRoute();
       if (current.route !== "auto" || current.revision !== gptRouteSnapshot.revision) {
-        if (current.route !== "official" || attempted.has("official")) return false;
-        autoMode = false;
-        route = undefined;
-        return true;
+        return adoptManualRoute(current);
       }
       const exclude = failed === "official" ? ["wlb", "official"] : ["wlb"];
       const decision = await resolveAutomatic([...new Set([...attempted, ...exclude])]);
-      if (decision.current) {
-        if (decision.current.route !== "official" || attempted.has("official")) return false;
-        autoMode = false;
-        route = undefined;
-        return true;
-      }
+      if (decision.current) return adoptManualRoute(decision.current);
       if (attempted.has(decision.snapshot.route)) return false;
       route = routeForMode(decision.snapshot.route);
       return true;
@@ -1323,14 +1348,12 @@ async function handleResponses(request, response, requestUrl) {
     let mimoCustomToolNames;
     for (;;) {
       if (autoMode) {
-        const current = readGptRouteSnapshot();
+        const current = readAutoRoute();
         if (current.route !== "auto" || current.revision !== gptRouteSnapshot.revision) {
-          if (current.route !== "official" || attempted.has("official")) throw autoRouteUnavailable();
-          autoMode = false;
-          route = undefined;
+          if (!adoptManualRoute(current)) throw autoRouteUnavailable();
         }
         const selected = route?.provider === "wlb-relay" ? "wlb" : route ? "supergpt" : "official";
-        if (attempted.has(selected) || attempted.size >= 3) throw autoRouteUnavailable();
+        if (attempted.has(selected) || attempted.size >= (subagentAuto ? 2 : 3)) throw autoRouteUnavailable();
         attempted.add(selected);
       }
       activity.setRoute({ provider: route ? canonicalProviderId(route.provider) : "openai", model: route?.slug || requestedModel, ...activityMetadata });

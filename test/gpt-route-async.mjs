@@ -105,39 +105,69 @@ test("缺少 pwsh 时兼容 Windows PowerShell；两个 shell 均失败时保留
 });
 
 
-test("auto 仅限主代理且要求双供应商凭据，诊断状态绑定 revision 并保持私有", async () => {
-  const { writeAutoRouteStatus, readAutoRouteStatus, AUTO_ROUTE_STATUS_PATH } = await import("../src/auto-route-state.mjs");
+test("主代理三档和子代理两档 auto 状态独立、绑定 revision 并保持私有", async () => {
+  const {
+    writeAutoRouteStatus,
+    readAutoRouteStatus,
+    writeSubagentAutoRouteStatus,
+    readSubagentAutoRouteStatus,
+    AUTO_ROUTE_STATUS_PATH,
+    SUBAGENT_AUTO_ROUTE_STATUS_PATH,
+  } = await import("../src/auto-route-state.mjs");
   const savedWlb = process.env.WLB_API_KEY;
   const savedSuper = process.env.SUPERGPT_API_KEY;
   process.env.WLB_API_KEY = "test-wlb-auto";
   delete process.env.SUPERGPT_API_KEY;
   try {
     await assert.rejects(setGptRoute("auto"), /SuperGPT 未配置密钥/);
+    await assert.rejects(setSubagentRoute("auto"), /SuperGPT 未配置密钥/);
     process.env.SUPERGPT_API_KEY = "test-super-auto";
-    await assert.rejects(setSubagentRoute("auto"), /路由必须/);
+    assert.equal(await setSubagentRoute("auto"), "auto");
+    const subConfigured = readSubagentRouteSnapshot();
+    assert.equal(subConfigured.route, "auto");
+    const snapshot = {
+      route: "official",
+      checkedAt: new Date().toISOString(),
+      degraded: false,
+      wlb: { daily: { status: "valid", remaining: 0 }, weekly: { status: "valid", remaining: 5 }, available: false },
+      gpt: { fiveHour: { status: "valid", remainingPercent: 70 }, weekly: { status: "missing" }, available: true },
+      errors: [],
+      authorization: "must-not-persist",
+    };
+    await writeSubagentAutoRouteStatus(snapshot, subConfigured);
+    assert.equal(privateFileIsProtected(SUBAGENT_AUTO_ROUTE_STATUS_PATH), true);
+    assert.equal(readSubagentAutoRouteStatus(subConfigured).route, "official");
+    assert.equal(readFileSync(SUBAGENT_AUTO_ROUTE_STATUS_PATH, "utf8").includes("must-not-persist"), false);
+    assert.equal(readGptRouteSnapshot().route, "official");
+
     await setGptRoute("auto");
     const configured = readGptRouteSnapshot();
-    const snapshot = { route: "official", checkedAt: new Date().toISOString(), degraded: false, wlb: { daily: { status: "valid", remaining: 0 }, weekly: { status: "valid", remaining: 5 }, available: false }, gpt: { fiveHour: { status: "valid", remainingPercent: 70 }, weekly: { status: "missing" }, available: true }, errors: [], authorization: "must-not-persist" };
     await writeAutoRouteStatus(snapshot, configured);
     assert.equal(privateFileIsProtected(AUTO_ROUTE_STATUS_PATH), true);
     assert.equal(readAutoRouteStatus(configured).route, "official");
     assert.equal(readFileSync(AUTO_ROUTE_STATUS_PATH, "utf8").includes("must-not-persist"), false);
-    assert.equal(readGptRouteSnapshot().route, "auto");
     const { collectStatus } = await import("../src/status.mjs");
     const status = await collectStatus();
     assert.equal(status.gptRoute.mode, "auto");
     assert.equal(status.gptRoute.effectiveMode, "official");
     assert.equal(status.gptRoute.auto.gpt.fiveHour.remainingPercent, 70);
-    assert.equal(status.gptRoute.ready, false, "environment-only credentials are not persistent readiness");
+    assert.equal(status.subagentRoute.mode, "auto");
+    assert.equal(status.subagentRoute.effectiveMode, "official");
+    assert.equal(status.subagentRoute.ready, false, "environment-only credentials are not persistent readiness");
+
+    await setSubagentRoute("auto");
+    assert.equal(readSubagentAutoRouteStatus(readSubagentRouteSnapshot()), null, "old subagent revision must be hidden");
     await setGptRoute("auto");
-    assert.equal(readAutoRouteStatus(readGptRouteSnapshot()), null, "old revision must be hidden");
+    assert.equal(readAutoRouteStatus(readGptRouteSnapshot()), null, "old main revision must be hidden");
     const pending = await collectStatus();
     assert.equal(pending.gptRoute.effectiveMode, null);
     assert.equal(pending.gptRoute.auto.reason, "pending");
-    await writeAutoRouteStatus(snapshot, configured);
-    assert.equal(readAutoRouteStatus(readGptRouteSnapshot()), null, "stale writer must not become current");
+    assert.equal(pending.subagentRoute.effectiveMode, null);
+    assert.equal(pending.subagentRoute.auto.reason, "pending");
     await setGptRoute("official");
+    await setSubagentRoute("official");
     assert.equal(readAutoRouteStatus(readGptRouteSnapshot()), null);
+    assert.equal(readSubagentAutoRouteStatus(readSubagentRouteSnapshot()), null);
     assertClean();
   } finally {
     if (savedWlb === undefined) delete process.env.WLB_API_KEY; else process.env.WLB_API_KEY = savedWlb;

@@ -8,9 +8,12 @@ import {
   GPT_ROUTES,
   SUBAGENT_ROUTES,
   readGptRouteSnapshot,
-  readSubagentRoute,
+  readSubagentRouteSnapshot,
 } from "./gpt-route.mjs";
-import { readAutoRouteStatus } from "./auto-route-state.mjs";
+import {
+  readAutoRouteStatus,
+  readSubagentAutoRouteStatus,
+} from "./auto-route-state.mjs";
 import { providerSelectionStatus } from "./provider-selection.mjs";
 import { LISTED_MODELS, PROVIDERS } from "./model-registry.mjs";
 import { readInstallManifest } from "./install-manifest.mjs";
@@ -166,7 +169,22 @@ function gptRouteStatus(providers) {
 
 function subagentRouteStatus(providers) {
   try {
-    const mode = readSubagentRoute();
+    const configured = readSubagentRouteSnapshot();
+    const mode = configured.route;
+    if (mode === "auto") {
+      const snapshot = readSubagentAutoRouteStatus(configured);
+      const { route: effectiveMode, ...details } = snapshot || {};
+      return {
+        readable: true,
+        mode,
+        ready: providers.providers.some((provider) =>
+          provider.id === "supergpt-relay" && provider.selected && provider.configured),
+        effectiveMode: effectiveMode || null,
+        auto: snapshot
+          ? details
+          : { checkedAt: null, reason: "pending", degraded: false, wlb: null, gpt: null, errors: [] },
+      };
+    }
     const selected = providers.providers.find((provider) => provider.id === SUBAGENT_ROUTES.get(mode).provider);
     return {
       readable: true,
@@ -273,6 +291,7 @@ function printText(status) {
   }
   if (status.subagentRoute) {
     console.log(`子代理供应商：${status.subagentRoute.mode}`);
+    if (status.subagentRoute.mode === "auto") console.log("  当前供应商：" + (status.subagentRoute.effectiveMode || "pending"));
     if (!status.subagentRoute.readable) console.log(`  ${status.subagentRoute.error}`);
     else if (!status.subagentRoute.ready) console.log(`  ${SUBAGENT_ROUTES.get(status.subagentRoute.mode).label} 凭据或 provider selection 缺失。`);
   }

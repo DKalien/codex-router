@@ -83,7 +83,7 @@
   同一请求至多尝试三家、每家一次，只有明确额度失败且尚未输出时才继续降级，SuperGPT 为终点。
   自动模式的官方错误体限读 64 KiB；超限明确返回 502 且不继续降级，限内的原生非额度错误保留原始字节。
   查询失败时保留已有档位；首次无法可靠判断则明确报错，不凭网络、认证或普通限流错误猜测额度。
-  独立子代理不支持 `auto`，默认官方且继续遵循自己的开关；`codex-auto-review` 特殊模型继续使用官方。
+  子代理可用 `route subagent auto` 按官方 GPT → SuperGPT 自动切换，阈值与主代理一致；WLB 不进入子代理自动循环。`codex-auto-review` 特殊模型继续使用官方。
   `status --json` 使用 `gptRoute.mode=auto`、可空的 `effectiveMode` 和无凭据 `auto` 诊断。
 - `/models` 和 `/v1/models` 始终使用官方身份透传官方查询参数和完整元数据；WLB 和 SuperGPT
   路由不替换官方模型列表。

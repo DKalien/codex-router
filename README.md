@@ -204,9 +204,11 @@ owner 冲突。安装完成后完全退出并重新打开 Codex，使新的本�
 - 服务商协议只接受 `openai-responses`，旧网关协作转换已删除。自定义注册表遗漏
   `protocol` 时，仅在上游原生支持 Responses API 的前提下补入该字段；旧 Chat/Anthropic
   协议配置需要迁移至兼容的 Responses 服务，不能只改协议名。
-- 检查：`node --test test/official-catalog.mjs`、
-  `node --test test/router-fixes.mjs test/response-usage-hardening.mjs test/http-health-bounds.mjs test/credential-file-security.mjs test/graceful-shutdown.mjs test/upstream-hardening.mjs test/windows-service-process.mjs test/service-command.mjs test/gpt-route-async.mjs test/windows-hidden-consoles.mjs test/start-proxy.mjs test/auto-route.mjs` 和
-  `node scripts-check.mjs`。
+- 本地检查：`npm ci`、`npm run check`、`npm test`。测试按文件串行运行，覆盖
+  `test/*.mjs`，不需要真实服务商密钥。
+- CI：`.github/workflows/ci.yml` 在推送或提交 PR 到 `lite` 时自动运行，也支持手动触发；
+  覆盖 Ubuntu、macOS、Windows，以及最低支持版本 Node 22.19.0 和 Node 24，执行语法检查、
+  服务商注册表验证和全部回归测试。不执行在线模型发现或旧桌面应用/Python 构建。
 - 旧聊天仍报 WLB：若会话绑定第三方 provider，或错误 URL 直接指向第三方，切换 GPT
   模型或 Router 的 `route` 不会迁移该会话的 provider。请使用官方 OpenAI provider
   新建通过本地 Router 的聊天，再切换路由；直接请求第三方的会话不经过 Router 回退。

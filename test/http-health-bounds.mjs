@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
+import { setTimeout as sleep } from "node:timers/promises";
 import test from "node:test";
 
 import { readRequestBody, readResponseBody, zstdFrameContentSize } from "../src/http-utils.mjs";
@@ -114,13 +115,9 @@ test("health probe 不会超过整体 deadline", async () => {
     intervalMs: 0,
     fetchImpl: async (_url, { signal }) => {
       probeSignal = signal;
-      await new Promise((resolve, reject) => {
-        if (signal.aborted) {
-          reject(signal.reason);
-          return;
-        }
-        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-      });
+      // A real fetch holds a network handle. Keep this mock alive too:
+      // AbortSignal.timeout alone uses an unref'ed timer on Node 22.
+      await sleep(500, undefined, { signal });
     },
   });
 

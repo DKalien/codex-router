@@ -1,6 +1,10 @@
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
+  fstatSync,
+  openSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -198,14 +202,40 @@ export function writeProviderCredential(providerOrId, value) {
   mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
   chmodSync(STATE_DIR, 0o700);
   const target = primaryCredentialPath(provider);
-  const temporary = `${target}.tmp.${process.pid}`;
-  writeFileSync(temporary, `${key}\n`, { encoding: "utf8", mode: 0o600 });
+  const temporary = `${target}.tmp.${process.pid}.${randomBytes(8).toString("hex")}`;
+  let identity;
   try {
+    const descriptor = openSync(temporary, "wx", 0o600);
+    let writeError;
+    try {
+      identity = fstatSync(descriptor, { bigint: true });
+      writeFileSync(descriptor, `${key}\n`, { encoding: "utf8" });
+    } catch (error) {
+      writeError = error;
+      throw error;
+    } finally {
+      try {
+        closeSync(descriptor);
+      } catch (error) {
+        if (!writeError) throw error;
+        try { writeError.closeError = error; } catch {}
+      }
+    }
     protectPrivateFile(temporary);
     renameSync(temporary, target);
     protectPrivateFile(target);
   } catch (error) {
-    if (existsSync(temporary)) unlinkSync(temporary);
+    if (identity) {
+      try {
+        const current = lstatSync(temporary, { bigint: true });
+        if (!current.isFile() || current.dev !== identity.dev || current.ino !== identity.ino) {
+          throw Object.assign(new Error("私有临时文件在清理前发生变化，已保留该文件。"), { code: "ESTALE" });
+        }
+        unlinkSync(temporary);
+      } catch (cleanupError) {
+        if (cleanupError.code !== "ENOENT") error.cleanupError = cleanupError;
+      }
+    }
     throw error;
   }
   resetKeychainCache();

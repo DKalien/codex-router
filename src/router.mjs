@@ -377,6 +377,17 @@ function nativeHeaders(request) {
   return headers;
 }
 
+async function rejectGenerationRedirect(upstream) {
+  if (upstream.status >= 300 && upstream.status < 400) {
+    await upstream.body?.cancel().catch(() => {});
+    const error = new Error("上游重定向了生成请求，请将服务商地址配置为最终 API 地址。");
+    error.type = "provider_redirect_refused";
+    error.status = 400;
+    throw error;
+  }
+  return upstream;
+}
+
 async function prepareNativeRequest(request, requestUrl, payload, compactV1, client) {
   const native = { ...payload };
   normalizeNativePromptCacheCompatibility(native);
@@ -745,12 +756,13 @@ async function relayEncryptedAgentPayload(request, item, encrypted, signal) {
     ],
     tool_choice: { type: "function", name: AGENT_PAYLOAD_RELAY_TOOL },
   };
-  const upstream = await fetch(nativeTarget("/responses", ""), {
+  const upstream = await rejectGenerationRedirect(await fetch(nativeTarget("/responses", ""), {
     method: "POST",
+    redirect: "manual",
     headers: { ...nativeHeaders(request), Accept: "text/event-stream" },
     body: JSON.stringify(body),
     signal,
-  });
+  }));
   const bytes = await readResponseBody(upstream, {
     maxBytes: 4 * 1024 * 1024,
     signal,
@@ -1077,12 +1089,13 @@ async function summarize(request, payload, route, signal) {
       },
     };
   }
-  const upstream = await fetch(`${providerBaseUrl(provider)}/responses`, {
+  const upstream = await rejectGenerationRedirect(await fetch(`${providerBaseUrl(provider)}/responses`, {
     method: "POST",
+    redirect: "manual",
     headers: routedHeaders(credential),
     body: JSON.stringify(body),
     signal,
-  });
+  }));
   if (!upstream.ok) {
     return {
       ok: false,
@@ -1527,6 +1540,7 @@ async function handleResponses(request, response, requestUrl, client = "codex") 
         target,
         {
           method: "POST",
+          redirect: "manual",
           headers,
           body: routedBody,
           signal: controller.signal,
@@ -1537,6 +1551,7 @@ async function handleResponses(request, response, requestUrl, client = "codex") 
           onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
         },
       ));
+      await rejectGenerationRedirect(upstream);
       upstreamRetries = retries;
       upstreamStatus = upstream.status;
       // Gateway error bodies leak LiteLLM's internal exception chain, which
@@ -1725,6 +1740,7 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel, 
       (client === "pi" ? piNativeTarget : nativeTarget)(requestUrl.pathname, requestUrl.search),
       {
         method: request.method,
+        ...(request.method === "POST" ? { redirect: "manual" } : {}),
         headers,
         body: upstreamBody,
         signal: controller.signal,
@@ -1743,6 +1759,7 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel, 
         onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
       },
     );
+    if (request.method === "POST") await rejectGenerationRedirect(upstream);
     upstreamRetries = retries;
     await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS);
     const clientWalkedAway = clientGone || (response.destroyed && !response.writableFinished);
@@ -1883,8 +1900,8 @@ const server = http.createServer((request, response) => {
     if (!response.headersSent) {
       writeJson(response, status, {
         error: {
-          type: error.type === "auto_route_unavailable" ? "auto_route_unavailable" : "local_router_error",
-          message: "The local router could not complete the request.",
+          type: ["auto_route_unavailable", "provider_redirect_refused"].includes(error.type) ? error.type : "local_router_error",
+          message: error.type === "provider_redirect_refused" ? error.message : "The local router could not complete the request.",
         },
       });
     } else {

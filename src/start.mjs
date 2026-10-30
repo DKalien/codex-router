@@ -100,7 +100,10 @@ const commonEnv = {
 };
 
 const children = [];
+const childExits = new WeakMap();
 let shuttingDown = false;
+let signalShutdown;
+const shutdown = new Promise((resolve) => { signalShutdown = resolve; });
 const SIGKILL_AFTER_MS = SHUTDOWN_DRAIN_MS + SHUTDOWN_FLUSH_MS + 2_000;
 
 function run(command, args) {
@@ -109,22 +112,25 @@ function run(command, args) {
     env: { ...process.env, ...commonEnv },
     stdio: "inherit",
   });
+  childExits.set(child, new Promise((resolve) => {
+    child.once("exit", (code, signal) => resolve({ code, signal }));
+    child.on("error", (error) => {
+      console.error(`[codex-router] 子进程错误: ${error.message}`);
+      if (child.pid === undefined) resolve({ code: 1, signal: null });
+    });
+  }));
   children.push(child);
   return child;
 }
 
 function waitForExit(child, label) {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return Promise.resolve({ label, code: child.exitCode, signal: child.signalCode });
-  }
-  return new Promise((resolve) => {
-    child.once("exit", (code, signal) => resolve({ label, code, signal }));
-  });
+  return childExits.get(child).then((result) => ({ label, ...result }));
 }
 
 function stopChildren() {
   if (shuttingDown) return;
   shuttingDown = true;
+  signalShutdown();
   for (const child of children) {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
   }
@@ -139,7 +145,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) process.on(signal, stopChildren);
 
 async function main() {
   const router = run(process.execPath, [path.join(SOURCE_ROOT, "src", "router.mjs")]);
-  await pollHealth({
+  await Promise.race([pollHealth({
     label: "Codex router",
     url: loopback(PORTS.router, "/health"),
     headers: {},
@@ -147,9 +153,14 @@ async function main() {
     expectedService: "codex-router",
     child: router,
     isShuttingDown: () => shuttingDown,
-  });
+  }), waitForExit(router, "Codex router").then(() => {
+    throw new Error("Codex router 在健康检查通过前退出。");
+  })]);
   console.error(`[codex-router] ready (authenticated loopback endpoint)`);
-  const result = await waitForExit(router, "Codex router");
+  const result = await Promise.race([
+    waitForExit(router, "Codex router"),
+    shutdown.then(() => ({ label: "Codex router", code: 0, signal: null })),
+  ]);
   if (!shuttingDown) {
     console.error(
       `[codex-router] ${result.label} exited (code=${String(result.code)}, signal=${String(result.signal)}).`,
@@ -169,6 +180,15 @@ try {
   }
 } finally {
   stopChildren();
-  await Promise.all(children.map((child) => waitForExit(child, "child")));
+  let timer;
+  const drained = await Promise.race([
+    Promise.all(children.map((child) => waitForExit(child, "child"))).then(() => true),
+    new Promise((resolve) => { timer = setTimeout(() => resolve(false), SIGKILL_AFTER_MS + 5_000); }),
+  ]);
+  clearTimeout(timer);
+  if (!drained) {
+    console.error("[codex-router] 子进程停止后未报告退出，监督器退出以便服务重启。");
+    process.exit(exitCode || 1);
+  }
 }
 process.exitCode = exitCode;

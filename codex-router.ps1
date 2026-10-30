@@ -7,7 +7,7 @@ if ($Target -ne "codex") {
 $Command = if ($args.Count) { [string]$args[0] } else { "" }
 $Arguments = @($args | Select-Object -Skip 1)
 $Commands = @(
-  "install", "provider-key", "enable", "disable", "uninstall", "start", "status", "route"
+  "install", "provider-key", "enable", "disable", "uninstall", "start", "status", "route", "pi"
 )
 if ($Command -notin $Commands) {
   throw "Unknown command '$Command'. Choose: $($Commands -join ', ')."
@@ -21,6 +21,7 @@ function Invoke-RouterNode([string]$Script, [string[]]$ScriptArguments = @()) {
 
 switch ($Command) {
   "route" { Invoke-RouterNode "src\gpt-route.mjs" $Arguments }
+  "pi" { Invoke-RouterNode "src\pi-config.mjs" $Arguments }
   "provider-key" { Invoke-RouterNode "src\provider-key.mjs" $Arguments }
   "install" { & (Join-Path $Root "install.ps1") -Target $Target @Arguments }
   "enable" { & (Join-Path $Root "install.ps1") -Target $Target }

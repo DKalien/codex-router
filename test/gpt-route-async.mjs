@@ -9,10 +9,13 @@ process.env.MODEL_ROUTER_STATE_DIR = sandbox;
 process.env.CODEX_HOME = path.join(sandbox, "codex-home");
 const {
   GPT_ROUTE_PATH,
+  PI_ROUTE_PATH,
   SUBAGENT_ROUTE_PATH,
   readGptRouteSnapshot,
+  readPiRouteSnapshot,
   readSubagentRouteSnapshot,
   setGptRoute,
+  setPiRoute,
   setSubagentRoute,
 } = await import("../src/gpt-route.mjs");
 const { privateFileIsProtected } = await import("../src/file-security.mjs");
@@ -71,6 +74,24 @@ test("子代理状态损坏时提示独立修复命令", () => {
     /route subagent official、route subagent wlb 或 route subagent supergpt/,
   );
   rmSync(SUBAGENT_ROUTE_PATH, { force: true });
+});
+
+test("Pi 路由使用独立状态文件并默认官方，损坏时提示 route pi 修复命令", async () => {
+  assert.equal(readPiRouteSnapshot().route, "official");
+  await setPiRoute("official");
+  const snapshot = readPiRouteSnapshot();
+  assert.equal(snapshot.route, "official");
+  assert.equal(typeof snapshot.revision, "string");
+  assert.equal(privateFileIsProtected(PI_ROUTE_PATH), true);
+  assert.equal(readGptRouteSnapshot().route, "official");
+  writeFileSync(PI_ROUTE_PATH, "broken");
+  assert.throws(
+    () => readPiRouteSnapshot(),
+    /route pi official、route pi wlb 或 route pi supergpt/,
+  );
+  rmSync(PI_ROUTE_PATH, { force: true });
+  assert.equal(readPiRouteSnapshot().route, "official");
+  assertClean();
 });
 
 test("异步 ACL 期间取消保留旧路由并清理临时文件", { skip: process.platform !== "win32" }, async () => {

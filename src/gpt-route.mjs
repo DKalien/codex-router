@@ -13,6 +13,7 @@ import { resolveProviderCredential } from "./provider-credentials.mjs";
 
 export const GPT_ROUTE_PATH = path.join(STATE_DIR, "gpt-route.json");
 export const SUBAGENT_ROUTE_PATH = path.join(STATE_DIR, "subagent-route.json");
+export const PI_ROUTE_PATH = path.join(STATE_DIR, "pi-route.json");
 export const GPT_ROUTES = new Map([
   ["official", { label: "官方" }],
   ["wlb", { label: "WLB", provider: "wlb-relay" }],
@@ -21,9 +22,16 @@ export const GPT_ROUTES = new Map([
 GPT_ROUTES.set("auto", { label: "自动（WLB → 官方 → SuperGPT）" });
 export const SUBAGENT_ROUTES = new Map(GPT_ROUTES);
 SUBAGENT_ROUTES.set("auto", { label: "自动（GPT → SuperGPT）" });
+// Pi 接入当前只支持手动路由：官方额度查询针对 Codex 身份，不能拿来
+// 为 Pi 的 OpenAI 凭据做自动降级决策。
+export const PI_ROUTES = new Map([
+  ["official", GPT_ROUTES.get("official")],
+  ["wlb", GPT_ROUTES.get("wlb")],
+  ["supergpt", GPT_ROUTES.get("supergpt")],
+]);
 
 function readRouteSnapshot(statePath, routes, description, repairCommand) {
-  const routePrefix = repairCommand.startsWith("subagent ") ? "route subagent " : "route ";
+  const routePrefix = `route ${repairCommand === "official" ? "" : `${repairCommand.replace(/ official$/, "")} `}`;
   let text;
   try {
     text = readFileSync(statePath, "utf8");
@@ -50,12 +58,20 @@ export function readSubagentRouteSnapshot() {
   return readRouteSnapshot(SUBAGENT_ROUTE_PATH, SUBAGENT_ROUTES, " 子代理供应商路由设置", "subagent official");
 }
 
+export function readPiRouteSnapshot() {
+  return readRouteSnapshot(PI_ROUTE_PATH, PI_ROUTES, " Pi 路由设置", "pi official");
+}
+
 export function readGptRoute() {
   return readGptRouteSnapshot().route;
 }
 
 export function readSubagentRoute() {
   return readSubagentRouteSnapshot().route;
+}
+
+export function readPiRoute() {
+  return readPiRouteSnapshot().route;
 }
 
 async function setRoute(statePath, routes, route, description, repairCommand, { expected, signal } = {}) {
@@ -110,25 +126,32 @@ export function setSubagentRoute(route, options) {
   return setRoute(SUBAGENT_ROUTE_PATH, SUBAGENT_ROUTES, route, "子代理供应商", "subagent official", options);
 }
 
+export function setPiRoute(route, options) {
+  return setRoute(PI_ROUTE_PATH, PI_ROUTES, route, "Pi 路由", "pi official", options);
+}
+
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
-  const isSubagent = args[0] === "subagent";
-  const command = isSubagent ? (args[1] || "status") : (args[0] || "status");
-  const expectedLength = isSubagent ? (args.length === 1 ? 1 : 2) : (args.length === 0 ? 0 : 1);
-  const routes = isSubagent ? SUBAGENT_ROUTES : GPT_ROUTES;
+  const scope = args[0] === "subagent" || args[0] === "pi" ? args[0] : undefined;
+  const command = scope ? (args[1] || "status") : (args[0] || "status");
+  const expectedLength = scope ? (args.length === 1 ? 1 : 2) : (args.length === 0 ? 0 : 1);
+  const routes = scope === "pi" ? PI_ROUTES : scope === "subagent" ? SUBAGENT_ROUTES : GPT_ROUTES;
+  const label = scope === "pi" ? "Pi 路由" : scope === "subagent" ? "子代理供应商" : "GPT 路由";
   if (args.length !== expectedLength || (command !== "status" && !routes.has(command))) {
-    console.error("用法：route official|wlb|supergpt|auto|status；route subagent official|wlb|supergpt|auto|status");
+    console.error("用法：route official|wlb|supergpt|auto|status；route subagent official|wlb|supergpt|auto|status；route pi official|wlb|supergpt|status");
     process.exitCode = 2;
   } else {
     try {
-      const read = isSubagent ? readSubagentRoute : readGptRoute;
-      const set = isSubagent ? setSubagentRoute : setGptRoute;
+      const read = scope === "pi" ? readPiRoute : scope === "subagent" ? readSubagentRoute : readGptRoute;
+      const set = scope === "pi" ? setPiRoute : scope === "subagent" ? setSubagentRoute : setGptRoute;
       const route = command === "status" ? read() : await set(command);
-      console.log(`${isSubagent ? "子代理供应商" : "GPT 路由"}：${routes.get(route).label} (${route})`);
+      console.log(`${label}：${routes.get(route).label} (${route})`);
       if (command !== "status") {
-        console.log(isSubagent
-          ? "设置已保存；已识别的原生 GPT 子代理从下一次请求起使用该供应商，所有任务共享此设置。"
-          : "设置已保存；支持此开关的路由器从下一次非子代理的原生 GPT 请求起使用新路由，所有任务共享此设置。");
+        console.log(scope === "pi"
+          ? "设置已保存；Pi 的 GPT 请求从下一次起使用新路由，所有任务共享此设置。"
+          : scope === "subagent"
+            ? "设置已保存；已识别的原生 GPT 子代理从下一次请求起使用该供应商，所有任务共享此设置。"
+            : "设置已保存；支持此开关的路由器从下一次非子代理的原生 GPT 请求起使用新路由，所有任务共享此设置。");
       }
     } catch (error) {
       console.error(error.message);

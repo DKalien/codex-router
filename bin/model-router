@@ -8,13 +8,15 @@ usage() {
 Usage: model-router codex COMMAND [arguments]
 
 Commands:
-  install, provider-key, enable, disable, uninstall, start, status, route
+  install, provider-key, enable, disable, uninstall, start, status, route, pi
 
   ./bin/model-router codex install
   ./bin/model-router codex provider-key mimo-token-plan set
   ./bin/model-router codex provider-key supergpt-relay set
   ./bin/model-router codex route official|wlb|supergpt|auto|status
   ./bin/model-router codex route subagent official|wlb|supergpt|status
+  ./bin/model-router codex route pi official|wlb|supergpt|status
+  ./bin/model-router codex pi enable|disable|status
 EOF
 }
 
@@ -33,7 +35,7 @@ case "$target" in
 esac
 
 case "$command" in
-  install|provider-key|enable|disable|uninstall|start|status|route) ;;
+  install|provider-key|enable|disable|uninstall|start|status|route|pi) ;;
   *) echo "Unknown command: $command" >&2; usage >&2; exit 2 ;;
 esac
 
@@ -41,6 +43,9 @@ MODEL_ROUTER_TARGET=$target
 export MODEL_ROUTER_TARGET
 if [ "$command" = route ]; then
   exec node "$repo_dir/src/gpt-route.mjs" "$@"
+fi
+if [ "$command" = pi ]; then
+  exec node "$repo_dir/src/pi-config.mjs" "$@"
 fi
 if [ "$command" = status ]; then
   exec node "$repo_dir/src/status.mjs" "$@"

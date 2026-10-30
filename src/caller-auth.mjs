@@ -39,6 +39,16 @@ export function callerBaseUrl(port, secret) {
   return `http://127.0.0.1:${port}${callerBasePath(secret)}`;
 }
 
+// Pi 与 Codex 共用同一个 caller secret 和端口，但占用独立的路径命名空间，
+// 路由器据此选择各自的官方上游和路由状态，无需额外请求头。
+export function callerPiBasePath(secret) {
+  return `${CALLER_PATH_PREFIX}/${assertCallerSecret(secret)}/pi/v1`;
+}
+
+export function callerPiBaseUrl(port, secret) {
+  return `http://127.0.0.1:${port}${callerPiBasePath(secret)}`;
+}
+
 export function authenticatedRoute(pathname, expectedSecret) {
   if (typeof pathname !== "string") return undefined;
   const prefix = `${CALLER_PATH_PREFIX}/`;
@@ -77,10 +87,36 @@ export function isManagedCallerBaseUrl(value, port) {
   }
 }
 
+export function isManagedCallerPiBaseUrl(value, port) {
+  if (typeof value !== "string" || !value) return false;
+  try {
+    const url = new URL(value);
+    const expectedPort =
+      port === undefined ? undefined : Number(port) === 80 ? "" : String(port);
+    if (
+      url.protocol !== "http:" ||
+      url.hostname !== "127.0.0.1" ||
+      (port !== undefined && url.port !== expectedPort) ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
+    ) {
+      return false;
+    }
+    const match = url.pathname.match(
+      new RegExp(`^${CALLER_PATH_PREFIX}/([A-Za-z0-9_-]+)/pi/v1/?$`),
+    );
+    return Boolean(match && validCallerSecret(match[1]));
+  } catch {
+    return false;
+  }
+}
+
 export function redactCallerUrl(value) {
   if (typeof value !== "string") return value;
   return value.replace(
-    new RegExp(`(${CALLER_PATH_PREFIX}/)[A-Za-z0-9_-]+(?=/v1(?:/|$))`, "g"),
+    new RegExp(`(${CALLER_PATH_PREFIX}/)[A-Za-z0-9_-]+(?=(?:/pi)?/v1(?:/|$))`, "g"),
     "$1[REDACTED]",
   );
 }

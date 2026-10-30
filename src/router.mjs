@@ -42,8 +42,10 @@ import { readNativeRedirect } from "./native-redirect.mjs";
 import {
   GPT_ROUTES,
   readGptRouteSnapshot,
+  readPiRouteSnapshot,
   readSubagentRouteSnapshot,
   setGptRoute,
+  setPiRoute,
 } from "./gpt-route.mjs";
 import {
   canonicalProviderId,
@@ -79,6 +81,11 @@ const LISTEN_PORT = Number(
 );
 const NATIVE_BASE = (
   process.env.CODEX_NATIVE_BASE_URL || "https://chatgpt.com/backend-api/codex"
+).replace(/\/+$/, "");
+// Pi 经 /pi/v1 命名空间接入同一台路由器，但它的官方上游是 OpenAI
+// Responses API，而不是 ChatGPT Codex 后端；两个客户端的官方目标分开配置。
+const PI_NATIVE_BASE = (
+  process.env.PI_NATIVE_BASE_URL || "https://api.openai.com/v1"
 ).replace(/\/+$/, "");
 // Lite: routed providers speak the Responses API natively, so turns go
 // straight to the provider endpoint with its own credential -- no local
@@ -370,14 +377,15 @@ function nativeHeaders(request) {
   return headers;
 }
 
-async function prepareNativeRequest(request, requestUrl, payload, compactV1) {
+async function prepareNativeRequest(request, requestUrl, payload, compactV1, client) {
   const native = { ...payload };
   normalizeNativePromptCacheCompatibility(native);
+  if (client === "pi") normalizePiChatGptTokenCompatibility(native, request.headers);
   if (Array.isArray(payload.input)) native.input = normalizeNativeInput(payload.input);
   if (!compactV1) delete native.previous_response_id;
   const headers = nativeHeaders(request);
   return {
-    target: nativeTarget(requestUrl.pathname, requestUrl.search),
+    target: (client === "pi" ? piNativeTarget : nativeTarget)(requestUrl.pathname, requestUrl.search),
     headers,
     routedBody: await compressedNativeBody(Buffer.from(JSON.stringify(native), "utf8"), headers),
   };
@@ -413,6 +421,11 @@ function writeRoutedError(response, status, bodyText, route, retryAfter) {
 function nativeTarget(pathname, search) {
   const withoutV1 = pathname.replace(/^\/v1(?=\/|$)/, "");
   return `${NATIVE_BASE}${withoutV1}${search}`;
+}
+
+function piNativeTarget(pathname, search) {
+  const withoutV1 = pathname.replace(/^\/v1(?=\/|$)/, "");
+  return `${PI_NATIVE_BASE}${withoutV1}${search}`;
 }
 
 // The safety line for an upstream retry: has the caller seen anything yet?
@@ -916,6 +929,43 @@ function normalizeNativePromptCacheCompatibility(payload) {
   return payload;
 }
 
+// Pi 直连 api.openai.com 时，Sign in with ChatGPT 的 token 会拒绝这些字段，
+// Pi 因此在 ChatGPT 登录下省略它们；覆盖 baseUrl 后由路由器维持同一契约。
+// sk- 开头的 API key 行为与标准 OpenAI 一致，字段保持原样。
+function normalizePiChatGptTokenCompatibility(payload, headers) {
+  const authorization = String(headers?.authorization || "");
+  if (authorization.startsWith("Bearer sk-")) return payload;
+  delete payload.prompt_cache_retention;
+  delete payload.prompt_cache_options;
+  delete payload.max_output_tokens;
+  delete payload.temperature;
+  return payload;
+}
+
+// Pi 在模型声明 supportsMidConvoEffort 时用 configuration_update input item
+// 承载 thinking 级别（reasoning.effort 固定为 medium）。Sign in with ChatGPT 的
+// 订阅共享拒绝该 item 类型（subscription_sharing_unsupported_capability），
+// 第三方中转站也未必支持；折回 reasoning.effort（最后一个 configuration_update
+// 为准）与 Pi 在 ChatGPT 登录下的直接行为等价。
+function foldPiConfigurationUpdates(payload) {
+  if (!Array.isArray(payload.input)) return payload;
+  let effort;
+  const input = [];
+  for (const item of payload.input) {
+    if (item?.type !== "configuration_update") {
+      input.push(item);
+      continue;
+    }
+    if (typeof item?.reasoning?.effort === "string") effort = item.reasoning.effort;
+  }
+  if (input.length === payload.input.length) return payload;
+  if (effort !== undefined) {
+    payload.reasoning = { ...(payload.reasoning || {}), effort };
+  }
+  payload.input = input;
+  return payload;
+}
+
 function extractUserMessages(input) {
   if (!Array.isArray(input)) return [];
   const messages = [];
@@ -1162,7 +1212,7 @@ function requireCodexTransport(request, response) {
   return true;
 }
 
-async function handleResponses(request, response, requestUrl) {
+async function handleResponses(request, response, requestUrl, client = "codex") {
   const startedAt = Date.now();
   const activity = beginRequestActivity();
   const controller = new AbortController();
@@ -1191,8 +1241,16 @@ async function handleResponses(request, response, requestUrl) {
     const body = await decodeBody(encoded, request.headers["content-encoding"]);
     const payload = parseBody(body);
     requestedModel = typeof payload.model === "string" ? payload.model : "";
-    const activityMetadata = activityMetadataFromHeaders(request.headers);
-    const nativeGpt = requestedModel.startsWith("gpt-") && !MODEL_BY_SLUG.has(requestedModel);
+    const piClient = client === "pi";
+    // Pi 没有 Codex 的子代理识别语义；显式命名空间 slug 保持原义，
+    // 其余模型名全部跟随 Pi 自己的全局路由状态。
+    const activityMetadata = piClient
+      ? { ...activityMetadataFromHeaders(request.headers), isSubagent: false }
+      : activityMetadataFromHeaders(request.headers);
+    const nativeGpt = piClient
+      ? !MODEL_BY_SLUG.has(requestedModel) &&
+        !MODEL_BY_SLUG.has(readNativeAliases()[requestedModel])
+      : requestedModel.startsWith("gpt-") && !MODEL_BY_SLUG.has(requestedModel);
     let autoMode = false;
     const subagentAuto = activityMetadata.isSubagent === true;
     const autoController = subagentAuto ? subagentAutoRouteController : autoRouteController;
@@ -1220,9 +1278,11 @@ async function handleResponses(request, response, requestUrl) {
     if (nativeGpt) {
       let gptRoute;
       try {
-        gptRouteSnapshot = (activityMetadata.isSubagent
-          ? readSubagentRouteSnapshot
-          : readGptRouteSnapshot)();
+        gptRouteSnapshot = (piClient
+          ? readPiRouteSnapshot
+          : activityMetadata.isSubagent
+            ? readSubagentRouteSnapshot
+            : readGptRouteSnapshot)();
         gptRoute = gptRouteSnapshot?.route || "official";
         autoMode = gptRoute === "auto";
         if (autoMode) {
@@ -1278,6 +1338,12 @@ async function handleResponses(request, response, requestUrl) {
       });
       return;
     }
+    // configuration_update 是 Pi 的 openai-responses 产物：官方 + API key 原样
+    // 保留，其余组合（ChatGPT 订阅 token 或第三方路由）折回 reasoning.effort。
+    if (piClient) {
+      const isApiKey = String(request.headers.authorization || "").startsWith("Bearer sk-");
+      if (route || !isApiKey) foldPiConfigurationUpdates(payload);
+    }
     // Activity and usage attribute protocol variants to their canonical
     // family so the tray Island and graphs show one provider per subscription.
     activity.setRoute({
@@ -1291,8 +1357,10 @@ async function handleResponses(request, response, requestUrl) {
           typeof request.headers.authorization !== "string" || !request.headers.authorization.trim()) return false;
       try {
         // 重新验证状态，损坏或写入失败时停止，沿用 owner 校验和原子写入。
-        if (!await setGptRoute("official", { expected: gptRouteSnapshot, signal: controller.signal }) &&
-            readGptRouteSnapshot().route !== "official") return false;
+        const writeRoute = piClient ? setPiRoute : setGptRoute;
+        const readRoute = piClient ? readPiRouteSnapshot : readGptRouteSnapshot;
+        if (!await writeRoute("official", { expected: gptRouteSnapshot, signal: controller.signal }) &&
+            readRoute().route !== "official") return false;
       } catch (error) {
         const failure = new Error(`WLB 额度耗尽，但无法保存官方路由：${error.message}`);
         failure.status = 503;
@@ -1446,7 +1514,7 @@ async function handleResponses(request, response, requestUrl) {
         headers = routedHeaders(credential);
         routedBody = Buffer.from(JSON.stringify(routed), "utf8");
       } else {
-        ({ target, headers, routedBody } = await prepareNativeRequest(request, requestUrl, payload, compactV1));
+        ({ target, headers, routedBody } = await prepareNativeRequest(request, requestUrl, payload, compactV1, client));
       }
 
       // `routedBody` is a fully materialized Buffer -- plain JSON, or the zstd
@@ -1606,7 +1674,7 @@ async function handleResponses(request, response, requestUrl) {
   }
 }
 
-async function handleNativeRequest(request, response, requestUrl, defaultModel) {
+async function handleNativeRequest(request, response, requestUrl, defaultModel, client = "codex") {
   const startedAt = Date.now();
   const activity = beginRequestActivity();
   const controller = new AbortController();
@@ -1654,7 +1722,7 @@ async function handleNativeRequest(request, response, requestUrl, defaultModel) 
     // Same replayable-Buffer rule as the turn path: encode once, outside the
     // retry, so every attempt carries identical bytes under identical headers.
     const { response: upstream, retries } = await fetchWithRetry(
-      nativeTarget(requestUrl.pathname, requestUrl.search),
+      (client === "pi" ? piNativeTarget : nativeTarget)(requestUrl.pathname, requestUrl.search),
       {
         method: request.method,
         headers,
@@ -1748,6 +1816,12 @@ async function handleRequest(request, response) {
     return;
   }
   requestUrl.pathname = route;
+  // Pi 通过 /pi/v1 命名空间接入；去掉前缀后与 Codex 共用全部路由逻辑。
+  const client =
+    requestUrl.pathname === "/pi" || requestUrl.pathname.startsWith("/pi/")
+      ? "pi"
+      : "codex";
+  if (client === "pi") requestUrl.pathname = requestUrl.pathname.slice("/pi".length) || "/";
 
   if (
     request.method === "GET" &&
@@ -1759,7 +1833,7 @@ async function handleRequest(request, response) {
   }
   if (request.method === "GET" && ["/models", "/v1/models"].includes(requestUrl.pathname)) {
     // 模型目录始终取自官方；GPT 的上游切换不改变客户端的能力元数据。
-    await handleNativeRequest(request, response, requestUrl, "models");
+    await handleNativeRequest(request, response, requestUrl, "models", client);
     return;
   }
   if (request.method === "OPTIONS") {
@@ -1773,15 +1847,15 @@ async function handleRequest(request, response) {
       requestUrl.pathname,
     )
   ) {
-    await handleResponses(request, response, requestUrl);
+    await handleResponses(request, response, requestUrl, client);
     return;
   }
   if (request.method === "POST" && NATIVE_IMAGE_PATHS.has(requestUrl.pathname)) {
-    await handleNativeRequest(request, response, requestUrl, "gpt-image-2");
+    await handleNativeRequest(request, response, requestUrl, "gpt-image-2", client);
     return;
   }
   if (request.method === "POST" && NATIVE_SEARCH_PATHS.has(requestUrl.pathname)) {
-    await handleNativeRequest(request, response, requestUrl, "web-search");
+    await handleNativeRequest(request, response, requestUrl, "web-search", client);
     return;
   }
   writeJson(response, 404, {

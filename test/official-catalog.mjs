@@ -14,6 +14,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { statusIsReady } from "../src/status.mjs";
+import { privateFileIsProtected } from "../src/file-security.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const callerSecret = "test-router-caller-capability-with-sufficient-length";
@@ -308,6 +309,122 @@ test("SuperGPT 状态只检查自身选择和持久化凭据，不误用 WLB 状
       { readable: true, mode: "supergpt", ready: false },
       { readable: true, mode: "supergpt", ready: false },
     ]);
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+function runPiConfig(command, tempRoot, agentDir, stateDir, env = {}) {
+  return spawnSync(
+    process.execPath,
+    [path.join(root, "src/pi-config.mjs"), ...command],
+    {
+      cwd: root,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CODEX_HOME: tempRoot,
+        CODEX_ROUTER_STATE_DIR: stateDir,
+        MODEL_ROUTER_STATE_DIR: stateDir,
+        MODEL_ROUTER_PORT: "4102",
+        PI_CODING_AGENT_DIR: agentDir,
+        ...env,
+      },
+    },
+  );
+}
+
+function piFixture() {
+  const tempRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-pi-config-"));
+  const stateDir = path.join(tempRoot, "codex-router");
+  const agentDir = path.join(tempRoot, "pi-agent");
+  mkdirSync(stateDir, { recursive: true });
+  mkdirSync(agentDir, { recursive: true });
+  writeFileSync(path.join(stateDir, "caller-secret"), `${callerSecret}\n`);
+  return { tempRoot, stateDir, agentDir, modelsPath: path.join(agentDir, "models.json") };
+}
+
+test("pi enable 只改写 openai baseUrl 并保留用户其他 models.json 配置", () => {
+  const { tempRoot, stateDir, agentDir, modelsPath } = piFixture();
+  const original = {
+    $schema: "https://pi.dev/schemas/models.schema.json",
+    providers: {
+      openai: { modelOverrides: { "gpt-5.4": { reasoning: true } } },
+      anthropic: { apiKey: "$ANTHROPIC_API_KEY" },
+    },
+  };
+  writeFileSync(modelsPath, JSON.stringify(original, null, 2));
+  const managedUrl = `http://127.0.0.1:4102/_codex-router/${callerSecret}/pi/v1`;
+  try {
+    const enabled = runPiConfig(["enable"], tempRoot, agentDir, stateDir);
+    assert.equal(enabled.status, 0, enabled.stderr);
+    assert.equal(enabled.stdout.includes(callerSecret), false);
+    const afterEnable = JSON.parse(readFileSync(modelsPath, "utf8"));
+    assert.equal(afterEnable.providers.openai.baseUrl, managedUrl);
+    assert.deepEqual(afterEnable.providers.openai.modelOverrides, original.providers.openai.modelOverrides);
+    assert.deepEqual(afterEnable.providers.anthropic, original.providers.anthropic);
+    assert.equal(privateFileIsProtected(modelsPath), true);
+    // 重复启用幂等，不叠加配置。
+    assert.equal(runPiConfig(["enable"], tempRoot, agentDir, stateDir).status, 0);
+    assert.deepEqual(JSON.parse(readFileSync(modelsPath, "utf8")), afterEnable);
+    const status = runPiConfig(["status", "--json"], tempRoot, agentDir, stateDir);
+    assert.equal(status.status, 0, status.stderr);
+    assert.equal(status.stdout.includes(callerSecret), false);
+    assert.match(status.stdout, /\[REDACTED\]/);
+    const parsed = JSON.parse(status.stdout);
+    assert.equal(parsed.configured, true);
+    assert.equal(parsed.managed, true);
+    const disabled = runPiConfig(["disable"], tempRoot, agentDir, stateDir);
+    assert.equal(disabled.status, 0, disabled.stderr);
+    const afterDisable = JSON.parse(readFileSync(modelsPath, "utf8"));
+    assert.equal("baseUrl" in afterDisable.providers.openai, false);
+    assert.deepEqual(afterDisable.providers.openai.modelOverrides, original.providers.openai.modelOverrides);
+    assert.deepEqual(afterDisable.providers.anthropic, original.providers.anthropic);
+    assert.equal(runPiConfig(["disable"], tempRoot, agentDir, stateDir).status, 0);
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("pi enable 拒绝覆盖用户自有 baseUrl，disable 不改用户配置", () => {
+  const { tempRoot, stateDir, agentDir, modelsPath } = piFixture();
+  const original = { providers: { openai: { baseUrl: "https://api.openai.com/v1" } } };
+  writeFileSync(modelsPath, JSON.stringify(original, null, 2));
+  try {
+    const enabled = runPiConfig(["enable"], tempRoot, agentDir, stateDir);
+    assert.equal(enabled.status, 1);
+    assert.match(enabled.stderr, /Refusing to replace user-owned openai baseUrl/);
+    assert.deepEqual(JSON.parse(readFileSync(modelsPath, "utf8")), original);
+    const disabled = runPiConfig(["disable"], tempRoot, agentDir, stateDir);
+    assert.equal(disabled.status, 0, disabled.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(modelsPath, "utf8")), original);
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("pi enable 缺少 caller secret 失败；损坏的 models.json 不被改写；空配置在 disable 后删除", () => {
+  const { tempRoot, stateDir, agentDir, modelsPath } = piFixture();
+  rmSync(path.join(stateDir, "caller-secret"));
+  try {
+    assert.equal(runPiConfig(["enable"], tempRoot, agentDir, stateDir).status, 1);
+    writeFileSync(path.join(stateDir, "caller-secret"), `${callerSecret}\n`);
+    writeFileSync(modelsPath, "not json\n");
+    const corrupted = runPiConfig(["enable"], tempRoot, agentDir, stateDir);
+    assert.equal(corrupted.status, 1);
+    assert.equal(readFileSync(modelsPath, "utf8"), "not json\n");
+    const status = runPiConfig(["status", "--json"], tempRoot, agentDir, stateDir);
+    assert.equal(status.status, 0, status.stderr);
+    assert.ok(JSON.parse(status.stdout).error);
+    rmSync(modelsPath);
+    assert.equal(runPiConfig(["enable"], tempRoot, agentDir, stateDir).status, 0);
+    assert.deepEqual(JSON.parse(readFileSync(modelsPath, "utf8")), {
+      providers: {
+        openai: { baseUrl: `http://127.0.0.1:4102/_codex-router/${callerSecret}/pi/v1` },
+      },
+    });
+    assert.equal(runPiConfig(["disable"], tempRoot, agentDir, stateDir).status, 0);
+    assert.equal(existsSync(modelsPath), false);
   } finally {
     rmSync(tempRoot, { recursive: true, force: true });
   }

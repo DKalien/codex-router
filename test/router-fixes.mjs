@@ -257,6 +257,172 @@ test("原生 GPT 主代理和子代理分别遵循各自供应商路由，旧命
   }
 });
 
+test("Pi 命名空间使用独立路由状态与官方上游，并保持 ChatGPT token 字段契约", async () => {
+  const received = [];
+  const upstream = (name) => http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const raw = Buffer.concat(chunks).toString("utf8");
+    received.push({
+      name,
+      url: request.url,
+      authorization: request.headers.authorization,
+      body: raw ? JSON.parse(raw) : null,
+    });
+    if (name === "wlb" && raw.includes("gpt-exhausted")) {
+      response.writeHead(429, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: { type: "usage_limit_reached", message: "quota exhausted for this key" } }));
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(request.method === "GET"
+      ? { object: "list", data: [{ id: "gpt-6-pi" }] }
+      : {
+          output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+          usage: { input_tokens: 3, output_tokens: 1 },
+        }));
+  });
+  const piOfficial = upstream("pi-official");
+  const codexOfficial = upstream("codex-official");
+  const wlb = upstream("wlb");
+  const piPort = await listen(piOfficial);
+  const codexPort = await listen(codexOfficial);
+  const wlbPort = await listen(wlb);
+  const router = await startRouter({
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${codexPort}/backend-api/codex`,
+    PI_NATIVE_BASE_URL: `http://127.0.0.1:${piPort}/v1`,
+    WLB_BASE_URL: `http://127.0.0.1:${wlbPort}`,
+    WLB_API_KEY: "test-wlb-key",
+    CODEX_ROUTER_SESSIONS_PATH: "",
+    CODEX_ROUTER_SESSION_INDEX: "",
+  });
+  const cli = (...args) =>
+    spawnSync(process.execPath, [path.join(root, "src/gpt-route.mjs"), ...args], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CODEX_HOME: router.stateDir,
+        MODEL_ROUTER_STATE_DIR: router.stateDir,
+        WLB_API_KEY: "test-wlb-key",
+      },
+    });
+  const request = async (model, { pi = true, headers = {}, fields = {} } = {}) => {
+    const response = await fetch(
+      `http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/${pi ? "pi/" : ""}v1/responses`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer test-credential", ...headers },
+        body: JSON.stringify({
+          model,
+          input: [{ role: "user", content: "hi" }],
+          stream: false,
+          ...fields,
+        }),
+      },
+    );
+    return { status: response.status, body: await response.json() };
+  };
+  try {
+    // 默认官方：Pi 的官方请求去 OpenAI 官方上游，而不是 Codex 后端。
+    assert.match(cli("pi", "status").stdout, /official/);
+    assert.equal((await request("gpt-6-pi")).status, 200);
+    assert.deepEqual(
+      { name: received.at(-1).name, url: received.at(-1).url, authorization: received.at(-1).authorization },
+      { name: "pi-official", url: "/v1/responses", authorization: "Bearer test-credential" },
+    );
+    // 同一个模型名从 Codex 命名空间进来仍去 Codex 后端，两个客户端互不影响。
+    assert.equal((await request("gpt-6-pi", { pi: false })).status, 200);
+    assert.equal(received.at(-1).name, "codex-official");
+    assert.equal(received.at(-1).url, "/backend-api/codex/responses");
+    // Pi 的 /models 也只透传到 Pi 的官方上游。
+    const models = await fetch(
+      `http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/pi/v1/models`,
+      { headers: { Authorization: "Bearer test-credential" } },
+    );
+    assert.equal(models.status, 200);
+    assert.equal(received.at(-1).name, "pi-official");
+    assert.equal(received.at(-1).url, "/v1/models");
+    // Pi 路由状态独立：切到 WLB 后 Codex 的全局路由保持不变。
+    assert.equal(cli("pi", "wlb").status, 0);
+    assert.equal((await request("gpt-6-pi")).status, 200);
+    assert.equal(received.at(-1).name, "wlb");
+    assert.equal(received.at(-1).body.model, "gpt-6-pi");
+    assert.equal(received.at(-1).authorization, "Bearer test-wlb-key");
+    assert.equal((await request("gpt-6-pi", { pi: false })).status, 200);
+    assert.equal(received.at(-1).name, "codex-official");
+    // Codex 的全局开关同样不改变 Pi 的路由。
+    assert.equal(cli("wlb").status, 0);
+    assert.equal((await request("gpt-6-pi", { pi: false })).status, 200);
+    assert.equal(received.at(-1).name, "wlb");
+    assert.equal(cli("pi", "official").status, 0);
+    assert.equal((await request("gpt-6-pi")).status, 200);
+    assert.equal(received.at(-1).name, "pi-official");
+    // 显式命名空间 slug 在 Pi 下保持原语义。
+    assert.equal((await request("wlb-relay/gpt-5.6-sol")).status, 200);
+    assert.equal(received.at(-1).name, "wlb");
+    assert.equal(received.at(-1).body.model, "gpt-5.6-sol");
+    // ChatGPT token 会丢弃订阅不接受的字段，API key 保持完整字段。
+    const fields = {
+      prompt_cache_retention: "24h",
+      prompt_cache_options: { mode: "explicit" },
+      max_output_tokens: 512,
+      temperature: 0.4,
+    };
+    assert.equal((await request("gpt-6-pi", { headers: { Authorization: "Bearer oauth-token" }, fields })).status, 200);
+    const oauthBody = received.at(-1).body;
+    assert.equal(received.at(-1).name, "pi-official");
+    for (const key of Object.keys(fields)) assert.equal(key in oauthBody, false, key);
+    assert.equal((await request("gpt-6-pi", { headers: { Authorization: "Bearer sk-test" }, fields })).status, 200);
+    const apiKeyBody = received.at(-1).body;
+    for (const key of Object.keys(fields)) assert.deepEqual(apiKeyBody[key], fields[key], key);
+    // configuration_update：ChatGPT token 折回 reasoning.effort，API key 保留原 item。
+    const configInput = [
+      { type: "additional_tools", role: "developer", tools: [] },
+      { role: "user", content: "hi" },
+      { type: "configuration_update", reasoning: { effort: "xhigh" } },
+    ];
+    const configFields = { input: configInput, reasoning: { effort: "medium", summary: "auto" } };
+    assert.equal((await request("gpt-6-pi", { headers: { Authorization: "Bearer oauth-token" }, fields: configFields })).status, 200);
+    const foldedBody = received.at(-1).body;
+    assert.equal(received.at(-1).name, "pi-official");
+    assert.equal(foldedBody.input.some((item) => item.type === "configuration_update"), false);
+    assert.equal(foldedBody.input.some((item) => item.type === "additional_tools"), true);
+    assert.equal(foldedBody.reasoning.effort, "xhigh");
+    assert.equal(foldedBody.reasoning.summary, "auto");
+    assert.equal((await request("gpt-6-pi", { headers: { Authorization: "Bearer sk-test" }, fields: configFields })).status, 200);
+    const unfoldedBody = received.at(-1).body;
+    assert.equal(unfoldedBody.input.some((item) => item.type === "configuration_update"), true);
+    assert.equal(unfoldedBody.reasoning.effort, "medium");
+    // 第三方路由同样折回 configuration_update，不把订阅专属 item 透给上游。
+    assert.equal(cli("pi", "wlb").status, 0);
+    assert.equal((await request("gpt-6-pi", { fields: configFields })).status, 200);
+    assert.equal(received.at(-1).name, "wlb");
+    assert.equal(received.at(-1).body.input.some((item) => item.type === "configuration_update"), false);
+    assert.equal(received.at(-1).body.reasoning.effort, "xhigh");
+    // WLB 明确额度耗尽时回退到 Pi 自己的官方路由，并只改写 Pi 的状态。
+    assert.equal(cli("pi", "wlb").status, 0);
+    const beforeFallback = received.length;
+    assert.equal((await request("gpt-exhausted")).status, 200);
+    assert.deepEqual(received.slice(beforeFallback).map((entry) => entry.name), ["wlb", "pi-official"]);
+    assert.equal(JSON.parse(readFileSync(path.join(router.stateDir, "pi-route.json"), "utf8")).route, "official");
+    assert.equal(JSON.parse(readFileSync(path.join(router.stateDir, "gpt-route.json"), "utf8")).route, "wlb");
+    // Pi 路由状态损坏时只阻断 Pi 请求，并提示 route pi 修复命令。
+    writeFileSync(path.join(router.stateDir, "pi-route.json"), "broken");
+    const broken = await request("gpt-6-pi");
+    assert.equal(broken.status, 503);
+    assert.match(broken.body.error.message, /route pi official/);
+    assert.equal((await request("gpt-6-pi", { pi: false })).status, 200);
+    assert.equal(received.at(-1).name, "wlb");
+    // Pi 暂不支持自动路由。
+    assert.equal(cli("pi", "auto").status, 2);
+  } finally {
+    await router.close();
+    await close(piOfficial);
+    await close(codexOfficial);
+    await close(wlb);
+  }
+});
+
 test("zstd 请求解压覆盖官方及第三方入口，并提前拒绝超大帧", async () => {
   const received = [];
   const upstream = http.createServer(async (request, response) => {

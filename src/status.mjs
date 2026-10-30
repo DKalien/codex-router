@@ -6,8 +6,10 @@ import { fileURLToPath } from "node:url";
 import { credentialStatus } from "./provider-credentials.mjs";
 import {
   GPT_ROUTES,
+  PI_ROUTES,
   SUBAGENT_ROUTES,
   readGptRouteSnapshot,
+  readPiRouteSnapshot,
   readSubagentRouteSnapshot,
 } from "./gpt-route.mjs";
 import {
@@ -15,6 +17,7 @@ import {
   readSubagentAutoRouteStatus,
 } from "./auto-route-state.mjs";
 import { providerSelectionStatus } from "./provider-selection.mjs";
+import { piConfigStatus } from "./pi-config.mjs";
 import { LISTED_MODELS, PROVIDERS } from "./model-registry.mjs";
 import { readInstallManifest } from "./install-manifest.mjs";
 import {
@@ -201,6 +204,28 @@ function subagentRouteStatus(providers) {
   }
 }
 
+function piRouteStatus(providers) {
+  try {
+    const configured = readPiRouteSnapshot();
+    const mode = configured.route;
+    const selected = providers.providers.find(
+      (provider) => provider.id === PI_ROUTES.get(mode).provider,
+    );
+    return {
+      readable: true,
+      mode,
+      ready: mode === "official" || Boolean(selected?.selected && selected?.configured),
+    };
+  } catch (error) {
+    return {
+      readable: false,
+      mode: "unknown",
+      ready: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 function serviceStatus() {
   const status = childJson("service.mjs", ["status"]);
   return status
@@ -227,6 +252,7 @@ export async function collectStatus() {
   const providers = providersStatus();
   const gptRoute = gptRouteStatus(providers);
   const subagentRoute = subagentRouteStatus(providers);
+  const pi = { config: piConfigStatus(), route: piRouteStatus(providers) };
   const service = serviceStatus();
   const manifest = manifestStatus();
   const selectedProviders = providers.providers.filter((provider) => provider.selected);
@@ -238,6 +264,7 @@ export async function collectStatus() {
     catalog,
     gptRoute,
     subagentRoute,
+    pi,
     providers,
     manifest,
     service,
@@ -294,6 +321,18 @@ function printText(status) {
     if (status.subagentRoute.mode === "auto") console.log("  当前供应商：" + (status.subagentRoute.effectiveMode || "pending"));
     if (!status.subagentRoute.readable) console.log(`  ${status.subagentRoute.error}`);
     else if (!status.subagentRoute.ready) console.log(`  ${SUBAGENT_ROUTES.get(status.subagentRoute.mode).label} 凭据或 provider selection 缺失。`);
+  }
+  if (status.pi?.config) {
+    console.log(
+      `Pi models.json：${status.pi.config.managed ? "由本路由器管理" : status.pi.config.configured ? "存在用户自有配置" : "未配置"}` +
+        (status.pi.config.baseUrl ? ` (${status.pi.config.baseUrl})` : ""),
+    );
+    if (status.pi.config.error) console.log(`  ${status.pi.config.error}`);
+  }
+  if (status.pi?.route) {
+    console.log(`Pi 路由：${status.pi.route.mode}`);
+    if (!status.pi.route.readable) console.log(`  ${status.pi.route.error}`);
+    else if (!status.pi.route.ready) console.log(`  ${PI_ROUTES.get(status.pi.route.mode).label} 凭据或 provider selection 缺失。`);
   }
   console.log(
     `Provider selection: ${status.providers.selection.explicit ? "explicit" : "default"} (${status.providers.selection.providers.join(", ") || "none"})`,

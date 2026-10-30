@@ -17,8 +17,11 @@
 ## 目录结构
 
 - `src/router.mjs` — 完整请求路径（官方请求透传、全局 GPT 路由，以及注入各服务商
-  凭据后的旧命名空间直接转发）
-- `src/gpt-route.mjs` — 读写主代理和子代理各自的原生 GPT 路由状态，默认均使用官方路由
+  凭据后的旧命名空间直接转发）；`/pi/v1` 命名空间接入 Pi，官方上游指向 OpenAI
+  Responses API，路由状态与 Codex 独立
+- `src/gpt-route.mjs` — 读写主代理、子代理和 Pi 各自的原生 GPT 路由状态，默认均使用官方路由
+- `src/pi-config.mjs` — 合并或恢复 `~/.pi/agent/models.json` 的 `providers.openai.baseUrl`
+  （指向路由器 `/pi/v1`），不触碰 Pi 的 `auth.json`、模型目录或其他 provider
 - `src/auto-route.mjs` — 请求触发的自动额度查询、默认 30 秒缓存和三档选择
 - `src/auto-route-state.mjs` — 带路由 revision 校验的脱敏有效档位快照；状态查询不联网
 - `src/model-registry.mjs` — 加载并验证 `config/**`；已列出模型的字段可选，但
@@ -75,6 +78,16 @@
   Router，之后 `route` 热切换无需重启。SuperGPT 默认域名固定 DIRECT；自定义
   `SUPERGPT_BASE_URL` 的其他域名如需直连，应显式加入 `NO_PROXY`。
   `route status` 只读且不支持 `--json`，只有总状态命令支持 `status --json`。
+- Pi 接入：`route pi official|wlb|supergpt|status` 管理 Pi 独立的路由状态，不支持
+  auto；Pi 请求不参与子代理识别，WLB 额度耗尽回退只改写 Pi 的状态。官方上游分离：
+  Codex 命名空间去 ChatGPT Codex 后端，`/pi/v1` 去 `PI_NATIVE_BASE_URL`（默认
+  `https://api.openai.com/v1`）。非 `sk-` token（ChatGPT 订阅登录）的官方请求按 Pi
+  直连契约删除 `prompt_cache_retention`、`prompt_cache_options`、`max_output_tokens`
+  和 `temperature`；Pi 的 `configuration_update` input item 在非 `sk-` token 或第三方
+  路由下折回 `reasoning.effort`（订阅共享拒绝该 item 类型），仅官方 + `sk-` key 原样
+  保留。`pi enable`/`pi disable` 只合并或恢复 `models.json` 的
+  `providers.openai.baseUrl`，拒绝覆盖用户自有值，不写 `auth.json`、不做 OAuth、
+  不生成模型目录；写入后的 `models.json` 必须保持仅当前用户可读。
 - 自动模式：主代理可用 `route auto` 启用自动模式，按 **WLB → 官方 GPT → SuperGPT** 的顺序选择；
   额度恢复后，后续请求自动回到最高可用档，配置模式始终保持 `auto`。WLB 读取原始 `1d` / `7d`
   窗口，任一额度耗尽即跳过。GPT 同时监控 5 小时和周窗口：5 小时剩余 **≤10%** 或
@@ -99,6 +112,8 @@
   启用、重复启用和关闭均需保持 TOML 有效。
 - 修改 GPT 路由开关后运行 `node --test test/router-fixes.mjs test/gpt-route-async.mjs`；修改配置管理、服务商
   密钥操作或状态检查后运行 `node --test test/official-catalog.mjs`。
+- 修改 `src/pi-config.mjs`、Pi 路由状态或 router 的 Pi 命名空间后，运行
+  `node --test test/router-fixes.mjs test/official-catalog.mjs test/gpt-route-async.mjs`。
 - 修改 `src/response-usage.mjs`、`src/sse-prefix.mjs`、`src/sse-events.mjs` 或
   `src/mimo-custom-tools.mjs` 后，运行
   `node --test test/response-usage-hardening.mjs`。

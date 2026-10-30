@@ -191,6 +191,54 @@ owner 冲突。安装完成后完全退出并重新打开 Codex，使新的本�
 原生 Web Search 和图片请求必须携带当前 ChatGPT/Codex 会话的 `Authorization`；缺少
 该请求头时路由器直接返回 `401`，不会访问原生上游。
 
+## Pi 接入
+
+Pi（pi.dev）的内置 OpenAI provider 可以复用同一台路由器：Pi 保留自己的官方模型列表、
+登录方式和 thinking 设置，`~/.pi/agent/models.json` 只把 OpenAI 的 `baseUrl` 指向路由器的
+`/_codex-router/<caller-secret>/pi/v1` 命名空间，后台再按 Pi 自己的路由状态转发到官方、
+WLB 或 SuperGPT。不新增网关层，也不复制 Pi 的模型目录。
+
+- **官方上游分离**：Codex 命名空间去 ChatGPT Codex 后端，`/pi/v1` 命名空间去
+  OpenAI Responses API（默认 `https://api.openai.com/v1`，可用 `PI_NATIVE_BASE_URL` 覆盖）。
+  两个客户端的请求和路由状态互不影响。
+- **独立路由状态**：`~/.codex/codex-router/pi-route.json`，与 `route`、`route subagent`
+  完全独立；显式 `wlb-relay/*` 等旧命名空间 slug 在 Pi 下保持原语义。
+- **凭据归 Pi 管**：登录、token 刷新和 `auth.json` 全部由 Pi 自己处理；路由器不写
+  `auth.json`、不做 OAuth、不记录任何凭据。ChatGPT 订阅登录的 token 与 `sk-` API key
+  行为不同：Pi 直连时会省略 `prompt_cache_retention`、`prompt_cache_options`、
+  `max_output_tokens`、`temperature`，路由器对非 `sk-` token 维持同一契约。
+  Pi 发出的 `configuration_update` input item（thinking 级别切换）会被订阅共享拒绝
+  （`subscription_sharing_unsupported_capability`），路由器对非 `sk-` token 及第三方
+  路由一律将其折回 `reasoning.effort`（与 Pi 在 ChatGPT 登录下的行为一致）；
+  `sk-` API key 直连官方时原样保留。
+
+用法（先完成 `install` 并确保路由器服务在运行；`pi enable` 需要已生成的 caller secret）：
+
+```powershell
+.\codex-router.ps1 pi enable          # 合并写入 models.json 的 providers.openai.baseUrl
+.\codex-router.ps1 route pi official  # Pi 的 GPT 请求走官方（默认）
+.\codex-router.ps1 route pi wlb       # Pi 的 GPT 请求走 WLB；supergpt 同理
+.\codex-router.ps1 route pi status
+.\codex-router.ps1 status             # 同时显示 Pi models.json 与 Pi 路由
+.\codex-router.ps1 pi disable         # 恢复 Pi 默认 OpenAI 端点
+```
+
+POSIX：`bin/model-router codex pi enable|disable|status`；路由切换使用
+`bin/model-router codex route pi official|wlb|supergpt|status`。`pi enable` 只改写
+`providers.openai.baseUrl`，拒绝覆盖用户自有 `baseUrl`，其余 provider、`modelOverrides`
+与密钥原样保留；`pi disable` 只删除自己写入的字段，文件清空后删除。写入后的
+`models.json` 会收紧为仅当前用户可读。`PI_CODING_AGENT_DIR` 可覆盖 Pi 的 agent 目录
+（默认 `~/.pi/agent`）。
+
+第一阶段的限制：
+
+- Pi 路由不支持 `auto`：现有额度查询接口面向 Codex 身份，不能拿来为 Pi 的
+  OpenAI 凭据做自动降级决策。
+- Pi 侧没有 Codex 的子代理识别语义，扩展/子进程发起的请求均按主路由处理。
+- WLB 明确额度耗尽时同样回退官方，但只改写 Pi 自己的路由状态。
+- 第三方是否支持 Pi 选中的模型及其工具/推理能力由上游决定；同一任务中途切换
+  服务商同样有历史上下文兼容风险。
+
 ## 维护
 
 - 更新官方模型：无需重建本地目录，Codex 会自行更新官方模型目录。

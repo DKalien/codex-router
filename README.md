@@ -9,7 +9,7 @@ Codex 后端或已配置的第三方服务商。
 `official`/`wlb`/`supergpt`。选择器选中的 `gpt-*` 模型名原样传给
 WLB 或 SuperGPT，新增模型无需修改本地名单，实际可用性取决于上游及 API key 分组支持。全局设置不绑定
 线程，从下一次非子代理的原生 GPT 请求起对所有任务共享；同一任务中途切换服务商可能带来
-历史上下文兼容风险。MiMo 和 WLB 的旧命名空间 slug 仍保留给旧目录或直接请求
+历史上下文兼容风险。WLB 的旧命名空间 slug 仍保留给旧目录或直接请求
 使用，但不会显示在官方模型选择器中。
 
 默认安装不写入 `model_catalog_json`，也不构建静态模型目录；Codex 的官方目录由
@@ -19,9 +19,11 @@ Codex 自己更新。本项目已移除模型元数据更新及静态目录生�
 
 ## 从上游移除了什么
 
-已移除这些服务商不需要的全部组件：LiteLLM 及其他网关或转发层、Python、OAuth
-流程、服务商预设、托盘/桌面应用和自动更新器。服务仅依赖 Node：`src/start.mjs`
-监督一个 `src/router.mjs` 子进程，不再启动额外的网关或转发进程。收到重启信号时，
+路由核心不引入 LiteLLM 及其他网关或转发层、服务商预设、OAuth 流程或自动更新器。
+为了让 Router 与用量悬浮窗只维护一个仓库，桌面监控现在位于根目录的
+`mimo-token-monitor/`，它是可选的 Python/PyQt6 子项目，不由 `src/start.mjs` 导入，也不进入
+Node 请求热路径。服务核心仍只由 `src/start.mjs` 监督一个 `src/router.mjs` 子进程。
+收到重启信号时，
 路由器先停止接收新请求，在途请求最多 drain 2 秒；流式请求收到 terminal error 后
 clean EOF，未发出响应头的请求返回 503。可用 `MODEL_ROUTER_SHUTDOWN_DRAIN_MS`
 调整 drain 时长。仓库保留的检查脚本是 `test/official-catalog.mjs`、
@@ -35,7 +37,7 @@ clean EOF，未发出响应头的请求返回 503。可用 `MODEL_ROUTER_SHUTDOW
 
 ## 架构
 
-三个第三方服务商都原生支持 Responses API，因此请求链路只有：
+两个第三方服务商都原生支持 Responses API，因此请求链路只有：
 
 ```
 Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.mjs
@@ -45,7 +47,6 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
     ├─ GPT 主代理 + route official → ChatGPT Codex 后端（透传 Codex 身份验证）
     ├─ GPT 主代理 + route wlb      → WLB Relay（注入 WLB_API_KEY）
     ├─ GPT 主代理 + route supergpt → SuperGPT（注入 SUPERGPT_API_KEY）
-    ├─ mimo-token-plan/*         → MiMo Token Plan（旧命名空间，注入 MIMO_API_KEY）
     └─ wlb-relay/*               → WLB Relay（旧命名空间，注入 WLB_API_KEY）
 ```
 
@@ -80,10 +81,9 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
   识别复用 `x-openai-subagent`、有效的 `x-codex-parent-thread-id`，或线程 rollout 的
   `source.subagent.thread_spawn`；明确的 `false`/`0` 子代理头不作为证据。rollout 缺失
   或首行未写完时会在下次请求重试；没有可识别证据的请求仍按主代理请求遵循全局开关。
-  此规则只适用于原生 `gpt-*`，显式 `wlb-relay/*` 和 MiMo 路由继续遵循原命名空间。
+  此规则只适用于原生 `gpt-*`，显式 `wlb-relay/*` 路由继续遵循原命名空间。
 - **旧命名空间路由**：WLB 的 `wlb-relay/gpt-5.6-sol`、`terra`、`luna` 与官方
-  GPT slug 一一对应；MiMo 的两个命名空间 slug 继续由原路由处理，但两者都不进入
-  官方选择器。
+  GPT slug 一一对应，但不进入官方选择器。
 - **官方模型列表**：`/models` 和 `/v1/models` 复用原生转发并保留查询参数及官方
   完整响应；WLB 和 SuperGPT 路由也不会把模型列表替换成本地简化目录。没有当前 Codex 登录身份
   时返回 `401`。
@@ -94,15 +94,11 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
   为取消或 `0`；原生 GPT-5.6 请求会移除旧兼容字段 `prompt_cache_retention`，保留
   `prompt_cache_options`。SSE 支持多行 `data:` 和 CR/LF/CRLF 换行；单事件解析缓存
   上限为 8 MiB，超限时仍原样透传，仅跳过该事件的用量统计。
-- **MiMo 长会话兼容**：Codex 的 custom tool 会在请求侧桥接为普通 function tool，
-  JSON/SSE 响应再还原成 custom tool 事件。跨模型续接会保留已经验收的
-  `FINAL_ANSWER`；标准协作 envelope 中的旧 `MESSAGE` 进度不发送给 MiMo，
-  `NEW_TASK` 和 `FOLLOWUP_TASK` 仍保留。第三方路由必须解析原生加密协作载荷时，
+- **第三方协作载荷**：第三方路由必须解析原生加密协作载荷时，
   会按原顺序最多 4 路并发；解密结果保存在进程内 LRU 缓存，逻辑 TTL 为 24 小时，
-  最多 512 条或 8 MiB。路由器估算第三方输入 Token 时不再把不会发送给模型的
+  最多 512 条或 8 MiB。路由器估算第三方输入 Token 时不会把不会发送给模型的
   `encrypted_content` 密文计入提示词大小。切回原生 GPT 时，没有原生加密上下文的
-  第三方 reasoning 会被丢弃，不会作为未持久化的 `rs_*` item 继续回放。MiMo 响应
-  转换的单个 SSE 事件、JSON 响应和累计未完成工具状态各限 8 MiB，超限明确报错。
+  第三方 reasoning 会被丢弃，不会作为未持久化的 `rs_*` item 继续回放。
 - **压缩历史**：第三方摘要必须完整且非空；HTTP 200 中的失败、不完整或空摘要
   返回 502，不生成替换历史，避免丢失续接上下文。省略 status 的有效摘要仍兼容。
 - **错误和日志安全**：请求日志默认关闭；启用后会自动遮盖 HTTP/WS caller URL
@@ -115,8 +111,8 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
 - **代理**：默认通过 `http://127.0.0.1:7897` 转发官方请求，不预先探测端口是否监听。
   显式代理按 `HTTPS_PROXY`、`https_proxy`、`HTTP_PROXY`、`http_proxy` 的优先级覆盖，
   再经 `NODE_USE_ENV_PROXY` 注入路由器。`NO_PROXY` 保留自定义值，并补入
-  `127.0.0.1`、`localhost`、`codex.wlbclub.com`、`token-plan-cn.xiaomimimo.com`
-  和 `api.supergpt.dev`，三个第三方服务商默认 DIRECT（直连）。自定义
+  `127.0.0.1`、`localhost`、`codex.wlbclub.com`
+  和 `api.supergpt.dev`，两个第三方服务商默认 DIRECT（直连）。自定义
   `SUPERGPT_BASE_URL` 的其他域名不会自动直连，需要时将该域名加入 `NO_PROXY`。
   `CODEX_ROUTER_PROXY_PORTS` 已退役，旧配置请改用 `HTTPS_PROXY`；不再定时探测
   或因代理端口变化自动重启。代理配置变更后需重启 Router；代理未运行时，官方请求
@@ -127,7 +123,6 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
 ```powershell
 .\codex-router.ps1 install                    # 安装依赖、密钥、路由器和服务；默认使用官方目录
                                                 # 仅使用官方路由时无需第三方密钥
-.\codex-router.ps1 provider-key mimo-token-plan set  # 使用 MiMo 时再配置
 .\codex-router.ps1 provider-key wlb-relay set        # 使用 WLB 时再配置
 .\codex-router.ps1 provider-key supergpt-relay set   # 使用 SuperGPT 时再配置
 .\codex-router.ps1 route official             # 全局：GPT 主代理请求走官方（默认）
@@ -192,6 +187,25 @@ owner 冲突。安装完成后完全退出并重新打开 Codex，使新的本�
 
 原生 Web Search 和图片请求必须携带当前 ChatGPT/Codex 会话的 `Authorization`；缺少
 该请求头时路由器直接返回 `401`，不会访问原生上游。
+
+
+## MiMo Token Monitor 桌面监控
+
+用量悬浮窗已经合并到本仓库的 `mimo-token-monitor/`，与 Router 共用同一份 Git checkout、
+Router 状态目录和 WLB / SuperGPT 密钥。安装 Python 依赖后，可以从 Router 根目录启动：
+
+```powershell
+python -m pip install -r mimo-token-monitor\requirements.txt
+.\codex-router.ps1 monitor
+```
+
+桌面监控当前面向 Windows，依赖 Win32 单实例和窗口 API；`bin/model-router codex monitor` 仅提供 shell 分发入口，不表示 Linux/macOS GUI 已受支持。Windows 入口运行子项目自己的 `launcher.py`，
+嵌套布局会自动把代码同步目标识别为当前 Router 仓库的 `lite` 分支；直接运行
+`mimo-token-monitor/main.py` 仍可跳过源码同步。修改 Router 核心或监控器源码后，按各自
+测试门禁验证：Router 运行 `npm run check` / `npm test`，监控器在子目录运行
+`python -m unittest discover -s tests`。监控器配置仍保存于本机外置目录，密钥只使用 Router
+受保护的供应商存储，不写入 Git。完整说明见 [监控器 README](mimo-token-monitor/README.md)。
+旧独立仓库 [DKalien/-u5t-f0r-funny-v1BecOdin9](https://github.com/DKalien/-u5t-f0r-funny-v1BecOdin9) 保留最终源码和开发历史备份；后续开发仅在本仓库进行。
 
 ## Pi 接入
 
@@ -258,7 +272,7 @@ POSIX：`bin/model-router codex pi enable|disable|status`；路由切换使用
   `test/*.mjs`，不需要真实服务商密钥。
 - CI：`.github/workflows/ci.yml` 在推送或提交 PR 到 `lite` 时自动运行，也支持手动触发；
   覆盖 Ubuntu、macOS、Windows，以及最低支持版本 Node 22.19.0 和 Node 24，执行语法检查、
-  服务商注册表验证和全部回归测试。不执行在线模型发现或旧桌面应用/Python 构建。
+  服务商注册表验证和全部回归测试。不执行在线模型发现或桌面监控的 Python 构建。
 - 旧聊天仍报 WLB：若会话绑定第三方 provider，或错误 URL 直接指向第三方，切换 GPT
   模型或 Router 的 `route` 不会迁移该会话的 provider。请使用官方 OpenAI provider
   新建通过本地 Router 的聊天，再切换路由；直接请求第三方的会话不经过 Router 回退。

@@ -5,14 +5,13 @@
 
 ## 范围
 
-只保留三个第三方服务商。它们都原生支持 Responses API，并由 `src/router.mjs`
-直接转发（没有 LiteLLM、转发器或 Python）：
+只保留两个第三方服务商。它们都原生支持 Responses API，并由 `src/router.mjs`
+直接转发（没有 LiteLLM 或额外网关；桌面监控是独立子项目，不进入此请求路径）：
 
-- `mimo-token-plan` — `config/mimo/` — `https://token-plan-cn.xiaomimimo.com/v1`
 - `wlb-relay` — `config/wlb/` — `https://codex.wlbclub.com`
 - `supergpt-relay` — `config/supergpt/` — `https://api.supergpt.dev/v1`
 
-不得重新引入网关/转发层、服务商预设、OAuth 流程、托盘应用或自动更新器。
+路由器核心不得重新引入网关/转发层、服务商预设、OAuth 流程或自动更新器；合并的 `mimo-token-monitor/` 仅作为可选桌面监控子项目运行。
 
 ## 目录结构
 
@@ -32,12 +31,10 @@
   探测期间缓存的字节
 - `src/sse-events.mjs` — 有界解析 SSE 事件，支持多行 `data:` 与 CR/LF/CRLF；
   空行 CR 到达即结束事件，不等待后续字节
-- `src/mimo-custom-tools.mjs` — 只处理 MiMo 的 custom tool/agent message 兼容、
-  旧 `MESSAGE` 进度裁剪和 JSON/SSE 响应还原
 - `src/start.mjs` — 监督唯一的路由器子进程并注入代理环境：官方请求默认走固定
   `http://127.0.0.1:7897`，不预先探测监听；显式 `HTTPS_PROXY`、`https_proxy`、
   `HTTP_PROXY`、`http_proxy` 按此优先级覆盖。`NO_PROXY` 保留自定义值并补入回环
-  地址及 WLB/MiMo/SuperGPT 默认域名，三个第三方默认 DIRECT（直连）。
+  地址及 WLB/SuperGPT 默认域名，两个第三方默认 DIRECT（直连）。
   `CODEX_ROUTER_PROXY_PORTS` 已退役，旧配置改用 `HTTPS_PROXY`；不定时探测或因
   端口变化自动重启。保留启动健康检查、进程退出及信号清理。Windows 后台服务
   原子登记 `service.pid`，退出时只清理仍属于自己的 PID；服务管理按已登记启动器的
@@ -48,19 +45,20 @@
   就绪，install 及 POSIX start/restart 由通用入口检查，均最多 60 秒。监督器自身
   启动预算为 30 秒，最后一次探针可能越过预算，单次探针最多 10 秒。
 - `codex-router.ps1` / `install.ps1` — Windows 入口；`bin/` — POSIX 入口
+- `mimo-token-monitor/` — 可选 Python/PyQt6 用量悬浮窗及其测试；通过 `codex-router.ps1 monitor` 或 `bin/model-router codex monitor` 启动，与 Node Router 共用当前仓库和受保护供应商密钥，但不被 Node 请求路径导入。
 
 ## 规则
 
 - 不提供模型元数据更新或静态目录生成入口，也不写入 `model_catalog_json`；官方
   目录由 Codex 自己更新。服务商密钥操作不得触发目录重建。保留旧目录状态读取和
-  配置迁移兼容；MiMo 的两个及 WLB 的三个命名空间 slug 继续由路由器转发。
+  配置迁移兼容；WLB 的三个命名空间 slug 继续由路由器转发。
 - `route official|wlb|supergpt|auto|status` 管理或读取主代理全局 GPT 路由；`route subagent
   official|wlb|supergpt|status` 管理独立的子代理供应商路由。缺少状态文件时均默认为
   `official`。主代理设置从下一次非子代理的原生 GPT 请求起对所有任务共享，不绑定线程；
   子代理设置对所有任务的已识别原生 `gpt-*` 子代理共享，不读取主代理路由状态，
   上游错误直接返回，不触发 WLB 自动回退。识别复用子代理/父线程请求头和
   rollout 的 `source.subagent.thread_spawn`；缺失或未写完的 rollout 不缓存负结果，
-  没有可识别证据时仍遵循主代理全局路由。显式 `wlb-relay/*` 与 MiMo 路由保持原语义。
+  没有可识别证据时仍遵循主代理全局路由。显式 `wlb-relay/*` 路由保持原语义。
   同一任务中途切换服务商可能带来历史上下文兼容风险。`wlb` 原样转发请求中的 `gpt-*` 模型名，不依赖旧目录注册，
   上游不支持时返回错误；仅手动 WLB 模式的主代理明确额度耗尽且尚未输出时自动保存为 `official`，默认立即
   使用原始 Codex 身份继续普通或压缩请求。手动设置和回退共用跨进程锁，
@@ -70,7 +68,7 @@
   每次写入更新 revision，兼容旧状态文件缺少该字段。
   普通限流、认证失败、套餐不包含 API
   和已输出的流不切换；缺少官方身份、路由状态损坏或状态写入失败时不回退。显式
-  `wlb-relay/*` 和 MiMo 保持原语义。等待复用可取消的 `sleep`，由
+  `wlb-relay/*` 保持原语义。等待复用可取消的 `sleep`，由
   `CODEX_ROUTER_WLB_FALLBACK_DELAY_MS` 调整（0 至 30000 毫秒整数，其他值默认 0），
   不修改 Codex 客户端的重连间隔；切换后需手动 `route wlb` 才恢复 WLB。
   `supergpt` 同样按原始 `gpt-*` 模型名转发，不新增旧命名空间模型条目或生成目录；
@@ -114,19 +112,14 @@
   密钥操作或状态检查后运行 `node --test test/official-catalog.mjs`。
 - 修改 `src/pi-config.mjs`、Pi 路由状态或 router 的 Pi 命名空间后，运行
   `node --test test/router-fixes.mjs test/official-catalog.mjs test/gpt-route-async.mjs`。
-- 修改 `src/response-usage.mjs`、`src/sse-prefix.mjs`、`src/sse-events.mjs` 或
-  `src/mimo-custom-tools.mjs` 后，运行
+- 修改 `src/response-usage.mjs`、`src/sse-prefix.mjs` 或 `src/sse-events.mjs` 后，运行
   `node --test test/response-usage-hardening.mjs`。
 - 修改 `src/http-utils.mjs`、`src/router.mjs` 或 `src/router-health.mjs` 的请求/响应
   有界读取或健康 deadline 路径后，运行 `node --test test/http-health-bounds.mjs`。
 - 修改 `src/file-security.mjs` 或 `src/provider-credentials.mjs` 后，运行
   `node --test test/credential-file-security.mjs`。
 - 修改 Windows 后台子进程调用后，运行 `node --test test/windows-hidden-consoles.mjs`。
-- MiMo 兼容必须保持服务商隔离：标准 envelope 的旧 `MESSAGE` 进度不回放，
-  `FINAL_ANSWER`、`NEW_TASK`、`FOLLOWUP_TASK` 仍保留；原生 GPT、WLB 和 SuperGPT 不得应用
-  MiMo 专属的历史裁剪或 custom-tool 映射。
-- SSE 用量解析缓存单事件最多 8 MiB，超限仍按字节透传并跳过该事件解析；MiMo
-  转换的单个事件、JSON 响应和累计未完成工具状态各限 8 MiB，超限必须明确报错。
+- SSE 用量解析缓存单事件最多 8 MiB，超限仍按字节透传并跳过该事件解析。
 - 第三方压缩必须拒绝失败、不完整或空摘要，不得返回替换历史；普通及压缩请求的
   上游错误统一限读 64 KiB 并脱敏。响应流及缓冲读取均遵循闲置超时和请求取消。
 - 切回原生 GPT 时，只能回放 `encrypted_content` 符合原生 `gAAAAA...` token
@@ -145,3 +138,10 @@
   环境变量中的密钥。
 - Node 的 `fetch` 不使用 Windows 系统代理；任何在 `src/start.mjs` 环境之外
   发起 fetch 的进程也必须携带代理环境变量。
+
+## 合并的桌面监控
+
+- `mimo-token-monitor/` 是 Router 仓库内的独立 Python 子项目；不要把 PyQt、Requests 或 Playwright 导入 `src/router.mjs`、`src/start.mjs` 或 Node 服务生命周期。
+- 从 Router 根目录启动桌面监控使用 `codex-router.ps1 monitor`（Windows）或 `bin/model-router codex monitor`（POSIX）；入口会在嵌套布局下将源码同步分支设为 `lite`。
+- 监控器修改后在 `mimo-token-monitor/` 运行 `python -m unittest discover -s tests`；Router 修改后继续执行本文件规定的 Node 检查。
+- 监控器的 WLB / SuperGPT 密钥只能通过 Router 现有受保护凭据接口写入；不要把密钥写入仓库内 SQLite、JSON、命令行参数或日志。

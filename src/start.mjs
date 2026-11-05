@@ -77,7 +77,6 @@ const noProxy = [
   "127.0.0.1",
   "localhost",
   "codex.wlbclub.com",
-  "token-plan-cn.xiaomimimo.com",
   "api.supergpt.dev",
 ].filter(Boolean).join(",");
 const commonEnv = {

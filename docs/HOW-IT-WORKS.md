@@ -12,7 +12,6 @@ sequenceDiagram
   participant C as Codex
   participant R as src/router.mjs
   participant N as 原生 Codex 后端
-  participant M as MiMo Token Plan
   participant W as WLB Relay
   participant S as SuperGPT
 
@@ -26,9 +25,6 @@ sequenceDiagram
   else 已识别的原生 GPT 子代理 + subagent supergpt 或 GPT 主代理 + route supergpt
     R->>S: /v1/responses、同名 GPT 模型和 SuperGPT 密钥
     S-->>R: Responses 响应或数据流
-  else mimo-token-plan/*（旧命名空间）
-    R->>M: /responses、MiMo 模型和 MiMo 密钥
-    M-->>R: Responses 响应或数据流
   else wlb-relay/*（旧命名空间）
     R->>W: /responses、上游 GPT 模型和 WLB 密钥
     W-->>R: Responses 响应或数据流
@@ -47,11 +43,14 @@ sequenceDiagram
 提供代理环境：默认固定使用 `http://127.0.0.1:7897`，不预先探测端口监听；
 显式 `HTTPS_PROXY`、`https_proxy`、`HTTP_PROXY`、`http_proxy` 按此优先级覆盖。
 `NO_PROXY` 保留已有自定义值，并补入 `127.0.0.1`、`localhost`、
-`codex.wlbclub.com`、`token-plan-cn.xiaomimimo.com` 和 `api.supergpt.dev`，
-官方请求走代理，三个第三方默认 DIRECT（直连）。`CODEX_ROUTER_PROXY_PORTS`
+`codex.wlbclub.com` 和 `api.supergpt.dev`，
+官方请求走代理，两个第三方默认 DIRECT（直连）。`CODEX_ROUTER_PROXY_PORTS`
 已退役，旧配置请改用 `HTTPS_PROXY`；删除定时探测和端口变化自动重启，代理环境
 变更后需重启 Router。子进程启动、健康检查及退出/信号清理保持原语义。请求路径中没有
-网关、API 转发器、Python 进程、OAuth 流程、托盘应用或更新器。
+网关、API 转发器、Python 进程、OAuth 流程、托盘应用或更新器。仓库根目录另有可选的
+`mimo-token-monitor/` Python/PyQt6 桌面监控子项目；它通过 `codex-router.ps1 monitor`
+或 `bin/model-router codex monitor` 单独启动，不由 `src/start.mjs` 导入，也不参与 Node
+路由服务生命周期。
 
 Windows 后台服务由 `src/service-windows.mjs` 通过计划任务管理。后台启动的
 `src/start.mjs` 会将监督进程 PID 原子写入 `service.pid`；停止或重启时，服务管理器
@@ -72,9 +71,21 @@ Windows 的 `start`/`restart` 只由平台管理器执行最多 60 秒的就绪�
 和 POSIX 的 `start`/`restart` 由通用入口执行最多 60 秒的就绪检查。监督器自身的
 30 秒启动预算检查仍保留，因此不能将所有启动调用都视为只有一轮健康检查。
 
+
+## 桌面监控与迁移
+
+`mimo-token-monitor/` 是同仓库内的 Windows Python/PyQt6 应用，保留 MiMo 套餐、WLB/GPT 用量、
+SuperGPT 余额、托盘维护和 Claude HUD 快照。它以独立进程运行，操作 Router 时调用现有 Node 入口。
+WLB 和 SuperGPT 查询每次刷新读取与 Router 共用的密钥；设置保存通过 stdin 调用 Router 的
+`writeProviderCredential` / `enableProvider`，沿用原子写入和私有 ACL，不把 Key 放进命令行或设置数据库。
+旧设置中的非空 Key 首次启动迁入共享存储，以旧悬浮窗设置值为准；成功后清理旧字段，失败停止启动并提示。
+
+启动方式、Python 依赖、旧独立仓库备份与本地数据边界见 [监控器说明](../mimo-token-monitor/README.md)。
+从旧目录切到新目录时继续使用同一个 `MIMO_TOKEN_MONITOR_DATA_DIR`，不迁移或覆盖 Cookie、设置和浏览器资料。
+
 ## 官方目录与旧模型目录
 
-`src/model-registry.mjs` 从 `config/` 加载三个服务商描述文件及已有模型片段，并验证
+`src/model-registry.mjs` 从 `config/` 加载两个服务商描述文件及已有模型片段，并验证
 服务商 ID、带命名空间的 slug、上游模型名称和已列出的元数据。服务商必须显式声明
 `protocol: openai-responses`；旧 Chat/Anthropic 网关协议及其协作工具转换已退役。
 自定义注册表若遗漏协议，仅在上游已原生支持 Responses 时补入该字段；其他协议
@@ -82,7 +93,6 @@ Windows 的 `start`/`restart` 只由平台管理器执行最多 60 秒的就绪�
 
 | 服务商 | 基础 URL 来源 | 凭据文件 |
 | --- | --- | --- |
-| `mimo-token-plan` | `config/mimo/mimo.json` | `mimo-api-key.secret` |
 | `wlb-relay` | `config/wlb/wlb.json` | `wlb-api-key.secret` |
 | `supergpt-relay` | `config/supergpt/supergpt.json` | `supergpt-api-key.secret` |
 
@@ -90,7 +100,7 @@ Windows 的 `start`/`restart` 只由平台管理器执行最多 60 秒的就绪�
 `model_catalog_json`；官方模型选择器由 Codex 自己维护。设置或删除服务商密钥
 仅修改凭据及服务商启用状态，不再捕获或重建模型目录。
 
-MiMo 的两个及 WLB 的三个命名空间 slug 保留给已有目录或直接请求；原生 GPT
+WLB 的三个命名空间 slug 保留给已有目录或直接请求；原生 GPT
 全局路由继续使用官方选择器中的模型名。已有的 `native-models.json` 和
 `merged-models.json` 仅保留兼容读取，不会由本项目更新或自动删除。
 
@@ -111,7 +121,7 @@ MiMo 的两个及 WLB 的三个命名空间 slug 保留给已有目录或直接�
 WLB 请求明确额度耗尽时，才自动保存主代理路由为 `official`，默认立即以原始 Codex 身份重发
 当前尚未输出的请求；后续 GPT 主代理请求也走官方。普通限流、认证失败、套餐不包含
 API 和已开始输出的流不切换；没有非空官方 `Authorization` 或状态保存失败时不访问
-官方。状态损坏或 owner 校验失败时停止切换并报告错误。显式 `wlb-relay/*`、MiMo
+官方。状态损坏或 owner 校验失败时停止切换并报告错误。显式 `wlb-relay/*`
 保持原语义；子代理请求不触发自动回退，也不改写主代理状态。主代理额度恢复后需手动运行
 `route wlb`。路由文件保持
 version 1，并在每次写入时生成新 revision，兼容没有 revision 的旧文件。手动设置
@@ -149,7 +159,7 @@ Node Router 在请求到来时刷新额度，默认缓存 30 秒；没有整机�
 `/responses`、`/responses/compact` 和 `/responses` 内以 `compaction_trigger` 触发的
 压缩 v2；没有独立的 `/responses/compact/v2` 端点。主代理 WLB 额度耗尽转官方同样覆盖
 这三种请求，并从原始请求重建官方请求体，保留原端点、模型、工具及官方身份，复用
-原生历史清理；WLB 密钥不会带到官方。官方返回错误时直接透传，不循环切换。显式 `wlb-relay/*` 与 MiMo
+原生历史清理；WLB 密钥不会带到官方。官方返回错误时直接透传，不循环切换。显式 `wlb-relay/*`
 命名空间路由保持原语义。
 
 官方路由使用白名单 Codex 请求头并保留客户端 `Authorization`，将请求转发给原生
@@ -176,29 +186,18 @@ Codex 登录身份时，这两个端点返回 `401`。
 
 上游省略 `content-type` 时，`src/sse-prefix.mjs` 会在最多 512 bytes 的前缀内识别
 SSE。字段名可跨 chunk，开头允许 UTF-8 BOM、注释和空行；探测期间缓存的原始字节会
-按顺序交回响应处理器。Token 用量统计和 MiMo custom tool 还原共用该判定，非 SSE
+按顺序交回响应处理器。Token 用量统计共用该判定，非 SSE
 响应则保持原路径。`src/sse-events.mjs` 共用事件解析支持多行 `data:` 和 CR/LF/CRLF，
 包括跨 chunk 的 CRLF；空行 CR 到达即交付事件，不等待后续字节。按固定块积累事件
 避免逐 chunk 全量复制，单事件缓存上限 8 MiB。用量统计超限时释放已缓存原字节并
 继续透传，跳过该事件解析，在下一事件恢复；未修改的事件始终保持原字节。第三方输入 Token 的兜底估算会扣除 `encrypted_content` 字符串值，
 因为这些密文不是模型可见提示词；未知字段仍默认计入，保持向上估算。
 
-MiMo 的 Responses 网关不接受 Codex 扩展的 `custom_tool_call` 和 `agent_message`。
-路由器因此在 MiMo 路径上增加专属转换：custom tool 定义和历史调用以带单个
-`input` 字符串参数的 function tool 上送，JSON/SSE 中对应的 function call 再还原为
-custom tool 事件；普通 function tool 保持不变。标准协作 envelope 中的 `MESSAGE`
-是未验收的中间进度，跨模型续接时不再回放；`FINAL_ANSWER`、`NEW_TASK`、
-`FOLLOWUP_TASK` 及无法识别的类型仍保留。compact 路径应用同一规则。原生 GPT、
-WLB 和 SuperGPT 不做这项 MiMo 专属裁剪或 custom-tool 映射。MiMo 转换的单个 SSE
-事件、JSON 响应及累计未完成工具状态各限 8 MiB；工具完成时释放对应状态，超限
-明确失败，不把未转换的 function tool 静默传回客户端。
-
 第三方路由仍需回放的标准原生 `agent_message` envelope 可能只含不可由本地解开的
 `encrypted_content`。路由器使用原生 Codex 后端的受控 function call 取回明文，
 最多 4 路并发并按输入索引回填。明文只放在当前路由器进程的 LRU 缓存中，逻辑 TTL
 为 24 小时，上限为 512 条或 8 MiB；不会主动持久化到模型目录、日志或凭据文件。
-MiMo 裁掉旧 `MESSAGE` 进度后，新设备和服务重启后的首次续接通常无需解密这些
-历史项；仍需解密的载荷由 4 路并发避免串行，LRU 则加速同一进程内的后续续接。
+仍需解密的载荷由 4 路并发避免串行，LRU 则加速同一进程内的后续续接。
 
 响应流以及错误体、压缩和协作 relay 的缓冲读取连续 300 秒没有任何数据时，
 路由器会取消上游读取。SSE 会收到固定的
@@ -232,7 +231,7 @@ Windows 原生解码器崩溃。后台凭据 ACL 与服务管理的非交互 Pow
 
 路由器只监听回环地址，并在读取请求前检查每次安装生成的 caller 凭据。
 `src/start.mjs` 设置 `NODE_USE_ENV_PROXY=1` 并将 `HTTP_PROXY`/`HTTPS_PROXY`
-传递给上游 fetch。WLB/MiMo/SuperGPT 默认域名固定 DIRECT；自定义 `SUPERGPT_BASE_URL` 的其他域名
+传递给上游 fetch。WLB/SuperGPT 默认域名固定 DIRECT；自定义 `SUPERGPT_BASE_URL` 的其他域名
 如需直连，应显式加入 `NO_PROXY`。服务商 URL 和 TLS 行为
 仍由服务商注册表及 Node 的正常 HTTPS 验证控制。
 
@@ -251,8 +250,8 @@ node scripts-check.mjs
 日常只读检查使用 `codex-router.ps1 status`（Windows）或
 `bin/model-router codex status`（POSIX）；它只读取本地健康端点、Codex 配置、官方或
 旧模型目录模式、Provider 凭据状态、安装清单和后台服务，不会自动修复或请求上游。
-官方目录模式不要求静态 8 模型目录；为了兼容已有安装，旧目录状态检查仍要求
-精确的 8 个目录 slug（包括 5 个路由 slug）。健康检查、受管配置、未降级的 Provider 选择以及相应凭据
+官方目录模式不要求静态模型目录；为了兼容已有安装，旧目录状态检查仍要求
+精确的 6 个目录 slug（包括 3 个路由 slug）。健康检查、受管配置、未降级的 Provider 选择以及相应凭据
 满足时，退出码才为 0；否则为 1，参数错误为 2。只有总状态命令支持 `--json`，即
 `status --json`；`route status` 是只读文本查询，不接受 `--json`。
 
@@ -271,7 +270,6 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | 文件 | 职责 |
 | --- | --- |
 | `src/router.mjs` | caller 验证、模型分发、原生搜索/图片、协作载荷 relay、直接转发、数据流和压缩摘要 |
-| `src/mimo-custom-tools.mjs` | MiMo custom tool/agent message 的请求转换、历史裁剪和 JSON/SSE 响应还原 |
 | `src/response-usage.mjs` | 从 JSON 或 SSE 响应提取 Token 用量并保持响应透传 |
 | `src/sse-prefix.mjs` | 有界识别无 `content-type` 的 SSE 并保持探测字节顺序 |
 | `src/sse-events.mjs` | 有界 SSE 事件解析、多行 data、CR/LF/CRLF 和原字节还原 |
@@ -282,10 +280,10 @@ installer 目前会拒绝 foreign state owner，应继续从原 checkout 更新�
 | `src/start.mjs` | 监督一个路由器子进程并提供代理环境 |
 | `src/status.mjs` | 只读汇总路由器、配置、目录模式、主代理/子代理 GPT 路由、Provider、安装和服务状态 |
 | `src/service-windows.mjs` | 管理 Windows 计划任务，先优雅排空再强杀已验证的监督进程树，启动/重启等待健康检查 |
-| `config/mimo/`、`config/wlb/`、`config/supergpt/` | 三个服务商的描述文件及已有模型片段 |
+| `config/wlb/`、`config/supergpt/` | 两个服务商的描述文件及已有模型片段 |
 | `test/official-catalog.mjs` | 检查官方目录状态、旧配置迁移、多代理子表去重及密钥操作不重建目录 |
-| `test/router-fixes.mjs` | 检查路由、MiMo 历史兼容、relay 并发/缓存、统计、脱敏、有界错误和流式 idle timeout |
-| `test/response-usage-hardening.mjs` | 检查 split/BOM SSE、字节透传、MiMo 还原和密文 Token 估算 |
+| `test/router-fixes.mjs` | 检查路由、relay 并发/缓存、统计、脱敏、有界错误和流式 idle timeout |
+| `test/response-usage-hardening.mjs` | 检查 split/BOM SSE、字节透传和密文 Token 估算 |
 | `test/http-health-bounds.mjs` | 检查 zstd 帧头边界、请求 drain/中止、响应超限取消和健康 deadline |
 | `test/credential-file-security.mjs` | 检查凭据 symlink/非文件拒绝和 Windows ACL 规范化 |
 | `test/graceful-shutdown.mjs` | 检查重启 drain、SSE terminal error、503 fallback、stop 文件触发和 idle keep-alive 快速退出 |

@@ -121,6 +121,6 @@ test("start 固定代理无需监听，显式代理依次优先，直连名单�
     assert.equal(snapshot.no_proxy, snapshot.NO_PROXY);
     assert.equal(snapshot.NODE_USE_ENV_PROXY, "1");
     const direct = snapshot.NO_PROXY.split(",");
-    for (const host of ["example.test", "127.0.0.1", "localhost", "codex.wlbclub.com", "token-plan-cn.xiaomimimo.com", "api.supergpt.dev"]) assert.ok(direct.includes(host), `NO_PROXY missing ${host}`);
+    for (const host of ["example.test", "127.0.0.1", "localhost", "codex.wlbclub.com", "api.supergpt.dev"]) assert.ok(direct.includes(host), `NO_PROXY missing ${host}`);
   }
 });

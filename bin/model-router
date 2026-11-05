@@ -8,10 +8,10 @@ usage() {
 Usage: model-router codex COMMAND [arguments]
 
 Commands:
-  install, provider-key, enable, disable, uninstall, start, status, route, pi
+  install, provider-key, enable, disable, uninstall, start, status, route, pi, monitor
 
   ./bin/model-router codex install
-  ./bin/model-router codex provider-key mimo-token-plan set
+  ./bin/model-router codex provider-key wlb-relay set
   ./bin/model-router codex provider-key supergpt-relay set
   ./bin/model-router codex route official|wlb|supergpt|auto|status
   ./bin/model-router codex route subagent official|wlb|supergpt|status
@@ -35,7 +35,7 @@ case "$target" in
 esac
 
 case "$command" in
-  install|provider-key|enable|disable|uninstall|start|status|route|pi) ;;
+  install|provider-key|enable|disable|uninstall|start|status|route|pi|monitor) ;;
   *) echo "Unknown command: $command" >&2; usage >&2; exit 2 ;;
 esac
 
@@ -49,5 +49,8 @@ if [ "$command" = pi ]; then
 fi
 if [ "$command" = status ]; then
   exec node "$repo_dir/src/status.mjs" "$@"
+fi
+if [ "$command" = monitor ]; then
+  exec "$repo_dir/bin/monitor" "$@"
 fi
 exec "$repo_dir/bin/$command" "$@"

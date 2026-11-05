@@ -345,8 +345,7 @@ function modelProblem(model, providers, slugs, gatewayModels) {
   }
   if (model.listed) {
     // Listed fields are optional and validated when present. Catalog metadata
-    // is provider-specific: WLB clones its exact native upstream entry while
-    // MiMo emits its explicit Xiaomi field set.
+    // is provider-specific: WLB clones its exact native upstream entry.
     for (const field of [
       "displayName",
       "description",

@@ -239,7 +239,7 @@ test("移除 provider 密钥不再重建或修改已有模型目录", () => {
   writeFileSync(configPath, config);
   writeFileSync(keyPath, "test-retired-catalog-key\n");
   writeFileSync(path.join(stateDir, "enabled-providers.json"), JSON.stringify({
-    version: 1, providers: ["mimo-token-plan", "wlb-relay"],
+    version: 1, providers: ["wlb-relay", "supergpt-relay"],
   }));
 
   try {
@@ -259,7 +259,7 @@ test("移除 provider 密钥不再重建或修改已有模型目录", () => {
     assert.doesNotMatch(result.stdout, /refresh the model picker/);
     assert.equal(existsSync(keyPath), false);
     const selection = JSON.parse(readFileSync(path.join(stateDir, "enabled-providers.json"), "utf8"));
-    assert.deepEqual(selection.providers, ["mimo-token-plan"]);
+    assert.deepEqual(selection.providers, ["supergpt-relay"]);
     assert.equal(readFileSync(nativePath, "utf8"), "invalid legacy capture\n");
     assert.equal(readFileSync(mergedPath, "utf8"), "existing legacy catalog\n");
     assert.equal(readFileSync(configPath, "utf8"), config);

@@ -308,7 +308,7 @@ function printText(status) {
     console.log("目录：官方 Codex 目录");
   } else {
     console.log(`Catalog: ${status.catalog.total} models, ${status.catalog.routed} routed`);
-    if (!status.catalog.exact) console.log("  Catalog entries do not match the required 8-model set.");
+    if (!status.catalog.exact) console.log("  Catalog entries do not match the required catalog set.");
   }
   if (status.gptRoute) {
     console.log(`GPT 路由：${status.gptRoute.mode}`);

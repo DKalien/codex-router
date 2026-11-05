@@ -26,7 +26,7 @@ test("生成重定向不重放请求、不泄露地址，模型查询仍可重�
   const child = spawn(process.execPath, ["src/router.mjs"], { cwd: process.cwd(), windowsHide: true,
     env: { ...process.env, CODEX_HOME: dir, MODEL_ROUTER_STATE_DIR: dir, CODEX_ROUTER_PORT: String(port),
       CODEX_ROUTER_CALLER_KEY: key, CODEX_ROUTER_QUIET: "1", NODE_USE_ENV_PROXY: "0",
-      CODEX_NATIVE_BASE_URL: upstream, PI_NATIVE_BASE_URL: upstream, MIMO_BASE_URL: upstream, MIMO_API_KEY: "test-key" },
+      CODEX_NATIVE_BASE_URL: upstream, PI_NATIVE_BASE_URL: upstream, WLB_BASE_URL: upstream, WLB_API_KEY: "test-key" },
     stdio: ["ignore", "ignore", "pipe"] });
   try {
     let log = "";
@@ -37,7 +37,7 @@ test("生成重定向不重放请求、不泄露地址，模型查询仍可重�
     });
     const base = `http://127.0.0.1:${port}/_codex-router/${key}`;
     for (const [endpoint, model] of [["/v1/responses", "gpt-test"], ["/pi/v1/responses", "gpt-test"],
-      ["/v1/responses", "mimo-token-plan/mimo-v2-flash"], ["/v1/responses/compact", "mimo-token-plan/mimo-v2-flash"],
+      ["/v1/responses", "wlb-relay/gpt-5.6-sol"], ["/v1/responses/compact", "wlb-relay/gpt-5.6-sol"],
       ["/v1/images/generations", "gpt-image-2"]]) {
       for (status of [301, 302, 303, 307, 308]) {
         const before = origins;

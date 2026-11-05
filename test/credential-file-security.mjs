@@ -28,7 +28,7 @@ const [{ protectPrivateFile, protectPrivateFileAsync, privateFileIsProtected }, 
     import("../src/provider-credentials.mjs"),
   ]);
 
-const provider = PROVIDERS.get("mimo-token-plan");
+const provider = PROVIDERS.get("wlb-relay");
 
 test.after(() => rmSync(sandbox, { recursive: true, force: true }));
 

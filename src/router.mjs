@@ -58,12 +58,6 @@ import {
   tokenUsageFromPayload,
 } from "./response-usage.mjs";
 import { fetchWithRetry, sleep } from "./upstream-retry.mjs";
-import {
-  MimoCustomToolCallTransform,
-  convertMimoRequestInput,
-  convertMimoRequestTools,
-  pruneMimoAgentProgress,
-} from "./mimo-custom-tools.mjs";
 import { activityMetadataFromHeaders } from "./codex-session-names.mjs";
 import { isUsageExhausted, translateGatewayError } from "./error-translation.mjs";
 import { createAutoRouteController } from "./auto-route.mjs";
@@ -1042,12 +1036,7 @@ function extractResponseText(payload) {
 }
 
 async function summarize(request, payload, route, signal) {
-  const originalInput =
-    route.provider === "mimo-token-plan" && Array.isArray(payload.input)
-      ? pruneMimoAgentProgress(payload.input)
-      : Array.isArray(payload.input)
-        ? payload.input
-        : [];
+  const originalInput = Array.isArray(payload.input) ? payload.input : [];
   // Compaction replays the whole conversation, so any image still in it would
   // reach the text-only model unbridged and fail the compaction rather than
   // the turn. The evidence is already cached from the turn that pasted it.
@@ -1062,8 +1051,6 @@ async function summarize(request, payload, route, signal) {
     route,
     request,
   );
-  const compactInput =
-    route.provider === "mimo-token-plan" ? convertMimoRequestInput(bridged) : bridged;
   const body = {
     ...payload,
     model: route.upstreamModel,
@@ -1072,7 +1059,7 @@ async function summarize(request, payload, route, signal) {
     // xAI rejects tool_choice "none" paired with it, so the field is omitted
     // rather than sent redundantly.
     tools: [],
-    input: [...compactInput, messageItem(COMPACT_PROMPT)],
+    input: [...bridged, messageItem(COMPACT_PROMPT)],
   };
   delete body.previous_response_id;
   delete body.client_metadata;
@@ -1426,7 +1413,6 @@ async function handleResponses(request, response, requestUrl, client = "codex") 
     let upstream;
     let retries;
     let routedBody;
-    let mimoCustomToolNames;
     for (;;) {
       if (autoMode) {
         const current = readAutoRoute();
@@ -1475,14 +1461,9 @@ async function handleResponses(request, response, requestUrl, client = "codex") 
 
       let target;
       let headers;
-      mimoCustomToolNames = undefined;
       if (route) {
-        const routedInput =
-          route.provider === "mimo-token-plan" && Array.isArray(payload.input)
-            ? pruneMimoAgentProgress(payload.input)
-            : payload.input;
         const input = await bridgeVisionInput(
-          await normalizeRoutedAgentInput(request, routedInput, controller.signal),
+          await normalizeRoutedAgentInput(request, payload.input, controller.signal),
           route,
           request,
         );
@@ -1492,18 +1473,6 @@ async function handleResponses(request, response, requestUrl, client = "codex") 
           model: route.upstreamModel,
           input,
         };
-        if (route.provider === "mimo-token-plan") {
-          const converted = convertMimoRequestTools(routed.tools);
-          routed.tools = converted.tools;
-          routed.input = convertMimoRequestInput(routed.input);
-          mimoCustomToolNames = converted.names;
-        }
-        // Codex adds hosted search from the built-in OpenAI provider capability,
-        // even when the selected MiMo catalog entry says search is unsupported.
-        // Xiaomi rejects the whole turn before the model runs if it sees this tool.
-        if (route.provider === "mimo-token-plan" && Array.isArray(routed.tools)) {
-          routed.tools = routed.tools.filter((tool) => tool?.type !== "web_search");
-        }
         // Native OpenAI traffic keeps client_metadata; routed providers do not
         // consume it and the strict ones reject the unknown field.
         delete routed.client_metadata;
@@ -1601,14 +1570,6 @@ async function handleResponses(request, response, requestUrl, client = "codex") 
       },
     );
     const transforms = [usageTransform];
-    if (mimoCustomToolNames?.size) {
-      transforms.push(
-        new MimoCustomToolCallTransform(
-          mimoCustomToolNames,
-          upstream.headers.get("content-type") || "",
-        ),
-      );
-    }
     await pipeResponse(upstream, response, HOP_BY_HOP_HEADERS, transforms, {
       eventStream: payload.stream === true,
     });

@@ -42,14 +42,14 @@ const { writeProviderCredential } = await import(pathToFileURL(path.join(root, "
 let failure;
 if (mode === "ordinary") {
   const { primaryCredentialPath } = await import(pathToFileURL(path.join(root, "src/provider-credentials.mjs")));
-  const target = primaryCredentialPath((await import(pathToFileURL(path.join(root, "src/model-registry.mjs")))).PROVIDERS.get("mimo-token-plan"));
+  const target = primaryCredentialPath((await import(pathToFileURL(path.join(root, "src/model-registry.mjs")))).PROVIDERS.get("wlb-relay"));
   fs.writeFileSync(target, "old");
 }
-try { writeProviderCredential("mimo-token-plan", "synthetic"); } catch (error) { failure = error; }
+try { writeProviderCredential("wlb-relay", "synthetic"); } catch (error) { failure = error; }
 assert.ok(failure);
 if (mode === "ordinary") {
   const { primaryCredentialPath } = await import(pathToFileURL(path.join(root, "src/provider-credentials.mjs")));
-  const target = primaryCredentialPath((await import(pathToFileURL(path.join(root, "src/model-registry.mjs")))).PROVIDERS.get("mimo-token-plan"));
+  const target = primaryCredentialPath((await import(pathToFileURL(path.join(root, "src/model-registry.mjs")))).PROVIDERS.get("wlb-relay"));
   assert.equal(fs.readFileSync(target, "utf8"), "old");
   assert.equal(fs.existsSync(attempted), false);
 } else assert.equal(fs.readFileSync(foreign, "utf8"), "foreign");

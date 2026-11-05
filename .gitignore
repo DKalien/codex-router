@@ -17,3 +17,6 @@ apps/desktop/src-tauri/icons/icon.icns
 .env
 .env.*
 !.env.example
+
+mimo-token-monitor/.ruff_cache/
+mimo-token-monitor/.pytest_cache/

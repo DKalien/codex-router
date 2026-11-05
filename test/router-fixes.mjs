@@ -67,7 +67,6 @@ async function startRouter(overrides = {}) {
       CODEX_ROUTER_QUIET: "1",
       NODE_USE_ENV_PROXY: "0",
       NO_PROXY: "127.0.0.1,localhost",
-      MIMO_API_KEY: "test-mimo-key",
       ...overrides,
     },
     stdio: ["ignore", "ignore", "pipe"],
@@ -486,7 +485,7 @@ test("孤立 app 工具结果在第三方普通及压缩请求保留，官方和
     response.end(JSON.stringify({ output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "摘要" }] }] }));
   });
   const port = await listen(upstream);
-  const router = await startRouter({ CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${port}`, MIMO_BASE_URL: `http://127.0.0.1:${port}`, WLB_BASE_URL: `http://127.0.0.1:${port}`, WLB_API_KEY: "test-wlb-key" });
+  const router = await startRouter({ CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${port}`, WLB_BASE_URL: `http://127.0.0.1:${port}`, WLB_API_KEY: "test-wlb-key" });
   const orphan = { type: "function_call_output", namespace: "codex_app", name: "read_thread", output: { text: "保留结果" } };
   const untouched = [
     { ...orphan, call_id: "existing-call" },
@@ -496,7 +495,7 @@ test("孤立 app 工具结果在第三方普通及压缩请求保留，官方和
   ];
   const input = [orphan, { ...orphan, call_id: "", output: "字符串结果" }, ...untouched];
   try {
-    for (const model of ["gpt-5.6-sol", "wlb-relay/gpt-5.6-sol", "mimo-token-plan/mimo-v2.5-pro"]) {
+    for (const model of ["gpt-5.6-sol", "wlb-relay/gpt-5.6-sol"]) {
       for (const endpoint of ["responses", "responses/compact"]) {
         const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/${endpoint}`, {
           method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer test-official" },
@@ -603,9 +602,9 @@ test("native 丢弃不可回放 reasoning 并保留合法 reasoning 和普通消
           input: [
             {
               type: "reasoning",
-              id: "rs_mimo",
+              id: "rs_third",
               summary: [],
-              content: [{ type: "reasoning_text", text: "MiMo reasoning" }],
+              content: [{ type: "reasoning_text", text: "third-party reasoning" }],
               encrypted_content: null,
             },
             { type: "reasoning", id: "rs_missing", summary: [] },
@@ -855,398 +854,6 @@ test("独立 Web Search 请求只转发给原生后端", async () => {
   }
 });
 
-test("MiMo 请求不会透传不支持的托管 Web Search 工具", async () => {
-  let upstreamBody;
-  const mimo = http.createServer(async (request, response) => {
-    const chunks = [];
-    for await (const chunk of request) chunks.push(chunk);
-    upstreamBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    response.writeHead(200, { "Content-Type": "application/json" });
-    response.end('{"status":"completed","output":[]}');
-  });
-  const mimoPort = await listen(mimo);
-  const routerPort = await unusedPort();
-  const stateDir = mkdtempSync(path.join(os.tmpdir(), "codex-router-fixes-"));
-  const router = spawn(process.execPath, [path.join(root, "src", "router.mjs")], {
-    cwd: root,
-    env: {
-      ...process.env,
-      CODEX_HOME: stateDir,
-      MODEL_ROUTER_STATE_DIR: stateDir,
-      CODEX_ROUTER_CALLER_KEY: callerKey,
-      CODEX_ROUTER_PORT: String(routerPort),
-      CODEX_ROUTER_QUIET: "1",
-      MIMO_API_KEY: "test-mimo-key",
-      MIMO_BASE_URL: `http://127.0.0.1:${mimoPort}`,
-      NODE_USE_ENV_PROXY: "0",
-      NO_PROXY: "127.0.0.1,localhost",
-    },
-    stdio: ["ignore", "ignore", "pipe"],
-  });
-
-  try {
-    const [startup] = await once(router.stderr, "data", {
-      signal: AbortSignal.timeout(5_000),
-    });
-    assert.match(startup.toString("utf8"), /\[codex-router\] listening/);
-
-    const response = await fetch(
-      `http://127.0.0.1:${routerPort}/_codex-router/${callerKey}/v1/responses`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "mimo-token-plan/mimo-v2.5-pro",
-          input: "check upstream updates",
-          tools: [
-            { type: "web_search", external_web_access: false },
-            {
-              type: "function",
-              name: "exec_command",
-              description: "Run a command",
-              parameters: { type: "object", properties: {} },
-            },
-          ],
-          tool_choice: "auto",
-          stream: false,
-        }),
-      },
-    );
-    const responseBody = await response.text();
-
-    assert.equal(response.status, 200, responseBody);
-    assert.equal(JSON.parse(responseBody).status, "completed");
-    assert.equal(upstreamBody.model, "mimo-v2.5-pro");
-    assert.deepEqual(upstreamBody.tools.map((tool) => tool.type), ["function"]);
-  } finally {
-    router.kill("SIGTERM");
-    if (router.exitCode === null) await once(router, "exit");
-    await close(mimo);
-    rmSync(stateDir, { recursive: true, force: true });
-  }
-});
-
-test("MiMo 将 custom tool 历史桥接为 function 并还原流式调用", async () => {
-  let upstreamBody;
-  const mimo = http.createServer(async (request, response) => {
-    const chunks = [];
-    for await (const chunk of request) chunks.push(chunk);
-    upstreamBody = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    const events = [
-      {
-        type: "response.output_item.added",
-        output_index: 0,
-        item: {
-          id: "fc_exec",
-          type: "function_call",
-          status: "in_progress",
-          name: "exec",
-          call_id: "call_exec",
-          arguments: "",
-        },
-      },
-      {
-        type: "response.function_call_arguments.delta",
-        item_id: "fc_exec",
-        output_index: 0,
-        delta: '{"input":"echo ',
-      },
-      {
-        type: "response.function_call_arguments.delta",
-        item_id: "fc_exec",
-        output_index: 0,
-        delta: 'hello"}',
-      },
-      {
-        type: "response.function_call_arguments.done",
-        item_id: "fc_exec",
-        output_index: 0,
-        arguments: '{"input":"echo hello"}',
-      },
-      {
-        type: "response.output_item.done",
-        output_index: 0,
-        item: {
-          id: "fc_exec",
-          type: "function_call",
-          status: "completed",
-          name: "exec",
-          call_id: "call_exec",
-          arguments: '{"input":"echo hello"}',
-        },
-      },
-      {
-        type: "response.output_item.added",
-        output_index: 1,
-        item: {
-          id: "fc_plain",
-          type: "function_call",
-          status: "in_progress",
-          name: "ordinary",
-          call_id: "call_plain",
-          arguments: "",
-        },
-      },
-      {
-        type: "response.function_call_arguments.delta",
-        item_id: "fc_plain",
-        output_index: 1,
-        delta: '{"value":"ok"}',
-      },
-      {
-        type: "response.function_call_arguments.done",
-        item_id: "fc_plain",
-        output_index: 1,
-        arguments: '{"value":"ok"}',
-      },
-      {
-        type: "response.output_item.done",
-        output_index: 1,
-        item: {
-          id: "fc_plain",
-          type: "function_call",
-          status: "completed",
-          name: "ordinary",
-          call_id: "call_plain",
-          arguments: '{"value":"ok"}',
-        },
-      },
-      {
-        type: "response.completed",
-        response: { status: "completed", output: [] },
-      },
-    ];
-    response.writeHead(200, { "Content-Type": "text/event-stream" });
-    events.forEach((event, sequence_number) => {
-      response.write(`event: ${event.type}\ndata: ${JSON.stringify({ ...event, sequence_number })}\n\n`);
-    });
-    response.end("data: [DONE]\n\n");
-  });
-  const mimoPort = await listen(mimo);
-  const routerPort = await unusedPort();
-  const stateDir = mkdtempSync(path.join(os.tmpdir(), "codex-router-fixes-"));
-  const router = spawn(process.execPath, [path.join(root, "src", "router.mjs")], {
-    cwd: root,
-    env: {
-      ...process.env,
-      CODEX_HOME: stateDir,
-      MODEL_ROUTER_STATE_DIR: stateDir,
-      CODEX_ROUTER_CALLER_KEY: callerKey,
-      CODEX_ROUTER_PORT: String(routerPort),
-      CODEX_ROUTER_QUIET: "1",
-      MIMO_API_KEY: "test-mimo-key",
-      MIMO_BASE_URL: `http://127.0.0.1:${mimoPort}`,
-      NODE_USE_ENV_PROXY: "0",
-      NO_PROXY: "127.0.0.1,localhost",
-    },
-    stdio: ["ignore", "ignore", "pipe"],
-  });
-
-  try {
-    const [startup] = await once(router.stderr, "data", {
-      signal: AbortSignal.timeout(5_000),
-    });
-    assert.match(startup.toString("utf8"), /\[codex-router\] listening/);
-
-    const response = await fetch(
-      `http://127.0.0.1:${routerPort}/_codex-router/${callerKey}/v1/responses`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "mimo-token-plan/mimo-v2.5-pro",
-          input: [
-            {
-              type: "custom_tool_call",
-              id: "hist_exec",
-              status: "completed",
-              call_id: "hist_call_exec",
-              name: "exec",
-              input: "pwd",
-            },
-            {
-              type: "custom_tool_call_output",
-              id: "hist_exec_output",
-              status: "completed",
-              call_id: "hist_call_exec",
-              output: "C:/work",
-            },
-            {
-              type: "agent_message",
-              id: "hist_agent",
-              status: "completed",
-              author: "agent-a",
-              recipient: "agent-b",
-              internal_chat_message_metadata_passthrough: { trace: "drop-me" },
-              content: [
-                {
-                  type: "input_text",
-                  text: "Message Type: FINAL_ANSWER\nPayload:",
-                },
-                { type: "encrypted_content", encrypted_content: "visible handoff" },
-                { type: "output_text", text: "drop this extension content" },
-              ],
-            },
-            {
-              type: "message",
-              role: "user",
-              content: [{ type: "input_text", text: "ordinary message" }],
-            },
-            {
-              type: "function_call",
-              id: "hist_plain",
-              status: "completed",
-              call_id: "hist_call_plain",
-              name: "ordinary",
-              arguments: '{"value":"old"}',
-            },
-          ],
-          tools: [
-            {
-              type: "custom",
-              name: "exec",
-              description: "Run a command",
-              format: { type: "grammar", syntax: "lark", definition: "start: /.+/" },
-            },
-            {
-              type: "function",
-              name: "ordinary",
-              description: "An ordinary function",
-              parameters: {
-                type: "object",
-                properties: { value: { type: "string" } },
-                required: ["value"],
-              },
-            },
-          ],
-          stream: true,
-        }),
-      },
-    );
-    const responseBody = await response.text();
-    assert.equal(response.status, 200, responseBody);
-
-    const outputEvents = responseBody
-      .split(/\r?\n\r?\n/)
-      .map((block) => block
-        .split(/\r?\n/)
-        .find((line) => line.startsWith("data:")))
-      .filter((line) => line && line.slice(5).trim() !== "[DONE]")
-      .map((line) => JSON.parse(line.slice(5)));
-    const execAdded = outputEvents.find(
-      (event) => event.type === "response.output_item.added" && event.item?.id === "fc_exec",
-    );
-    assert.equal(execAdded.item.type, "custom_tool_call");
-    assert.equal(execAdded.item.input, "");
-    const execDelta = outputEvents.find(
-      (event) => event.type === "response.custom_tool_call_input.delta",
-    );
-    assert.equal(execDelta.delta, "echo hello");
-    const execDone = outputEvents.find(
-      (event) => event.type === "response.custom_tool_call_input.done",
-    );
-    assert.equal(execDone.input, "echo hello");
-    const execItemDone = outputEvents.find(
-      (event) => event.type === "response.output_item.done" && event.item?.id === "fc_exec",
-    );
-    assert.equal(execItemDone.item.type, "custom_tool_call");
-    assert.equal(execItemDone.item.input, "echo hello");
-    assert.equal(
-      outputEvents.some(
-        (event) => event.type === "response.function_call_arguments.done" && event.item_id === "fc_exec",
-      ),
-      false,
-    );
-    const ordinaryDone = outputEvents.find(
-      (event) => event.type === "response.output_item.done" && event.item?.id === "fc_plain",
-    );
-    assert.equal(ordinaryDone.item.type, "function_call");
-    assert.equal(ordinaryDone.item.name, "ordinary");
-    assert.equal(ordinaryDone.item.arguments, '{"value":"ok"}');
-
-    const execTool = upstreamBody.tools.find((tool) => tool.name === "exec");
-    assert.deepEqual(execTool, {
-      type: "function",
-      name: "exec",
-      description: "Run a command",
-      parameters: {
-        type: "object",
-        properties: { input: { type: "string" } },
-        required: ["input"],
-        additionalProperties: false,
-      },
-    });
-    assert.deepEqual(
-      upstreamBody.tools.find((tool) => tool.name === "ordinary"),
-      {
-        type: "function",
-        name: "ordinary",
-        description: "An ordinary function",
-        parameters: {
-          type: "object",
-          properties: { value: { type: "string" } },
-          required: ["value"],
-        },
-      },
-    );
-    const historyExec = upstreamBody.input.find((item) => item.id === "hist_exec");
-    assert.equal(historyExec.type, "function_call");
-    assert.equal(historyExec.call_id, "hist_call_exec");
-    assert.equal(historyExec.name, "exec");
-    assert.deepEqual(JSON.parse(historyExec.arguments), { input: "pwd" });
-    const historyOutput = upstreamBody.input.find((item) => item.id === "hist_exec_output");
-    assert.equal(historyOutput.type, "function_call_output");
-    assert.equal(historyOutput.call_id, "hist_call_exec");
-    assert.equal(historyOutput.output, "C:/work");
-    assert.deepEqual(upstreamBody.input.find((item) => item.id === "hist_plain"), {
-      type: "function_call",
-      id: "hist_plain",
-      status: "completed",
-      call_id: "hist_call_plain",
-      name: "ordinary",
-      arguments: '{"value":"old"}',
-    });
-    assert.equal(upstreamBody.input.some((item) => item.type === "agent_message"), false);
-    assert.deepEqual(
-      upstreamBody.input.find((item) =>
-        item.type === "message" &&
-        item.content?.some((part) => part.text === "visible handoff"),
-      ),
-      {
-        type: "message",
-        role: "user",
-        content: [
-          { type: "input_text", text: "Message Type: FINAL_ANSWER\nPayload:" },
-          { type: "input_text", text: "visible handoff" },
-        ],
-      },
-    );
-    assert.deepEqual(
-      upstreamBody.input.find((item) =>
-        item.type === "message" &&
-        item.content?.some((part) => part.text === "ordinary message"),
-      ),
-      {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text: "ordinary message" }],
-      },
-    );
-    assert.equal(
-      upstreamBody.input.some((item) =>
-        item.type === "message" &&
-        item.content?.some((part) => part.type === "encrypted_content"),
-      ),
-      false,
-    );
-  } finally {
-    router.kill("SIGTERM");
-    if (router.exitCode === null) await once(router, "exit");
-    await close(mimo);
-    rmSync(stateDir, { recursive: true, force: true });
-  }
-});
-
 test("agent_message relay 有界并发、按序保留并命中缓存", async () => {
   let activeRelays = 0;
   let maxInFlight = 0;
@@ -1271,18 +878,18 @@ test("agent_message relay 有界并发、按序保留并命中缓存", async () 
     }));
   });
   const nativePort = await listen(native);
-  const mimoBodies = [];
-  const mimo = http.createServer(async (request, response) => {
+  const wlbBodies = [];
+  const wlb = http.createServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
-    mimoBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    wlbBodies.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
     response.writeHead(200, { "Content-Type": "application/json" });
     response.end('{"status":"completed","output":[]}');
   });
-  const mimoPort = await listen(mimo);
+  const wlbPort = await listen(wlb);
   const router = await startRouter({
     CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${nativePort}/backend-api/codex`,
-    MIMO_BASE_URL: `http://127.0.0.1:${mimoPort}`,
+    WLB_BASE_URL: `http://127.0.0.1:${wlbPort}`, WLB_API_KEY: "test-wlb-key",
   });
   const payloadCount = 263;
   const input = Array.from({ length: payloadCount }, (_, index) => ({
@@ -1301,7 +908,7 @@ test("agent_message relay 有界并发、按序保留并命中缓存", async () 
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "mimo-token-plan/mimo-v2.5-pro",
+          model: "wlb-relay/gpt-5.6-sol",
           input: items,
           stream: false,
         }),
@@ -1317,14 +924,14 @@ test("agent_message relay 有界并发、按序保留并命中缓存", async () 
     assert.ok(maxInFlight <= 4, `relay concurrency exceeded limit: ${maxInFlight}`);
     assert.equal(relayCount, payloadCount);
     assert.deepEqual(
-      mimoBodies[0].input.map((item) => item.content?.at(-1)?.text),
+      wlbBodies[0].input.map((item) => item.content?.at(-1)?.text),
       expected,
     );
 
     await send(input);
     assert.equal(relayCount, payloadCount);
     assert.deepEqual(
-      mimoBodies[1].input.map((item) => item.content?.at(-1)?.text),
+      wlbBodies[1].input.map((item) => item.content?.at(-1)?.text),
       expected,
     );
 
@@ -1347,10 +954,10 @@ test("agent_message relay 有界并发、按序保留并命中缓存", async () 
       ],
     });
     await send(completed);
-    assert.equal(relayCount, payloadCount + 1);
+    assert.equal(relayCount, payloadCount + 3);
     assert.deepEqual(
-      mimoBodies[2].input.map((item) => item.content?.at(-1)?.text),
-      ["plain-completed-final"],
+      wlbBodies[2].input.map((item) => item.content?.at(-1)?.text),
+      ["plain-completed-0", "plain-completed-1", "plain-completed-final"],
     );
 
     const latest = [completed[2], {
@@ -1363,9 +970,10 @@ test("agent_message relay 有界并发、按序保留并命中缓存", async () 
       ],
     }];
     await send(latest);
-    assert.equal(relayCount, payloadCount + 1);
-    assert.deepEqual(mimoBodies[3].input.map((item) => item.content?.at(-1)?.text), [
+    assert.equal(relayCount, payloadCount + 4);
+    assert.deepEqual(wlbBodies[3].input.map((item) => item.content?.at(-1)?.text), [
       "plain-completed-final",
+      "plain-completed-latest",
     ]);
 
     const retained = [
@@ -1386,17 +994,17 @@ test("agent_message relay 有界并发、按序保留并命中缓存", async () 
       },
     ];
     await send(retained);
-    assert.equal(relayCount, payloadCount + 3);
-    assert.equal(mimoBodies[4].input.length, retained.length);
-    assert.deepEqual(mimoBodies[4].input.slice(0, 2).map((item) => item.content?.at(-1)?.text), [
+    assert.equal(relayCount, payloadCount + 6);
+    assert.equal(wlbBodies[4].input.length, retained.length);
+    assert.deepEqual(wlbBodies[4].input.slice(0, 2).map((item) => item.content?.at(-1)?.text), [
       "plain-retained-new-task",
       "plain-retained-followup",
     ]);
-    assert.match(mimoBodies[4].input[2].content?.[0]?.text || "", /handoff without recognized type/);
+    assert.match(wlbBodies[4].input[2].content?.[0]?.text || "", /handoff without recognized type/);
   } finally {
     await router.close();
     await close(native);
-    await close(mimo);
+    await close(wlb);
   }
 });
 
@@ -1487,7 +1095,7 @@ test("上游巨型错误只读取有界内容并脱敏", async () => {
     response.end(body);
   });
   const upstreamPort = await listen(upstream);
-  const router = await startRouter({ MIMO_BASE_URL: `http://127.0.0.1:${upstreamPort}` });
+  const router = await startRouter({ WLB_BASE_URL: `http://127.0.0.1:${upstreamPort}`, WLB_API_KEY: "test-wlb-key" });
   try {
     const response = await fetch(
       `http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/responses`,
@@ -1495,7 +1103,7 @@ test("上游巨型错误只读取有界内容并脱敏", async () => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "mimo-token-plan/mimo-v2.5-pro",
+          model: "wlb-relay/gpt-5.6-sol",
           input: "test",
           stream: false,
         }),
@@ -1521,7 +1129,7 @@ test("静默 SSE 在 idle timeout 后发送 terminal error", async () => {
   });
   const upstreamPort = await listen(upstream);
   const router = await startRouter({
-    MIMO_BASE_URL: `http://127.0.0.1:${upstreamPort}`,
+    WLB_BASE_URL: `http://127.0.0.1:${upstreamPort}`, WLB_API_KEY: "test-wlb-key",
     CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS: "100",
   });
   try {
@@ -1531,7 +1139,7 @@ test("静默 SSE 在 idle timeout 后发送 terminal error", async () => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "mimo-token-plan/mimo-v2.5-pro",
+          model: "wlb-relay/gpt-5.6-sol",
           input: "test",
           stream: true,
         }),
@@ -1555,7 +1163,7 @@ test("非 SSE 在首字节 idle timeout 后返回 504 JSON", async () => {
   });
   const upstreamPort = await listen(upstream);
   const router = await startRouter({
-    MIMO_BASE_URL: `http://127.0.0.1:${upstreamPort}`,
+    WLB_BASE_URL: `http://127.0.0.1:${upstreamPort}`, WLB_API_KEY: "test-wlb-key",
     CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS: "100",
   });
   try {
@@ -1565,7 +1173,7 @@ test("非 SSE 在首字节 idle timeout 后返回 504 JSON", async () => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "mimo-token-plan/mimo-v2.5-pro",
+          model: "wlb-relay/gpt-5.6-sol",
           input: "test",
           stream: false,
         }),
@@ -1598,7 +1206,7 @@ test("持续 SSE chunk 会重置 idle timeout", async () => {
   });
   const upstreamPort = await listen(upstream);
   const router = await startRouter({
-    MIMO_BASE_URL: `http://127.0.0.1:${upstreamPort}`,
+    WLB_BASE_URL: `http://127.0.0.1:${upstreamPort}`, WLB_API_KEY: "test-wlb-key",
     CODEX_ROUTER_STREAM_IDLE_TIMEOUT_MS: "300",
   });
   try {
@@ -1608,7 +1216,7 @@ test("持续 SSE chunk 会重置 idle timeout", async () => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: "mimo-token-plan/mimo-v2.5-pro",
+          model: "wlb-relay/gpt-5.6-sol",
           input: "test",
           stream: true,
         }),

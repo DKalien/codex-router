@@ -340,9 +340,10 @@ class CodeSyncWorker(QThread):
 
     completed = pyqtSignal(object)
 
-    def __init__(self, mode: str, parent=None):
+    def __init__(self, mode: str, parent=None, expected_remote: str = ""):
         super().__init__(parent)
         self.mode = mode  # "check" | "apply"
+        self.expected_remote = expected_remote
 
     def run(self):
         project_root = os.path.dirname(os.path.abspath(__file__))
@@ -350,7 +351,9 @@ class CodeSyncWorker(QThread):
             if self.mode == "check":
                 result = code_sync.run_explicit_code_check(project_root)
             else:
-                result = code_sync.run_explicit_code_update(project_root)
+                result = code_sync.run_explicit_code_update(
+                    project_root, expected_remote=self.expected_remote
+                )
         except Exception:
             result = code_sync.SyncResult(
                 code_sync.SyncStatus.FAILED, "code_sync", "代码更新执行异常"
@@ -502,7 +505,8 @@ class SettingsDialog(QDialog):
                 edit.setFocus()
                 return False
             edit.setText(normalized)
-            if usage_url.endpoint_host(normalized) != usage_url.endpoint_host(default):
+            host = usage_url.endpoint_host(normalized)
+            if host and host != usage_url.endpoint_host(default):
                 answer = QMessageBox.question(
                     self,
                     f"{label} Base URL 确认",
@@ -513,6 +517,9 @@ class SettingsDialog(QDialog):
                 )
                 if answer != QMessageBox.StandardButton.Yes:
                     return False
+                approved = set(self.cfg.get("approved_base_url_hosts") or [])
+                approved.add(host)
+                self.cfg["approved_base_url_hosts"] = sorted(approved)
         return True
 
     def accept(self):
@@ -796,6 +803,7 @@ class TokenWidget(QWidget):
         self._queued_router_operation: str | None = None
         self._code_sync_worker: CodeSyncWorker | None = None
         self._code_update_action: QAction | None = None
+        self._base_url_declined: set[str] = set()
         self._router_actions: list[QAction] = []
         self._claude_profiles: list[dict] = []
         self._claude_profile_actions: dict[str, QAction] = {}
@@ -1514,7 +1522,9 @@ class TokenWidget(QWidget):
             self._set_router_status("已取消代码更新", None, clear_after=5000)
             return
         self._set_router_status("正在快进更新代码...")
-        self._code_sync_worker = CodeSyncWorker("apply", self)
+        self._code_sync_worker = CodeSyncWorker(
+            "apply", self, expected_remote=check.remote_commit
+        )
         self._code_sync_worker.completed.connect(self._on_code_update_done)
         self._code_sync_worker.start()
 
@@ -2220,10 +2230,62 @@ class TokenWidget(QWidget):
                 reset_line,
             )
 
+    def _confirm_base_url_first_use(
+        self, label: str, base_url: str, default_base: str
+    ) -> bool:
+        """旧配置中的非默认域名首次使用前必须确认；确认前不发送共享 Key。
+
+        已确认主机记入 ``approved_base_url_hosts`` 持久化；本会话内拒绝过的
+        主机不再重复询问，但依旧不发送密钥。无效 URL 直接放行给请求层，
+        由其在发送密钥前拒绝。
+        """
+        try:
+            normalized = usage_url.validate_base_url(
+                base_url, default_base=default_base, label=label
+            )
+        except usage_url.UsageUrlError:
+            return True
+        host = usage_url.endpoint_host(normalized)
+        if not host or host == usage_url.endpoint_host(default_base):
+            return True
+        approved = set(self.cfg.get("approved_base_url_hosts") or [])
+        if host in approved:
+            return True
+        if host in self._base_url_declined:
+            return False
+        answer = QMessageBox.question(
+            self,
+            f"{label} Base URL 首次使用确认",
+            f"{label} Base URL 使用非默认域名 {host}（可能来自旧配置）。\n"
+            "确认前不会向该主机发送共享 API Key。\n"
+            "是否信任该地址并继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._base_url_declined.add(host)
+            return False
+        approved.add(host)
+        self.cfg["approved_base_url_hosts"] = sorted(approved)
+        save_config(self.cfg)
+        return True
+
     def _do_fetch_supergpt_balance(self):
         if self._exit_requested or self.cfg.get("display_mode", MIMO_MODE) != OVERVIEW_MODE:
             return
         if self._supergpt_worker is not None:
+            return
+        if not self._confirm_base_url_first_use(
+            "SuperGPT",
+            self.cfg.get("supergpt_base_url", ""),
+            supergpt_balance.DEFAULT_BASE_URL,
+        ):
+            self._on_supergpt_balance_done({
+                "ok": False,
+                "balance": None,
+                "currency": None,
+                "error": "SuperGPT Base URL 非默认域名未确认，已跳过查询（未发送共享 Key）",
+            })
             return
         self._supergpt_worker = SuperGPTBalanceWorker(
             self,
@@ -2257,9 +2319,18 @@ class TokenWidget(QWidget):
         """Dispatch third-party usage fetch."""
         if self._exit_requested:
             return
-        if hasattr(self, "_tp_worker") and self._tp_worker.isRunning():
+        worker = getattr(self, "_tp_worker", None)
+        if worker is not None and worker.isRunning():
             return
         base_url = self.cfg.get("third_party_base_url", "https://codex.wlbclub.com")
+        if not self._confirm_base_url_first_use(
+            "WLB", base_url, api_client.DEFAULT_THIRD_PARTY_BASE_URL
+        ):
+            self._on_third_party_fetch_done({
+                "ok": False,
+                "error": "WLB Base URL 非默认域名未确认，已跳过查询（未发送共享 Key）",
+            })
+            return
         self._tp_worker = ThirdPartyFetchWorker(base_url)
         self._tp_worker.finished.connect(self._on_third_party_fetch_done)
         self._tp_worker.start()

@@ -297,6 +297,32 @@ class TestCodeSync(unittest.TestCase):
         self.assertIn("监控器 1 个文件", summary)
         self.assertEqual(scope_summary([], "mimo-token-monitor"), "无文件变更")
 
+    def test_pull_cancels_when_remote_commit_changes_after_check(self):
+        service = CodeSyncService(self.fixture.config())
+        self._clone_and_push_file("mimo-token-monitor/main.py", "remote-v2\n")
+
+        check = service.check_updates()
+        self.assertTrue(check.has_updates)
+        self.assertTrue(check.remote_commit)
+
+        # 检查后远端又有新提交：执行必须取消且不改变工作区
+        self._clone_and_push_file("other-project/keep.txt", "more\n")
+        before = run_git(self.fixture.repo, "rev-parse", "HEAD").stdout
+
+        result = service.pull_latest(expected_remote=check.remote_commit)
+
+        self.assertEqual(result.status, SyncStatus.SKIPPED)
+        self.assertIn("取消", result.message)
+        self.assertIn("重新检查", result.message)
+        self.assertEqual(run_git(self.fixture.repo, "rev-parse", "HEAD").stdout, before)
+
+        # 重新检查并以新 SHA 确认后即可安全快进
+        recheck = service.check_updates()
+        self.assertTrue(recheck.has_updates)
+        self.assertNotEqual(recheck.remote_commit, check.remote_commit)
+        result = service.pull_latest(expected_remote=recheck.remote_commit)
+        self.assertEqual(result.status, SyncStatus.SUCCESS)
+
 class TestHiddenSubprocessKwargs(unittest.TestCase):
     def test_git_runner_receives_hidden_window_kwargs(self):
         config = CodeSyncConfig(

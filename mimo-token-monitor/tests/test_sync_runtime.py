@@ -8,11 +8,11 @@ _ORIGINAL_QT_QPA_PLATFORM = os.environ.get("QT_QPA_PLATFORM")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtGui import QCloseEvent  # noqa: E402
-from PyQt6.QtWidgets import QApplication  # noqa: E402
+from PyQt6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from code_sync import SyncResult, SyncStatus, UpdateCheck  # noqa: E402
 from router_control import RouterResult  # noqa: E402
-from widget import TokenWidget  # noqa: E402
+from widget import OVERVIEW_MODE, TokenWidget  # noqa: E402
 
 
 def tearDownModule():
@@ -424,6 +424,7 @@ class TestCodeUpdateRuntime(unittest.TestCase):
             ahead=0,
             changed_paths=("src/router.mjs",),
             scope="Router 核心 1 个文件",
+            remote_commit="abc123",
         )
         with managed_widget({"position": [100, 100]}) as widget:
             widget._tray_icon.showMessage = Mock()
@@ -438,7 +439,9 @@ class TestCodeUpdateRuntime(unittest.TestCase):
             with patch.object(widget, "_confirm_code_update", return_value=True), \
                  patch("widget.CodeSyncWorker") as worker_type:
                 widget._on_code_check_done(check)
-                worker_type.assert_called_once_with("apply", widget)
+                worker_type.assert_called_once_with(
+                    "apply", widget, expected_remote="abc123"
+                )
             widget._code_sync_worker = None
             widget._on_code_update_done(
                 SyncResult(
@@ -477,6 +480,82 @@ class TestCodeUpdateRuntime(unittest.TestCase):
                 SyncResult(SyncStatus.SUCCESS, "code_pull", "已更新：监控器 1 个文件")
             )
             widget._tray_icon.showMessage.assert_called_once()
+
+
+class TestBaseUrlFirstUse(unittest.TestCase):
+    """Issue #3 补充：旧配置非默认域名首次使用确认，确认前不发送共享 Key。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_old_config_non_default_host_blocks_key_until_confirmed(self):
+        cfg = {"position": [100, 100], "cookie": "x",
+               "third_party_base_url": "https://relay.example.test"}
+        with managed_widget(cfg) as widget:
+            # 拒绝：不创建 worker（不读不发共享 Key），本会话不重复询问
+            with patch("widget.QMessageBox.question",
+                       return_value=QMessageBox.StandardButton.No) as question, \
+                 patch("widget.ThirdPartyFetchWorker") as worker:
+                widget._do_fetch_third_party()
+                widget._do_fetch_third_party()
+            question.assert_called_once()
+            worker.assert_not_called()
+            self.assertIn("未确认", widget._tp_error)
+            self.assertNotIn(
+                "relay.example.test", widget.cfg.get("approved_base_url_hosts", [])
+            )
+
+            # 显式确认：持久化已确认域名并放行
+            widget._base_url_declined.clear()
+            with patch("widget.QMessageBox.question",
+                       return_value=QMessageBox.StandardButton.Yes) as question, \
+                 patch("widget.save_config") as save_config, \
+                 patch("widget.ThirdPartyFetchWorker") as worker:
+                widget._do_fetch_third_party()
+            question.assert_called_once()
+            worker.assert_called_once()
+            save_config.assert_called_once()
+            self.assertIn(
+                "relay.example.test", widget.cfg["approved_base_url_hosts"]
+            )
+
+            # 已确认后不再询问
+            widget._tp_worker = None
+            with patch("widget.QMessageBox.question") as question, \
+                 patch("widget.ThirdPartyFetchWorker") as worker:
+                widget._do_fetch_third_party()
+            question.assert_not_called()
+            worker.assert_called_once()
+
+    def test_default_host_passes_and_supergpt_uses_same_gate(self):
+        cfg = {"position": [100, 100], "cookie": "x"}
+        with managed_widget(cfg) as widget:
+            with patch("widget.QMessageBox.question") as question, \
+                 patch("widget.ThirdPartyFetchWorker") as worker:
+                widget._do_fetch_third_party()
+            question.assert_not_called()
+            worker.assert_called_once()
+
+            widget.cfg["display_mode"] = OVERVIEW_MODE
+            widget.cfg["supergpt_base_url"] = "https://relay.example.test"
+            with patch("widget.QMessageBox.question",
+                       return_value=QMessageBox.StandardButton.No), \
+                 patch("widget.SuperGPTBalanceWorker") as worker:
+                widget._do_fetch_supergpt_balance()
+            worker.assert_not_called()
+            self.assertIn("未确认", widget._supergpt_error)
+
+    def test_confirmed_host_is_read_from_old_config_without_prompt(self):
+        cfg = {"position": [100, 100], "cookie": "x",
+               "third_party_base_url": "https://relay.example.test",
+               "approved_base_url_hosts": ["relay.example.test"]}
+        with managed_widget(cfg) as widget:
+            with patch("widget.QMessageBox.question") as question, \
+                 patch("widget.ThirdPartyFetchWorker") as worker:
+                widget._do_fetch_third_party()
+            question.assert_not_called()
+            worker.assert_called_once()
 
 
 class TestLifecycleDegradation(unittest.TestCase):

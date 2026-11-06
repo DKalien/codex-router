@@ -507,6 +507,9 @@ class TestSuperGPTSettings(unittest.TestCase):
             question.assert_called_once()
             factory.assert_not_called()
             self.assertEqual(dialog.result(), 0)
+            self.assertNotIn(
+                "relay.example.test", dialog.cfg.get("approved_base_url_hosts", [])
+            )
 
             with patch("widget.QMessageBox.question",
                        return_value=QMessageBox.StandardButton.Yes):
@@ -514,6 +517,9 @@ class TestSuperGPTSettings(unittest.TestCase):
             self.assertEqual(dialog.result(), 1)
             self.assertEqual(
                 dialog.supergpt_base_url_edit.text(), "https://relay.example.test"
+            )
+            self.assertIn(
+                "relay.example.test", dialog.cfg["approved_base_url_hosts"]
             )
         finally:
             dialog.close()
@@ -697,7 +703,8 @@ class TestSuperGPTBalance(unittest.TestCase):
             w.close()
 
     def test_only_overview_dispatches_balance_and_never_duplicates_worker(self):
-        w = _make_widget(supergpt_base_url="https://example.test", supergpt_api_key="test-key")
+        w = _make_widget(supergpt_base_url="https://example.test", supergpt_api_key="test-key",
+                          approved_base_url_hosts=["example.test"])
         try:
             balance = Mock()
             w._do_fetch_supergpt_balance = balance

@@ -97,6 +97,7 @@ class UpdateCheck:
     ahead: int = 0
     changed_paths: tuple[str, ...] = ()
     scope: str = ""
+    remote_commit: str = ""
 
     @property
     def has_updates(self) -> bool:
@@ -330,6 +331,13 @@ class CodeSyncService:
             .strip()
         )
 
+    def _remote_commit(self, deadline: float) -> str:
+        return (
+            self._git("rev-parse", self.remote_ref, deadline=deadline)
+            .decode("utf-8", errors="replace")
+            .strip()
+        )
+
     def _changed_paths(self, revision_range: str, deadline: float) -> list[str]:
         output = self._git("diff", "--name-only", revision_range, deadline=deadline)
         return [
@@ -367,8 +375,12 @@ class CodeSyncService:
             raise GitCommandError("无法判断代码分支关系", output) from exc
         return ahead, behind
 
-    def pull_latest(self) -> SyncResult:
-        """Fast-forward the clean project checkout before the app starts."""
+    def pull_latest(self, expected_remote: str = "") -> SyncResult:
+        """Fast-forward the clean project checkout before the app starts.
+
+        ``expected_remote`` 非空时（显式「检查并更新代码」流程）要求当前远端
+        提交与检查阶段记录的 SHA 一致；不一致即取消，须重新检查并确认。
+        """
         deadline = time.monotonic() + self.config.timeout_seconds
         invalid = self.validate_repository(deadline)
         if invalid is not None:
@@ -382,6 +394,13 @@ class CodeSyncService:
                     "工作区存在本地修改",
                 )
             self._fetch(deadline)
+            if expected_remote and self._remote_commit(deadline) != expected_remote:
+                return SyncResult(
+                    SyncStatus.SKIPPED,
+                    "code_pull",
+                    "远端提交已变化，更新已取消，请重新检查并确认",
+                    "检查与执行之间远端分支出现新提交",
+                )
             ahead, behind = self._relation(self.remote_ref, deadline)
             if ahead == 0 and behind == 0:
                 return SyncResult(SyncStatus.NO_CHANGE, "code_pull", "代码仓库已是最新")
@@ -487,6 +506,7 @@ class CodeSyncService:
                 behind=behind,
                 changed_paths=tuple(changed),
                 scope=summary,
+                remote_commit=self._remote_commit(deadline),
             )
         except (GitCommandError, OSError) as exc:
             detail = (
@@ -629,9 +649,13 @@ def run_explicit_code_check(project_root: Path) -> UpdateCheck:
         )
 
 
-def run_explicit_code_update(project_root: Path) -> SyncResult:
+def run_explicit_code_update(
+    project_root: Path, expected_remote: str = ""
+) -> SyncResult:
     try:
-        return CodeSyncService(_explicit_config(project_root)).pull_latest()
+        return CodeSyncService(_explicit_config(project_root)).pull_latest(
+            expected_remote=expected_remote
+        )
     except (OSError, ValueError) as exc:
         return SyncResult(
             SyncStatus.SKIPPED, "config", str(exc), sanitize_detail(str(exc))

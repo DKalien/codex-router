@@ -1,12 +1,11 @@
 """查询 SuperGPT 账户余额，支持本地设置并兼容 Router 密钥。"""
 
 import math
-from urllib.parse import urlsplit
 
 import requests
 
-from api_client import _third_party_usage_url
 from provider_keys import read_key
+from usage_url import UsageUrlError, usage_endpoint
 
 DEFAULT_BASE_URL = "https://api.supergpt.dev"
 
@@ -21,17 +20,14 @@ def _failure(message: str) -> dict:
 
 def fetch_balance(base_url: str = "", api_key: str = "") -> dict:
     """使用设置地址查询余额，默认从 Router 共享存储读取密钥。"""
-    base_url = base_url.strip() or DEFAULT_BASE_URL
+    # 与 WLB 共享 usage_url 的安全规则：默认仅 HTTPS、禁止内嵌凭据与查询
+    # 参数；校验失败在读取密钥和发起请求之前返回。
     try:
-        parsed = urlsplit(base_url)
-        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
-                or parsed.username is not None or parsed.password is not None
-                or parsed.query or parsed.fragment):
-            raise ValueError("Invalid base URL")
-        parsed.port
-    except ValueError:
-        return _failure("SuperGPT Base URL 无效，请填写不含认证信息、查询参数的 HTTP(S) 地址")
-    url = _third_party_usage_url(base_url)
+        url = usage_endpoint(
+            base_url, default_base=DEFAULT_BASE_URL, label="SuperGPT"
+        )
+    except UsageUrlError as exc:
+        return _failure(str(exc))
     try:
         key = api_key.strip() or _api_key()
     except (OSError, UnicodeError, RuntimeError):
@@ -50,6 +46,10 @@ def fetch_balance(base_url: str = "", api_key: str = "") -> dict:
     except requests.RequestException:
         return _failure("SuperGPT 余额查询网络连接失败")
     try:
+        if response.status_code in (301, 302, 303, 307, 308):
+            return _failure(
+                f"SuperGPT 余额查询返回重定向（HTTP {response.status_code}），已拒绝跟随"
+            )
         if response.status_code in (401, 403):
             return _failure("SuperGPT API Key 无效或已过期")
         if response.status_code != 200:

@@ -37,7 +37,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QPoint, QRect, Qt  # noqa: E402
 from PyQt6.QtGui import QFont, QFontMetrics, QFontDatabase  # noqa: E402
-from PyQt6.QtWidgets import QApplication, QLineEdit  # noqa: E402
+from PyQt6.QtWidgets import QApplication, QLineEdit, QMessageBox  # noqa: E402
 
 # Ensure QApplication exists
 _app = QApplication.instance() or QApplication(sys.argv)
@@ -481,6 +481,42 @@ class TestSuperGPTSettings(unittest.TestCase):
             dialog.accept()
         factory.assert_not_called()
         self.assertEqual(dialog.result(), 1)
+
+
+    def test_settings_reject_invalid_base_url_before_saving(self):
+        dialog = SettingsDialog({})
+        try:
+            dialog.tp_base_url_edit.setText("http://example.test")
+            with patch("widget.QMessageBox.warning") as warning, \
+                 patch("widget.ProviderKeysWorker") as factory:
+                dialog.accept()
+            warning.assert_called_once()
+            factory.assert_not_called()
+            self.assertEqual(dialog.result(), 0)
+        finally:
+            dialog.close()
+
+    def test_settings_confirm_non_default_host_before_saving(self):
+        dialog = SettingsDialog({})
+        try:
+            dialog.supergpt_base_url_edit.setText("https://relay.example.test")
+            with patch("widget.QMessageBox.question",
+                       return_value=QMessageBox.StandardButton.No) as question, \
+                 patch("widget.ProviderKeysWorker") as factory:
+                dialog.accept()
+            question.assert_called_once()
+            factory.assert_not_called()
+            self.assertEqual(dialog.result(), 0)
+
+            with patch("widget.QMessageBox.question",
+                       return_value=QMessageBox.StandardButton.Yes):
+                dialog.accept()
+            self.assertEqual(dialog.result(), 1)
+            self.assertEqual(
+                dialog.supergpt_base_url_edit.text(), "https://relay.example.test"
+            )
+        finally:
+            dialog.close()
 
 
 class TestSuperGPTBalance(unittest.TestCase):

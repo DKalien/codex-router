@@ -94,3 +94,39 @@ class TestProviderKeys(unittest.TestCase):
                 self.assertNotIn("secret-value", str(raised.exception))
                 if not isinstance(outcome, Exception) and outcome.stdout.startswith('{'):
                     self.assertIn("WLB 已保存", str(raised.exception))
+
+    def test_save_without_enable_never_touches_provider_selection(self):
+        root = Path(tempfile.gettempdir()).resolve() / "router"
+        with patch.dict(os.environ, {}, clear=True), \
+             patch("provider_keys.resolve_router_root", return_value=root), \
+             patch("provider_keys.subprocess.run",
+                   return_value=Mock(returncode=0, stdout='{"ok":true}')) as run:
+            provider_keys.save_keys({"wlb-relay": "test-secret"}, enable=False)
+        command = run.call_args.args[0]
+        self.assertNotIn("enableProvider", command[3])
+        self.assertEqual(json.loads(run.call_args.kwargs["input"]), {"wlb-relay": "test-secret"})
+        self.assertTrue(command[-2].endswith("/src/provider-credentials.mjs"))
+
+    def test_save_with_enable_writes_and_enables_provider(self):
+        root = Path(tempfile.gettempdir()).resolve() / "router"
+        with patch.dict(os.environ, {}, clear=True), \
+             patch("provider_keys.resolve_router_root", return_value=root), \
+             patch("provider_keys.subprocess.run",
+                   return_value=Mock(returncode=0, stdout='{"ok":true}')) as run:
+            provider_keys.save_keys({"wlb-relay": "test-secret"})
+        command = run.call_args.args[0]
+        self.assertIn("enableProvider", command[3])
+
+    def test_env_override_and_persistent_reads_are_separate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp) / "codex-router"
+            state.mkdir()
+            (state / "wlb-api-key.secret").write_text("persist-key", encoding="utf-8")
+            with patch.dict(os.environ, {"CODEX_HOME": temp}, clear=True):
+                self.assertEqual(provider_keys.read_persistent_key("wlb-relay"), "persist-key")
+                self.assertEqual(provider_keys.env_override("wlb-relay"), "")
+                with patch.dict(os.environ, {"WLB_API_KEY": " env-key "}):
+                    self.assertEqual(provider_keys.env_override("wlb-relay"), "env-key")
+                    self.assertEqual(provider_keys.read_persistent_key("wlb-relay"), "persist-key")
+                    self.assertEqual(provider_keys.read_key("wlb-relay"), "env-key")
+            self.assertEqual(provider_keys.provider_label("supergpt-relay"), "SuperGPT")

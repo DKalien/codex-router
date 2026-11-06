@@ -13,6 +13,7 @@ import math
 import os
 import sys
 import api_client
+import code_sync
 from claude_profiles import (
     ClaudeProfileError,
     PROFILE_ENV_KEYS,
@@ -28,6 +29,7 @@ import provider_keys
 import router_control
 import snapshot_writer
 import supergpt_balance
+import usage_url
 import window_snap
 
 SNAP_THRESHOLD = 15  # px, 距屏幕边缘多少像素内触发吸附
@@ -333,6 +335,29 @@ class RouterWorker(QThread):
         self.completed.emit(router_control.run_router_operation(self.operation))
 
 
+class CodeSyncWorker(QThread):
+    """显式代码更新：只检查或安全快进磁盘源码，不触碰 Node Router。"""
+
+    completed = pyqtSignal(object)
+
+    def __init__(self, mode: str, parent=None):
+        super().__init__(parent)
+        self.mode = mode  # "check" | "apply"
+
+    def run(self):
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        try:
+            if self.mode == "check":
+                result = code_sync.run_explicit_code_check(project_root)
+            else:
+                result = code_sync.run_explicit_code_update(project_root)
+        except Exception:
+            result = code_sync.SyncResult(
+                code_sync.SyncStatus.FAILED, "code_sync", "代码更新执行异常"
+            )
+        self.completed.emit(result)
+
+
 # ── Settings dialog ─────────────────────────────────────────────
 class ProviderKeysWorker(QThread):
     def __init__(self, keys: dict, parent=None):
@@ -457,8 +482,43 @@ class SettingsDialog(QDialog):
         btn_row.addWidget(cancel_btn)
         layout.addRow(btn_row)
 
+    def _validate_base_urls(self) -> bool:
+        """保存前统一校验 Base URL；非默认域名需用户显式确认。
+
+        与请求路径共用 ``usage_url`` 规则：默认仅 HTTPS、禁止内嵌凭据、
+        查询参数与片段；校验失败不发请求、不保存。
+        """
+        fields = (
+            ("WLB", self.tp_base_url_edit, api_client.DEFAULT_THIRD_PARTY_BASE_URL),
+            ("SuperGPT", self.supergpt_base_url_edit, supergpt_balance.DEFAULT_BASE_URL),
+        )
+        for label, edit, default in fields:
+            try:
+                normalized = usage_url.validate_base_url(
+                    edit.text().strip(), default_base=default, label=label
+                )
+            except usage_url.UsageUrlError as exc:
+                QMessageBox.warning(self, f"{label} Base URL 无效", str(exc))
+                edit.setFocus()
+                return False
+            edit.setText(normalized)
+            if usage_url.endpoint_host(normalized) != usage_url.endpoint_host(default):
+                answer = QMessageBox.question(
+                    self,
+                    f"{label} Base URL 确认",
+                    f"{label} Base URL 不是官方默认域名，API Key 会发送到该主机。\n"
+                    "确认这是你信任的自建或第三方中转地址吗？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return False
+        return True
+
     def accept(self):
         if self._keys_worker is not None:
+            return
+        if not self._validate_base_urls():
             return
         keys = {provider: edit.text().strip() for provider, edit in (
             ("wlb-relay", self.tp_api_key_edit), ("supergpt-relay", self.supergpt_api_key_edit),
@@ -734,6 +794,8 @@ class TokenWidget(QWidget):
         self._pin_btn_rect = QRect()  # placeholder, set in paintEvent
         self._router_worker: RouterWorker | None = None
         self._queued_router_operation: str | None = None
+        self._code_sync_worker: CodeSyncWorker | None = None
+        self._code_update_action: QAction | None = None
         self._router_actions: list[QAction] = []
         self._claude_profiles: list[dict] = []
         self._claude_profile_actions: dict[str, QAction] = {}
@@ -1104,6 +1166,11 @@ class TokenWidget(QWidget):
         restart_act.triggered.connect(
             lambda _checked=False: self._start_router_operation("restart")
         )
+        self._code_update_action = router_menu.addAction("检查并更新代码…")
+        self._code_update_action.setToolTip(
+            "显式检查并快进更新磁盘源码；不会重启正在运行的 Router"
+        )
+        self._code_update_action.triggered.connect(self._check_code_updates)
         self._router_actions = [
             enable_act, disable_act, restart_act,
             *self._gpt_route_actions.values(),
@@ -1402,6 +1469,99 @@ class TokenWidget(QWidget):
             else QSystemTrayIcon.MessageIcon.Warning
         )
         self._tray_icon.showMessage("Codex Router", message, icon, 5000)
+
+    # ── 显式代码更新（检查并更新代码） ─────────────────────────────
+    def _check_code_updates(self):
+        if self._exit_requested:
+            return
+        if self._code_sync_worker is not None:
+            self._tray_icon.showMessage(
+                "代码更新",
+                "已有代码更新任务正在进行",
+                QSystemTrayIcon.MessageIcon.Warning,
+                3000,
+            )
+            return
+        if self._code_update_action is not None:
+            self._code_update_action.setEnabled(False)
+        self._set_router_status("正在检查代码更新...")
+        self._code_sync_worker = CodeSyncWorker("check", self)
+        self._code_sync_worker.completed.connect(self._on_code_check_done)
+        self._code_sync_worker.start()
+
+    def _finish_code_sync_worker(self):
+        worker = self._code_sync_worker
+        if worker is not None:
+            worker.wait()
+            worker.deleteLater()
+        self._code_sync_worker = None
+        if self._code_update_action is not None:
+            self._code_update_action.setEnabled(True)
+
+    def _on_code_check_done(self, check):
+        self._finish_code_sync_worker()
+        if not check.result.ok:
+            message = check.result.message or "代码更新检查失败"
+            self._set_router_status(message, False, clear_after=5000)
+            self._tray_icon.showMessage(
+                "代码更新", message, QSystemTrayIcon.MessageIcon.Warning, 5000
+            )
+            return
+        if not check.has_updates:
+            self._set_router_status(check.result.message, True, clear_after=5000)
+            return
+        if not self._confirm_code_update(check):
+            self._set_router_status("已取消代码更新", None, clear_after=5000)
+            return
+        self._set_router_status("正在快进更新代码...")
+        self._code_sync_worker = CodeSyncWorker("apply", self)
+        self._code_sync_worker.completed.connect(self._on_code_update_done)
+        self._code_sync_worker.start()
+
+    def _confirm_code_update(self, check) -> bool:
+        """快进前展示变更范围并要求确认；默认不更新。"""
+        box = QMessageBox(
+            QMessageBox.Icon.Question,
+            "检查并更新代码",
+            f"{check.result.message}。\n"
+            f"更新范围：{check.scope}。\n"
+            "更新只改变磁盘源码，不会重启正在运行的 Router；\n"
+            "Router 核心变更需在「路由控制 → 重启路由器」后生效。\n"
+            "确认快进更新？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            self,
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        return box.exec() == QMessageBox.StandardButton.Yes
+
+    def _on_code_update_done(self, result):
+        self._finish_code_sync_worker()
+        message = result.message or ("代码已更新" if result.ok else "代码更新失败")
+        self._set_router_status(message, result.ok, clear_after=5000)
+        text = f"{message}\n{result.detail}" if result.detail else message
+        icon = (
+            QSystemTrayIcon.MessageIcon.Information
+            if result.ok
+            else QSystemTrayIcon.MessageIcon.Warning
+        )
+        self._tray_icon.showMessage("代码更新", text, icon, 6000)
+
+    def show_startup_sync_result(self, result):
+        """启动器执行过同步时展示结果；跳过/无变更不打扰用户。"""
+        if result.status not in (
+            code_sync.SyncStatus.SUCCESS,
+            code_sync.SyncStatus.FAILED,
+        ):
+            return
+        message = result.message or ("代码已更新" if result.ok else "代码更新失败")
+        text = f"{message}\n{result.detail}" if result.detail else message
+        icon = (
+            QSystemTrayIcon.MessageIcon.Information
+            if result.ok
+            else QSystemTrayIcon.MessageIcon.Warning
+        )
+        self._tray_icon.showMessage("代码更新", text, icon, 6000)
+        self._set_router_status(message, result.ok, clear_after=8000)
 
     # ── Painting ────────────────────────────────────────────────
     def paintEvent(self, _event):

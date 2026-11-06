@@ -142,6 +142,7 @@
 ## 合并的桌面监控
 
 - `mimo-token-monitor/` 是 Router 仓库内的独立 Python 子项目；不要把 PyQt、Requests 或 Playwright 导入 `src/router.mjs`、`src/start.mjs` 或 Node 服务生命周期。
+- 合并布局下监控器启动不隐式更新 Router checkout（`MIMO_TOKEN_MONITOR_CODE_SYNC_ENABLED` 默认 0）；更新只能通过托盘「检查并更新代码…」在展示变更范围并确认后快进，结果按 Router 核心/监控器文件范围报告，且不重启正在运行的 Node Router。旧配置密钥迁移默认保留 Router 现有凭据、不自动启用供应商；WLB / SuperGPT 用量请求共享 HTTPS-only、拒绝重定向的 URL 安全规则（`mimo-token-monitor/usage_url.py`）。
 - 从 Router 根目录启动桌面监控使用 `codex-router.ps1 monitor`（Windows）或 `bin/model-router codex monitor`（POSIX）；入口会在嵌套布局下将源码同步分支设为 `lite`。
 - 监控器修改后在 `mimo-token-monitor/` 运行 `python -m unittest discover -s tests`；Router 修改后继续执行本文件规定的 Node 检查。
 - 监控器的 WLB / SuperGPT 密钥只能通过 Router 现有受保护凭据接口写入；不要把密钥写入仓库内 SQLite、JSON、命令行参数或日志。

@@ -10,6 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtGui import QCloseEvent  # noqa: E402
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
+from code_sync import SyncResult, SyncStatus, UpdateCheck  # noqa: E402
 from router_control import RouterResult  # noqa: E402
 from widget import TokenWidget  # noqa: E402
 
@@ -44,6 +45,43 @@ class TestStartupRuntime(unittest.TestCase):
             self.assertIsNone(initialize_window())
         error.assert_called_once()
         widget.assert_not_called()
+
+    @patch("main.load_config", return_value={"cookie": "x", "third_party_api_key": "stale-key"})
+    def test_key_migration_conflict_requires_explicit_choice(self, _load):
+        from main import initialize_window
+
+        conflict = {"field": "third_party_api_key", "provider": "wlb-relay",
+                    "label": "WLB", "reason": "different"}
+        for overwrite_choice in (False, True):
+            with self.subTest(overwrite=overwrite_choice), \
+                 patch("main.migrate_provider_keys", return_value=[conflict]), \
+                 patch("main._confirm_key_override", return_value=overwrite_choice) as confirm, \
+                 patch("main.resolve_key_migration") as resolve, \
+                 patch("main.TokenWidget") as widget_type:
+                widget = initialize_window()
+            self.assertIs(widget, widget_type.return_value)
+            confirm.assert_called_once_with(conflict)
+            resolve.assert_called_once()
+            args, kwargs = resolve.call_args
+            self.assertEqual(args[1], "third_party_api_key")
+            self.assertEqual(kwargs["overwrite"], overwrite_choice)
+
+    @patch("main.load_config", return_value={"cookie": "x", "third_party_api_key": "stale-key"})
+    def test_key_override_failure_warns_and_keeps_startup(self, _load):
+        from main import initialize_window
+        from provider_keys import ProviderKeyError
+
+        conflict = {"field": "third_party_api_key", "provider": "wlb-relay",
+                    "label": "WLB", "reason": "env"}
+        with patch("main.migrate_provider_keys", return_value=[conflict]), \
+             patch("main._confirm_key_override", return_value=True), \
+             patch("main.resolve_key_migration",
+                   side_effect=ProviderKeyError("环境变量覆盖了共享密钥")), \
+             patch("main.QMessageBox.warning") as warning, \
+             patch("main.TokenWidget") as widget_type:
+            widget = initialize_window()
+        warning.assert_called_once()
+        self.assertIs(widget, widget_type.return_value)
 
     @patch("main.activate_existing_instance")
     @patch("main.check_single_instance", return_value=None)
@@ -145,7 +183,7 @@ class TestExitRuntime(unittest.TestCase):
             self.assertIsNotNone(router_menu)
             self.assertEqual(
                 [action.text() for action in router_menu.actions() if not action.isSeparator()],
-                ["自动（WLB → GPT → SuperGPT）", "切换到 WLB", "切换到 SuperGPT", "切换到 GPT", "子代理供应商", "Pi 路由", "开启路由", "关闭路由", "重启路由器"],
+                ["自动（WLB → GPT → SuperGPT）", "切换到 WLB", "切换到 SuperGPT", "切换到 GPT", "子代理供应商", "Pi 路由", "开启路由", "关闭路由", "重启路由器", "检查并更新代码…"],
             )
             subagent_menu = next(
                 action.menu() for action in router_menu.actions() if action.text() == "子代理供应商"
@@ -362,6 +400,83 @@ class TestExitRuntime(unittest.TestCase):
             self.assertTrue(all(action.isEnabled() for action in widget._router_actions))
             widget._tray_icon.showMessage.assert_called_once()
 
+
+
+class TestCodeUpdateRuntime(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_tray_menu_exposes_explicit_code_update_entry(self):
+        with managed_widget({"position": [100, 100]}) as widget:
+            action = widget._code_update_action
+            self.assertIsNotNone(action)
+            self.assertEqual(action.text(), "检查并更新代码…")
+
+    def test_code_update_requires_confirmation_and_reports_scope(self):
+        check = UpdateCheck(
+            SyncResult(
+                SyncStatus.SUCCESS,
+                "code_check",
+                "远端有 1 个新提交：Router 核心 1 个文件",
+            ),
+            behind=1,
+            ahead=0,
+            changed_paths=("src/router.mjs",),
+            scope="Router 核心 1 个文件",
+        )
+        with managed_widget({"position": [100, 100]}) as widget:
+            widget._tray_icon.showMessage = Mock()
+            with patch.object(widget, "_confirm_code_update", return_value=False) as confirm, \
+                 patch("widget.CodeSyncWorker") as worker_type:
+                widget._on_code_check_done(check)
+            confirm.assert_called_once_with(check)
+            worker_type.assert_not_called()
+            self.assertIsNone(widget._code_sync_worker)
+            self.assertTrue(widget._code_update_action.isEnabled())
+
+            with patch.object(widget, "_confirm_code_update", return_value=True), \
+                 patch("widget.CodeSyncWorker") as worker_type:
+                widget._on_code_check_done(check)
+                worker_type.assert_called_once_with("apply", widget)
+            widget._code_sync_worker = None
+            widget._on_code_update_done(
+                SyncResult(
+                    SyncStatus.SUCCESS,
+                    "code_pull",
+                    "已拉取代码仓库最新更新：Router 核心 1 个文件",
+                    "运行中的 Router 未重启，重启后生效",
+                )
+            )
+            widget._tray_icon.showMessage.assert_called()
+            self.assertIn(
+                "Router 核心", widget._tray_icon.showMessage.call_args.args[1]
+            )
+            self.assertTrue(widget._code_update_action.isEnabled())
+
+    def test_check_without_updates_or_failure_is_reported(self):
+        with managed_widget({"position": [100, 100]}) as widget:
+            widget._tray_icon.showMessage = Mock()
+            widget._on_code_check_done(
+                UpdateCheck(SyncResult(SyncStatus.NO_CHANGE, "code_check", "代码仓库已是最新"))
+            )
+            widget._tray_icon.showMessage.assert_not_called()
+            widget._on_code_check_done(
+                UpdateCheck(SyncResult(SyncStatus.FAILED, "code_check", "代码更新检查失败"))
+            )
+            widget._tray_icon.showMessage.assert_called_once()
+
+    def test_startup_sync_result_only_announces_success_or_failure(self):
+        with managed_widget({"position": [100, 100]}) as widget:
+            widget._tray_icon.showMessage = Mock()
+            widget.show_startup_sync_result(
+                SyncResult(SyncStatus.SKIPPED, "config", "代码仓库同步已禁用")
+            )
+            widget._tray_icon.showMessage.assert_not_called()
+            widget.show_startup_sync_result(
+                SyncResult(SyncStatus.SUCCESS, "code_pull", "已更新：监控器 1 个文件")
+            )
+            widget._tray_icon.showMessage.assert_called_once()
 
 
 class TestLifecycleDegradation(unittest.TestCase):

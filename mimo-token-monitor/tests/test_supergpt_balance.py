@@ -89,6 +89,7 @@ class TestSuperGPTBalance(unittest.TestCase):
 
     def test_invalid_url_fails_before_reading_or_sending_credentials(self):
         for url in ("example.test", "file:///tmp/secret", "https://",
+                    "http://api.supergpt.dev",
                     "https://user:password@example.test", "https://[bad",
                     "https://example.test:bad", "https://example.test?token=secret",
                     "https://example.test#fragment"):
@@ -137,6 +138,94 @@ class TestSuperGPTBalance(unittest.TestCase):
              patch("supergpt_balance.requests.Session") as session:
             session.return_value.__enter__.return_value.get.side_effect = supergpt_balance.requests.Timeout("test-secret")
             self.assertNotIn("test-secret", supergpt_balance.fetch_balance()["error"])
+
+
+class _LocalUsageServer:
+    """回环测试服务器：统计 GET 次数；可返回 3xx 或 200 JSON。"""
+
+    def __init__(self, *, status=200, location="", body=b"{}"):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        self.requests = 0
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                owner.requests += 1
+                self.send_response(status)
+                if location:
+                    self.send_header("Location", location)
+                data = body if status == 200 else b""
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def __enter__(self):
+        import threading
+
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestSuperGPTUrlHardening(unittest.TestCase):
+    """Issue #3 验收：与 WLB 共享安全规则，拒绝重定向且目标零请求。"""
+
+    def test_redirects_are_refused_and_never_followed(self):
+        from usage_url import LOOPBACK_HTTP_ENV
+
+        body = b'{"balance": 5, "unit": "USD"}'
+        for status in (301, 302, 303, 307, 308):
+            with self.subTest(status=status):
+                with _LocalUsageServer(status=200, body=body) as target:
+                    with _LocalUsageServer(
+                        status=status, location=f"{target.url}/v1/usage"
+                    ) as entry:
+                        with patch.dict(os.environ, {LOOPBACK_HTTP_ENV: "1"}):
+                            result = supergpt_balance.fetch_balance(
+                                entry.url, "fake-secret-key"
+                            )
+                        self.assertFalse(result["ok"])
+                        self.assertIn("重定向", result["error"])
+                        self.assertNotIn("fake-secret-key", result["error"])
+                        self.assertEqual(entry.requests, 1)
+                        self.assertEqual(target.requests, 0)
+
+    def test_loopback_http_requires_explicit_opt_in(self):
+        from usage_url import LOOPBACK_HTTP_ENV
+
+        body = b'{"balance": 5, "unit": "USD"}'
+        with _LocalUsageServer(body=body) as server:
+            with patch.dict(os.environ, {LOOPBACK_HTTP_ENV: ""}):
+                result = supergpt_balance.fetch_balance(server.url, "fake-secret-key")
+            self.assertFalse(result["ok"])
+            self.assertIn("URL 无效", result["error"])
+            self.assertEqual(server.requests, 0)
+
+            with patch.dict(os.environ, {LOOPBACK_HTTP_ENV: "1"}):
+                result = supergpt_balance.fetch_balance(server.url, "fake-secret-key")
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["balance"], 5.0)
+            self.assertEqual(server.requests, 1)
+
+    def test_error_paths_never_expose_key(self):
+        with _LocalUsageServer(status=500) as server, patch.dict(
+            os.environ, {"MIMO_TOKEN_MONITOR_ALLOW_HTTP_LOOPBACK": "1"}
+        ):
+            result = supergpt_balance.fetch_balance(server.url, "fake-secret-key")
+        self.assertFalse(result["ok"])
+        self.assertNotIn("fake-secret-key", result["error"])
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import json
 import os
@@ -86,6 +86,39 @@ class SyncResult:
     @property
     def ok(self) -> bool:
         return self.status in {SyncStatus.SUCCESS, SyncStatus.NO_CHANGE}
+
+
+@dataclass(frozen=True)
+class UpdateCheck:
+    """显式检查更新的结果：只读取远端关系，不改变工作区。"""
+
+    result: SyncResult
+    behind: int = 0
+    ahead: int = 0
+    changed_paths: tuple[str, ...] = ()
+    scope: str = ""
+
+    @property
+    def has_updates(self) -> bool:
+        return self.result.ok and self.behind > 0 and self.ahead == 0
+
+
+def _is_project_path(path: str, project_path: str) -> bool:
+    prefix = project_path.strip("/").replace("\\", "/")
+    normalized = path.replace("\\", "/")
+    return normalized == prefix or normalized.startswith(f"{prefix}/")
+
+
+def scope_summary(paths, project_path: str) -> str:
+    """把变更文件按 Router 核心 / 监控器分类汇总，用于用户可见结果。"""
+    monitor = [p for p in paths if _is_project_path(p, project_path)]
+    core = [p for p in paths if not _is_project_path(p, project_path)]
+    parts = []
+    if core:
+        parts.append(f"Router 核心 {len(core)} 个文件")
+    if monitor:
+        parts.append(f"监控器 {len(monitor)} 个文件")
+    return "、".join(parts) or "无文件变更"
 
 
 def _nonempty_env(name: str, default: str) -> str:
@@ -297,6 +330,14 @@ class CodeSyncService:
             .strip()
         )
 
+    def _changed_paths(self, revision_range: str, deadline: float) -> list[str]:
+        output = self._git("diff", "--name-only", revision_range, deadline=deadline)
+        return [
+            line.strip()
+            for line in output.decode("utf-8", errors="replace").splitlines()
+            if line.strip()
+        ]
+
     def _fetch(self, deadline: float) -> None:
         self._git(
             "fetch",
@@ -345,9 +386,33 @@ class CodeSyncService:
             if ahead == 0 and behind == 0:
                 return SyncResult(SyncStatus.NO_CHANGE, "code_pull", "代码仓库已是最新")
             if ahead == 0 and behind > 0:
+                old_head = (
+                    self._git("rev-parse", "HEAD", deadline=deadline)
+                    .decode("utf-8", errors="replace")
+                    .strip()
+                )
                 self._git("merge", "--ff-only", self.remote_ref, deadline=deadline)
+                changed = self._changed_paths(f"{old_head}..HEAD", deadline)
+                summary = scope_summary(changed, self.config.project_path)
+                detail_parts = []
+                if changed:
+                    listed = "、".join(changed[:10])
+                    if len(changed) > 10:
+                        listed += f" 等 {len(changed)} 个文件"
+                    detail_parts.append(f"变更文件：{listed}")
+                if any(
+                    not _is_project_path(path, self.config.project_path)
+                    for path in changed
+                ):
+                    detail_parts.append(
+                        "运行中的 Router 未重启，重启后生效"
+                        "（托盘「路由控制 → 重启路由器」）"
+                    )
                 return SyncResult(
-                    SyncStatus.SUCCESS, "code_pull", "已拉取代码仓库最新更新"
+                    SyncStatus.SUCCESS,
+                    "code_pull",
+                    f"已拉取代码仓库最新更新：{summary}",
+                    "；".join(detail_parts),
                 )
             if ahead > 0 and behind == 0:
                 return SyncResult(
@@ -367,6 +432,71 @@ class CodeSyncService:
                 else sanitize_detail(str(exc))
             )
             return SyncResult(SyncStatus.FAILED, "code_pull", str(exc), detail)
+
+    def check_updates(self) -> UpdateCheck:
+        """显式「检查更新」：只 fetch 并报告变更范围，不改变工作区。
+
+        dirty 工作区、detached HEAD、错误分支或分叉时不给出可更新结论。
+        """
+        deadline = time.monotonic() + self.config.timeout_seconds
+        invalid = self.validate_repository(deadline)
+        if invalid is not None:
+            return UpdateCheck(invalid)
+        try:
+            if self._status(deadline):
+                return UpdateCheck(
+                    SyncResult(
+                        SyncStatus.SKIPPED,
+                        "code_check",
+                        "代码仓库有未提交修改，不会自动更新",
+                        "工作区存在本地修改",
+                    )
+                )
+            self._fetch(deadline)
+            ahead, behind = self._relation(self.remote_ref, deadline)
+            if behind == 0:
+                message = (
+                    "代码仓库已是最新"
+                    if ahead == 0
+                    else "本地代码已有未推送提交，不会自动拉取"
+                )
+                return UpdateCheck(
+                    SyncResult(SyncStatus.NO_CHANGE, "code_check", message),
+                    ahead=ahead,
+                    behind=behind,
+                )
+            if ahead > 0:
+                return UpdateCheck(
+                    SyncResult(
+                        SyncStatus.FAILED,
+                        "code_check",
+                        "代码仓库本地与远端已分叉，不会自动覆盖本地代码",
+                    ),
+                    ahead=ahead,
+                    behind=behind,
+                )
+            changed = self._changed_paths(f"HEAD..{self.remote_ref}", deadline)
+            summary = scope_summary(changed, self.config.project_path)
+            return UpdateCheck(
+                SyncResult(
+                    SyncStatus.SUCCESS,
+                    "code_check",
+                    f"远端有 {behind} 个新提交：{summary}",
+                ),
+                ahead=ahead,
+                behind=behind,
+                changed_paths=tuple(changed),
+                scope=summary,
+            )
+        except (GitCommandError, OSError) as exc:
+            detail = (
+                exc.detail
+                if isinstance(exc, GitCommandError)
+                else sanitize_detail(str(exc))
+            )
+            return UpdateCheck(
+                SyncResult(SyncStatus.FAILED, "code_check", str(exc), detail)
+            )
 
     def push_local_changes(self) -> SyncResult:
         """Commit and push source-project changes without touching other paths."""
@@ -477,6 +607,31 @@ def run_startup_code_sync(project_root: Path) -> SyncResult:
     try:
         config = CodeSyncConfig.from_project_root(project_root)
         return CodeSyncService(config).pull_latest()
+    except (OSError, ValueError) as exc:
+        return SyncResult(
+            SyncStatus.SKIPPED, "config", str(exc), sanitize_detail(str(exc))
+        )
+
+
+def _explicit_config(project_root: Path) -> CodeSyncConfig:
+    """显式用户操作不受「合并布局默认禁用」限制，其余安全检查不变。"""
+    return replace(CodeSyncConfig.from_project_root(project_root), enabled=True)
+
+
+def run_explicit_code_check(project_root: Path) -> UpdateCheck:
+    try:
+        return CodeSyncService(_explicit_config(project_root)).check_updates()
+    except (OSError, ValueError) as exc:
+        return UpdateCheck(
+            SyncResult(
+                SyncStatus.SKIPPED, "config", str(exc), sanitize_detail(str(exc))
+            )
+        )
+
+
+def run_explicit_code_update(project_root: Path) -> SyncResult:
+    try:
+        return CodeSyncService(_explicit_config(project_root)).pull_latest()
     except (OSError, ValueError) as exc:
         return SyncResult(
             SyncStatus.SKIPPED, "config", str(exc), sanitize_detail(str(exc))

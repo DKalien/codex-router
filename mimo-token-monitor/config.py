@@ -4,7 +4,14 @@ import sqlite3
 from copy import deepcopy
 import tempfile
 
-from provider_keys import KEY_FIELDS, ProviderKeyError, save_keys
+from provider_keys import (
+    KEY_FIELDS,
+    ProviderKeyError,
+    env_override,
+    provider_label,
+    read_persistent_key,
+    save_keys,
+)
 
 DEFAULT_CONFIG = {
     "cookie": "",
@@ -243,19 +250,86 @@ def save_config(cfg: dict) -> bool:
     return _atomic_save_json(_legacy_config_path(), merged)
 
 
-def migrate_provider_keys(cfg: dict) -> None:
-    """旧悬浮窗密钥只迁移一次；成功前保留旧配置供重试。"""
-    keys = {provider: cfg[field] for field, provider in KEY_FIELDS.items() if cfg.get(field)}
-    if not keys:
-        return
-    save_keys(keys)
+def _cleanup_key_fields(cfg: dict, fields: set[str]) -> None:
+    """确认目标状态后清理旧密钥字段；清理失败保留旧数据供重试。"""
     legacy = _read_legacy_json()
-    if legacy is not None and any(legacy.get(field) for field in KEY_FIELDS):
-        legacy = {key: value for key, value in legacy.items() if key not in KEY_FIELDS}
+    if legacy is not None and any(legacy.get(field) for field in fields):
+        legacy = {key: value for key, value in legacy.items() if key not in fields}
         if not _atomic_save_json(_legacy_config_path(), legacy):
             raise ProviderKeyError("密钥已保存到 Router，但旧 JSON 清理失败；请检查设置目录权限后重试")
-    cleaned = {key: value for key, value in cfg.items() if key not in KEY_FIELDS}
+    cleaned = {key: value for key, value in cfg.items() if key not in fields}
     if not save_config(cleaned):
         raise ProviderKeyError("密钥已保存到 Router，但旧设置清理失败；请检查设置目录权限后重试")
     cfg.clear()
     cfg.update(cleaned)
+
+
+def migrate_provider_keys(cfg: dict) -> list[dict]:
+    """把旧悬浮窗密钥迁移到 Router 共享存储，返回需要用户决定的冲突列表。
+
+    - 默认保留 Router 现有生效值：仅当没有生效密钥时才写入旧值；
+      旧值与现值不同时不写入，返回冲突项由用户显式选择是否覆盖。
+    - 迁移只写密钥（enable=False），绝不隐式启用供应商。
+    - 逐项独立处理：成功项立即清理旧字段，失败项保留供重试；重试时
+      按现状重新比对，旧值不会二次覆盖已变化的 Router 密钥（幂等）。
+    - 错误与返回值都不携带密钥原文。
+    """
+    conflicts: list[dict] = []
+    migrated: list[str] = []
+    errors: list[str] = []
+    for field, provider in KEY_FIELDS.items():
+        raw = cfg.get(field)
+        if not raw:
+            continue
+        label = provider_label(provider)
+        if not isinstance(raw, str) or not raw.strip():
+            errors.append(f"{label} 旧密钥格式无效，已保留旧设置")
+            continue
+        old = raw.strip()
+        try:
+            override = env_override(provider)
+            current = override or read_persistent_key(provider)
+        except ProviderKeyError as exc:
+            errors.append(f"{label}：{exc}")
+            continue
+        if not current:
+            try:
+                save_keys({provider: old}, enable=False)
+            except ProviderKeyError as exc:
+                errors.append(f"{label}：{exc}")
+                continue
+            migrated.append(field)
+            continue
+        if current == old:
+            migrated.append(field)
+            continue
+        conflicts.append({
+            "field": field,
+            "provider": provider,
+            "label": label,
+            "reason": "env" if override else "different",
+        })
+    if migrated:
+        _cleanup_key_fields(cfg, set(migrated))
+    if errors:
+        done = "、".join(provider_label(KEY_FIELDS[f]) for f in migrated)
+        prefix = f"{done} 已完成；" if done else ""
+        raise ProviderKeyError(
+            f"{prefix}{'；'.join(errors)}（失败项旧值已保留，重启后自动重试）"
+        )
+    return conflicts
+
+
+def resolve_key_migration(cfg: dict, field: str, *, overwrite: bool) -> None:
+    """执行用户对密钥冲突的显式选择；覆盖只写密钥，不启用供应商。"""
+    provider = KEY_FIELDS[field]
+    raw = cfg.get(field)
+    if not raw:
+        return
+    if overwrite:
+        if not isinstance(raw, str) or not raw.strip():
+            raise ProviderKeyError(
+                f"{provider_label(provider)} 旧密钥格式无效，无法覆盖 Router 现有值"
+            )
+        save_keys({provider: raw.strip()}, enable=False)
+    _cleanup_key_fields(cfg, {field})

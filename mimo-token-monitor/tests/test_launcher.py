@@ -35,6 +35,38 @@ class TestLauncher(unittest.TestCase):
                     "lite",
                 )
 
+    def test_embedded_router_checkout_disables_startup_sync_by_default(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "mimo-token-monitor"
+            project.mkdir()
+            (root / "package.json").write_text(
+                '{"name":"codex-model-router"}', encoding="utf-8"
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                configure_merged_checkout(project)
+                self.assertEqual(
+                    os.environ["MIMO_TOKEN_MONITOR_CODE_SYNC_ENABLED"], "0"
+                )
+
+    def test_embedded_router_checkout_keeps_explicit_sync_opt_in(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "mimo-token-monitor"
+            project.mkdir()
+            (root / "package.json").write_text(
+                '{"name":"codex-model-router"}', encoding="utf-8"
+            )
+            with patch.dict(
+                os.environ,
+                {"MIMO_TOKEN_MONITOR_CODE_SYNC_ENABLED": "1"},
+                clear=True,
+            ):
+                configure_merged_checkout(project)
+                self.assertEqual(
+                    os.environ["MIMO_TOKEN_MONITOR_CODE_SYNC_ENABLED"], "1"
+                )
+
     def test_start_monitor_passes_sync_result_to_child_environment(self):
         project_root = Path("C:/workspace/mimo-token-monitor")
         result = SyncResult(SyncStatus.SUCCESS, "code_pull", "代码已更新")

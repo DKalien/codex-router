@@ -1,3 +1,4 @@
+import os
 import unittest
 from unittest.mock import Mock, patch
 
@@ -31,7 +32,10 @@ class TestDirectUsageRequests(unittest.TestCase):
                     self.assertEqual(fetch(*args)["ok"], status == 200)
                     self.assertIs(client.trust_env, False)
                     if count == 1:
-                        client.get.assert_called_once_with(url, headers=headers, timeout=timeout)
+                        expected = {"headers": headers, "timeout": timeout}
+                        if fetch is api_client.fetch_third_party_usage:
+                            expected["allow_redirects"] = False
+                        client.get.assert_called_once_with(url, **expected)
                     for response in responses:
                         response.close.assert_called_once()
 
@@ -91,7 +95,144 @@ class TestThirdPartyUsageUrl(unittest.TestCase):
             "https://example.test/v1/usage",
             headers={"Authorization": "Bearer test-key"},
             timeout=15,
+            allow_redirects=False,
         )
+
+
+class _LocalUsageServer:
+    """回环测试服务器：统计 GET 次数；可返回 3xx 或 200 JSON。"""
+
+    def __init__(self, *, status=200, location="", body=b"{}"):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        self.requests = 0
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                owner.requests += 1
+                self.send_response(status)
+                if location:
+                    self.send_header("Location", location)
+                data = body if status == 200 else b""
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def __enter__(self):
+        import threading
+
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class _SelfRedirectServer(_LocalUsageServer):
+    """Location 指向自身的 3xx 服务器：若被跟随会计数到 2。"""
+
+    def __init__(self, status):
+        super().__init__(status=status, location="/v1/usage")
+
+
+class TestThirdPartyUsageHardening(unittest.TestCase):
+    """Issue #3 验收：URL 校验先行、拒绝重定向、错误不回显密钥。"""
+
+    def test_invalid_urls_fail_before_any_request(self):
+        from usage_url import LOOPBACK_HTTP_ENV
+
+        for base in (
+            "http://example.test",
+            "http://127.0.0.1",
+            "https://user:password@example.test",
+            "https://example.test?token=secret-query",
+            "https://example.test#secret-fragment",
+            "https://example.test:bad",
+            "example.test",
+            "https://",
+            "file:///tmp/secret-path",
+        ):
+            with self.subTest(base=base), patch.dict(
+                os.environ, {LOOPBACK_HTTP_ENV: ""}
+            ), patch("api_client.requests.Session") as session:
+                result = fetch_third_party_usage(base, "fake-secret-key")
+                self.assertFalse(result["ok"])
+                self.assertIn("URL 无效", result["error"])
+                self.assertEqual(result["url"], "")
+                self.assertNotIn("secret", result["error"])
+                self.assertNotIn("fake-secret-key", result["error"])
+                session.assert_not_called()
+
+    def test_redirects_are_refused_and_never_followed(self):
+        from usage_url import LOOPBACK_HTTP_ENV
+
+        body = b'{"rate_limits": [{"window": "7d", "limit": 100, "used": 1}]}'
+        for status in (301, 302, 303, 307, 308):
+            # 跨主机跳转：目标服务器请求数必须为 0，收不到 Bearer。
+            with self.subTest(status=status, same_host=False):
+                with _LocalUsageServer(status=200, body=body) as target:
+                    with _LocalUsageServer(
+                        status=status, location=f"{target.url}/v1/usage"
+                    ) as entry:
+                        with patch.dict(os.environ, {LOOPBACK_HTTP_ENV: "1"}):
+                            result = fetch_third_party_usage(
+                                entry.url, "fake-secret-key"
+                            )
+                        self.assertFalse(result["ok"])
+                        self.assertIn("重定向", result["error"])
+                        self.assertNotIn("fake-secret-key", result["error"])
+                        self.assertEqual(entry.requests, 1)
+                        self.assertEqual(target.requests, 0)
+            # 同主机跳转：若被跟随，同一服务器会计数到 2。
+            with self.subTest(status=status, same_host=True):
+                with _SelfRedirectServer(status) as entry:
+                    with patch.dict(os.environ, {LOOPBACK_HTTP_ENV: "1"}):
+                        result = fetch_third_party_usage(
+                            entry.url, "fake-secret-key"
+                        )
+                    self.assertFalse(result["ok"])
+                    self.assertIn("重定向", result["error"])
+                    self.assertEqual(entry.requests, 1)
+
+    def test_loopback_http_requires_explicit_opt_in(self):
+        from usage_url import LOOPBACK_HTTP_ENV
+
+        body = b'{"rate_limits": [{"window": "7d", "limit": 100, "used": 1}]}'
+        with _LocalUsageServer(body=body) as server:
+            with patch.dict(os.environ, {LOOPBACK_HTTP_ENV: ""}):
+                result = fetch_third_party_usage(server.url, "fake-secret-key")
+            self.assertFalse(result["ok"])
+            self.assertIn("URL 无效", result["error"])
+            self.assertEqual(server.requests, 0)
+
+            with patch.dict(os.environ, {LOOPBACK_HTTP_ENV: "1"}):
+                result = fetch_third_party_usage(server.url, "fake-secret-key")
+            self.assertTrue(result["ok"])
+            self.assertEqual(server.requests, 1)
+
+    def test_error_paths_never_expose_key(self):
+        from usage_url import LOOPBACK_HTTP_ENV
+
+        with _LocalUsageServer(status=500) as server, patch.dict(
+            os.environ, {LOOPBACK_HTTP_ENV: "1"}
+        ):
+            result = fetch_third_party_usage(server.url, "fake-secret-key")
+        self.assertFalse(result["ok"])
+        self.assertNotIn("fake-secret-key", result["error"])
+
+        result = fetch_third_party_usage("https://127.0.0.1:1", "fake-secret-key")
+        self.assertFalse(result["ok"])
+        self.assertNotIn("fake-secret-key", result["error"])
 
 
 class TestThirdPartyUsageParser(unittest.TestCase):

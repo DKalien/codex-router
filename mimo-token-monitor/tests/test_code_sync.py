@@ -195,6 +195,108 @@ class TestCodeSync(unittest.TestCase):
         self.assertNotIn("secret-token", clean)
 
 
+    def _clone_and_push_file(self, relpath: str, content: str):
+        clone = Path(tempfile.mkdtemp(dir=self.tmp.name, prefix="publisher-"))
+        subprocess.run(
+            ["git", "clone", "-b", "main", str(self.fixture.remote), str(clone)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        run_git(clone, "config", "user.name", "Publisher")
+        run_git(clone, "config", "user.email", "publisher@example.test")
+        target = clone / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        run_git(clone, "add", relpath)
+        run_git(clone, "commit", "-m", "remote update")
+        run_git(clone, "push", "origin", "main")
+
+    def test_disabled_sync_never_calls_git(self):
+        config = CodeSyncConfig(
+            project_root=self.fixture.project.resolve(),
+            repo_root=self.fixture.repo.resolve(),
+            project_path="mimo-token-monitor",
+            timeout_seconds=10,
+            enabled=False,
+        )
+        runner = Mock()
+        result = CodeSyncService(config, runner=runner).pull_latest()
+
+        self.assertEqual(result.status, SyncStatus.SKIPPED)
+        self.assertIn("禁用", result.message)
+        runner.assert_not_called()
+
+    def test_pull_reports_scope_for_router_only_and_mixed_changes(self):
+        self._clone_and_push_file("other-project/keep.txt", "router-v2\n")
+
+        result = CodeSyncService(self.fixture.config()).pull_latest()
+
+        self.assertEqual(result.status, SyncStatus.SUCCESS)
+        self.assertIn("Router 核心 1 个文件", result.message)
+        self.assertNotIn("监控器", result.message)
+        self.assertIn("运行中的 Router 未重启", result.detail)
+
+        self._clone_and_push_file("mimo-token-monitor/main.py", "monitor-v2\n")
+        self._clone_and_push_file("other-project/keep.txt", "router-v3\n")
+
+        result = CodeSyncService(self.fixture.config()).pull_latest()
+
+        self.assertEqual(result.status, SyncStatus.SUCCESS)
+        self.assertIn("Router 核心 1 个文件", result.message)
+        self.assertIn("监控器 1 个文件", result.message)
+        self.assertIn("运行中的 Router 未重启", result.detail)
+
+    def test_check_updates_reports_scope_without_changing_worktree(self):
+        self._clone_and_push_file("other-project/keep.txt", "router-v2\n")
+        before = run_git(self.fixture.repo, "rev-parse", "HEAD").stdout
+
+        check = CodeSyncService(self.fixture.config()).check_updates()
+
+        self.assertTrue(check.has_updates)
+        self.assertEqual(check.behind, 1)
+        self.assertEqual(check.changed_paths, ("other-project/keep.txt",))
+        self.assertIn("Router 核心", check.scope)
+        self.assertEqual(run_git(self.fixture.repo, "rev-parse", "HEAD").stdout, before)
+        self.assertEqual(run_git(self.fixture.repo, "status", "--porcelain").stdout, b"")
+
+        result = CodeSyncService(self.fixture.config()).pull_latest()
+        self.assertEqual(result.status, SyncStatus.SUCCESS)
+
+    def test_pull_never_changes_detached_wrong_branch_or_diverged(self):
+        service = CodeSyncService(self.fixture.config())
+        self._clone_and_push_file("mimo-token-monitor/main.py", "remote-v2\n")
+
+        run_git(self.fixture.repo, "checkout", "--detach")
+        before = run_git(self.fixture.repo, "rev-parse", "HEAD").stdout
+        self.assertEqual(service.pull_latest().status, SyncStatus.SKIPPED)
+        self.assertEqual(run_git(self.fixture.repo, "rev-parse", "HEAD").stdout, before)
+        check = service.check_updates()
+        self.assertFalse(check.has_updates)
+
+        run_git(self.fixture.repo, "checkout", "-b", "other")
+        self.assertEqual(service.pull_latest().status, SyncStatus.SKIPPED)
+        self.assertEqual(run_git(self.fixture.repo, "rev-parse", "HEAD").stdout, before)
+
+        run_git(self.fixture.repo, "checkout", "main")
+        local = self.fixture.project / "main.py"
+        local.write_text("local-edit\n", encoding="utf-8")
+        run_git(self.fixture.repo, "add", "mimo-token-monitor/main.py")
+        run_git(self.fixture.repo, "commit", "-m", "local diverge")
+        before = run_git(self.fixture.repo, "rev-parse", "HEAD").stdout
+        self.assertEqual(service.pull_latest().status, SyncStatus.FAILED)
+        self.assertEqual(run_git(self.fixture.repo, "rev-parse", "HEAD").stdout, before)
+        self.assertEqual(local.read_text(encoding="utf-8"), "local-edit\n")
+
+    def test_scope_summary_classification(self):
+        from code_sync import scope_summary
+
+        paths = ["mimo-token-monitor/main.py", "src/router.mjs", "README.md"]
+        summary = scope_summary(paths, "mimo-token-monitor")
+        self.assertIn("Router 核心 2 个文件", summary)
+        self.assertIn("监控器 1 个文件", summary)
+        self.assertEqual(scope_summary([], "mimo-token-monitor"), "无文件变更")
+
 class TestHiddenSubprocessKwargs(unittest.TestCase):
     def test_git_runner_receives_hidden_window_kwargs(self):
         config = CodeSyncConfig(

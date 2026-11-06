@@ -48,6 +48,9 @@ def configure_merged_checkout(project_root: Path) -> None:
     os.environ.setdefault("MIMO_TOKEN_MONITOR_CODE_REPO_ROOT", str(project_root.parent))
     os.environ.setdefault("MIMO_TOKEN_MONITOR_CODE_PROJECT_PATH", project_root.name)
     os.environ.setdefault("MIMO_TOKEN_MONITOR_CODE_GIT_BRANCH", "lite")
+    # 合并布局下启动监控器绝不隐式 fast-forward 整个 Router checkout：
+    # 只有托盘「检查并更新代码」显式操作（或本变量显式设为 1）才同步。
+    os.environ.setdefault("MIMO_TOKEN_MONITOR_CODE_SYNC_ENABLED", "0")
 
 
 def local_python_candidates(project_root: Path) -> list[list[str]]:

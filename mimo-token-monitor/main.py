@@ -7,7 +7,8 @@ from pathlib import Path
 from PyQt6.QtCore import QProcess, QTimer
 from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 
-from config import load_config, migrate_provider_keys, save_config
+from code_sync import CODE_SYNC_RESULT_ENV, decode_sync_result
+from config import load_config, migrate_provider_keys, resolve_key_migration, save_config
 from provider_keys import ProviderKeyError
 from widget import SettingsDialog, TokenWidget
 
@@ -82,10 +83,34 @@ def restart_application() -> bool:
     )
     return started
 
+def _confirm_key_override(item: dict) -> bool:
+    """旧值与 Router 现有密钥不同时让用户显式选择；默认保留现有值。"""
+    reason = "（当前生效值来自环境变量覆盖）" if item.get("reason") == "env" else ""
+    box = QMessageBox(
+        QMessageBox.Icon.Question,
+        "共享密钥迁移",
+        f"{item['label']}：Router 中已有不同的生效密钥{reason}。\n"
+        "旧配置中的值不会自动覆盖现有密钥。\n"
+        "选择「用旧值覆盖」只替换密钥值，不改变供应商启用状态。",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+    )
+    box.setDefaultButton(QMessageBox.StandardButton.No)
+    box.button(QMessageBox.StandardButton.Yes).setText("用旧值覆盖")
+    box.button(QMessageBox.StandardButton.No).setText("保留现有值（推荐）")
+    return box.exec() == QMessageBox.StandardButton.Yes
+
+
 def initialize_window():
     cfg = load_config()
     try:
-        migrate_provider_keys(cfg)
+        conflicts = migrate_provider_keys(cfg)
+        for item in conflicts:
+            overwrite = _confirm_key_override(item)
+            try:
+                resolve_key_migration(cfg, item["field"], overwrite=overwrite)
+            except ProviderKeyError as exc:
+                # 单项覆盖失败（如环境变量冲突）保留旧值供重试，不阻塞启动。
+                QMessageBox.warning(None, "共享密钥迁移未完成", str(exc))
     except ProviderKeyError as exc:
         QMessageBox.critical(None, "共享密钥迁移失败", str(exc))
         return None
@@ -122,6 +147,13 @@ def main() -> int:
         widget = initialize_window()
         if widget is None:
             return 0
+
+        raw_sync_result = os.environ.pop(CODE_SYNC_RESULT_ENV, "")
+        startup_sync_result = (
+            decode_sync_result(raw_sync_result) if raw_sync_result else None
+        )
+        if startup_sync_result is not None:
+            widget.show_startup_sync_result(startup_sync_result)
 
         activation_timer = QTimer()
         activation_timer.setInterval(250)

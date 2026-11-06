@@ -7,6 +7,7 @@ import math as _math
 import pathlib as _pl
 from datetime import datetime as _datetime
 import gpt_browser
+from usage_url import UsageUrlError, usage_endpoint
 
 # 确保打包后 requests 也能找到 CA 证书
 if "SSL_CERT_FILE" not in os.environ:
@@ -108,18 +109,15 @@ def fetch_usage(cookie: str) -> dict:
 DEFAULT_THIRD_PARTY_BASE_URL = "https://codex.wlbclub.com"
 
 
-def _third_party_usage_url(base_url: str) -> str:
-    """Build the usage endpoint without duplicating a user-supplied /v1 path."""
-    base = (base_url or DEFAULT_THIRD_PARTY_BASE_URL).strip().rstrip("/")
-    if not base:
-        base = DEFAULT_THIRD_PARTY_BASE_URL
+def _third_party_usage_url(base_url: str, label: str = "WLB") -> str:
+    """Build the validated usage endpoint without duplicating a /v1 path.
 
-    lower_base = base.casefold()
-    if lower_base.endswith("/v1/usage"):
-        return base
-    if lower_base.endswith("/v1"):
-        return f"{base}/usage"
-    return f"{base}/v1/usage"
+    与 SuperGPT 共享 ``usage_url`` 的安全规则：默认仅 HTTPS、禁止 URL 内嵌
+    登录凭据/查询参数/片段，失败抛 ``UsageUrlError``（消息不含输入原文）。
+    """
+    return usage_endpoint(
+        base_url, default_base=DEFAULT_THIRD_PARTY_BASE_URL, label=label
+    )
 
 
 def parse_third_party_usage(data, window: str = "7d") -> dict:
@@ -215,7 +213,10 @@ def fetch_third_party_usage(base_url: str, api_key: str, window: str = "7d") -> 
     GET the normalized base_url/v1/usage endpoint with Authorization: Bearer apiKey.
     Returns: ok, data, error, url
     """
-    url = _third_party_usage_url(base_url)
+    try:
+        url = _third_party_usage_url(base_url)
+    except UsageUrlError as exc:
+        return {"ok": False, "data": None, "error": str(exc), "url": ""}
 
     if not str(api_key or "").strip():
         return {"ok": False, "data": None, "error": "API Key 不能为空", "url": url}
@@ -228,7 +229,18 @@ def fetch_third_party_usage(base_url: str, api_key: str, window: str = "7d") -> 
                 url,
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=15,
+                allow_redirects=False,
             )
+        if resp.status_code in (301, 302, 303, 307, 308):
+            return {
+                "ok": False,
+                "data": None,
+                "error": (
+                    f"WLB 用量接口返回重定向（HTTP {resp.status_code}），"
+                    "已拒绝跟随，请检查 Base URL 配置"
+                ),
+                "url": url,
+            }
         if resp.status_code == 401:
             return {"ok": False, "data": None, "error": "API Key 无效或已过期", "url": url}
         if resp.status_code >= 400:

@@ -33,8 +33,7 @@ class TestDirectUsageRequests(unittest.TestCase):
                     self.assertIs(client.trust_env, False)
                     if count == 1:
                         expected = {"headers": headers, "timeout": timeout}
-                        if fetch is api_client.fetch_third_party_usage:
-                            expected["allow_redirects"] = False
+                        expected["allow_redirects"] = False
                         client.get.assert_called_once_with(url, **expected)
                     for response in responses:
                         response.close.assert_called_once()
@@ -51,6 +50,74 @@ class TestDirectUsageRequests(unittest.TestCase):
             self.assertIs(client.trust_env, False)
             for response in responses:
                 response.close.assert_called_once()
+
+
+class TestMimoDiagnostics(unittest.TestCase):
+    def test_http_403_classifies_content_without_claiming_expired_cookie(self):
+        import api_client
+        for content_type, expected in (("text/html", "HTML"), ("application/json", "JSON")):
+            with self.subTest(content_type=content_type), patch("api_client.requests.Session") as factory:
+                response = Mock(status_code=403, headers={"Content-Type": content_type}, text="fake-secret")
+                factory.return_value.__enter__.return_value.get.return_value = response
+                result = api_client.fetch_balance("fake-secret")
+                self.assertFalse(result["ok"])
+                self.assertFalse(result["auth_expired"])
+                self.assertEqual(result["status_code"], 403)
+                self.assertIn("/api/v1/balance", result["error"])
+                self.assertIn(expected, result["error"])
+                self.assertNotIn("fake-secret", str(result))
+                response.json.assert_not_called()
+                response.close.assert_called_once()
+
+    def test_balance_requires_valid_payload_and_preserves_zero(self):
+        import api_client
+        for payload, expected in (
+            ({"code": 0, "data": {"balance": 0}}, True),
+            ({"data": {"amount": "12.50"}}, True),
+            ({"data": 0}, True), ({"data": "0.0"}, True),
+            ({"code": 401, "message": "fake-secret"}, False),
+            ({"code": 403, "data": {"balance": 5}}, False),
+            ({"data": {}}, False), ({"balance": True}, False),
+            ({"balance": "nan"}, False), ({"balance": "not money"}, False),
+        ):
+            with self.subTest(payload=payload), patch("api_client.requests.Session") as factory:
+                response = Mock(status_code=200)
+                response.json.return_value = payload
+                factory.return_value.__enter__.return_value.get.return_value = response
+                result = api_client.fetch_balance("fake-secret")
+                self.assertIs(result["ok"], expected)
+                self.assertFalse(result["auth_expired"])
+                self.assertNotIn("fake-secret", str(result))
+
+    def test_usage_keeps_all_endpoint_failures_and_401_is_explicit(self):
+        import api_client
+        for status in (401, 403):
+            with self.subTest(status=status), patch("api_client.requests.Session") as factory:
+                response = Mock(status_code=status, headers={"Content-Type": "text/html"})
+                factory.return_value.__enter__.return_value.get.return_value = response
+                result = api_client.fetch_usage("fake-secret")
+                self.assertFalse(result["ok"])
+                self.assertIs(result["auth_expired"], status == 401)
+                self.assertEqual(len(result["attempts"]), 1 if status == 401 else 4)
+                self.assertIn("/api/v1/tokenPlan/usage", result["error"])
+                if status == 403:
+                    self.assertIn("/api/v1/tokenPlan/subscription/order", result["error"])
+                    self.assertIn("/api/v1/usage", result["error"])
+                self.assertNotIn("fake-secret", str(result))
+
+    def test_network_and_json_errors_never_echo_exception_details(self):
+        import api_client
+        import requests
+        for fetch in (api_client.fetch_balance, api_client.fetch_usage):
+            for error in (requests.exceptions.SSLError("fake-secret"),
+                          requests.exceptions.ReadTimeout("fake-secret"),
+                          ValueError("fake-secret")):
+                with self.subTest(fetch=fetch.__name__, error=type(error).__name__), patch("api_client.requests.Session") as factory:
+                    factory.return_value.__enter__.return_value.get.side_effect = error
+                    result = fetch("fake-secret")
+                    self.assertFalse(result["ok"])
+                    self.assertNotIn("fake-secret", str(result))
+                    self.assertFalse(result["auth_expired"])
 
 
 class TestThirdPartyUsageUrl(unittest.TestCase):
@@ -852,6 +919,24 @@ class TestFetchGPTWeeklyUsage(unittest.TestCase):
                 patch("api_client._GPT_SESSION.get", return_value=resp)):
                 result = _gpt_try_local_auth()
             self.assertIsNone(result)
+
+
+class TestMimoLocalHttp(unittest.TestCase):
+    def test_redirect_is_not_followed_and_403_remains_a_separate_failure(self):
+        import api_client
+        with _LocalUsageServer(status=200, body=b'{"balance": 3}') as target:
+            with _LocalUsageServer(status=302, location=target.url) as entry:
+                with patch.object(api_client, "BALANCE_URL", entry.url):
+                    result = api_client.fetch_balance("fake-cookie")
+                self.assertFalse(result["ok"])
+                self.assertIn("未跟随", result["error"])
+                self.assertEqual(target.requests, 0)
+            with _LocalUsageServer(status=403) as entry:
+                with patch.object(api_client, "BALANCE_URL", entry.url):
+                    result = api_client.fetch_balance("fake-cookie")
+                self.assertEqual(result["status_code"], 403)
+                self.assertFalse(result["auth_expired"])
+                self.assertEqual(entry.requests, 1)
 
 
 if __name__ == "__main__":

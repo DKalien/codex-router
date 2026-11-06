@@ -238,30 +238,22 @@ class PlaywrightCookieWorker(QThread):
     @staticmethod
     def _cookie_is_usable(cookie: str) -> bool:
         result = api_client.fetch_balance(cookie)
-        return bool(result.get("ok"))
+        if result.get("ok"):
+            return True
+        if result.get("auth_expired"):
+            return False
+        raise playwright_session.PlaywrightSessionError(
+            "MiMo Cookie 校验未通过：" + (result.get("error") or "未知错误")
+        )
 
     def run(self):
         try:
-            if self.interactive:
-                # Keep the headed browser open until a usable cookie appears so the
-                # user can finish login / captcha instead of the window closing early.
-                cookie, error = playwright_session.refresh_cookie(
-                    interactive=True,
-                    timeout_seconds=180,
-                    previous_cookie=self.previous_cookie,
-                    cookie_validator=self._cookie_is_usable,
-                )
-            else:
-                cookie, error = playwright_session.refresh_cookie(
-                    interactive=False,
-                    timeout_seconds=30,
-                    previous_cookie=self.previous_cookie,
-                )
-                if cookie:
-                    result = api_client.fetch_balance(cookie)
-                    if not result.get("ok"):
-                        error = result.get("error") or "Cookie 验证失败"
-                        cookie = None
+            cookie, error = playwright_session.refresh_cookie(
+                interactive=self.interactive,
+                timeout_seconds=180 if self.interactive else 30,
+                previous_cookie=self.previous_cookie,
+                cookie_validator=self._cookie_is_usable,
+            )
         except Exception as exc:  # noqa: BLE001 - worker must always emit
             cookie, error = None, f"Playwright 续期异常（{type(exc).__name__}）"
         self.result_ready.emit(cookie, error, self.interactive)
@@ -2560,6 +2552,12 @@ class TokenWidget(QWidget):
                 3000,
             )
             return
+        if self._playwright_worker is not None and self._playwright_worker.isRunning():
+            self._tray_icon.showMessage(
+                "Playwright 续期", "续期任务结束后再退出；可先关闭登录浏览器",
+                QSystemTrayIcon.MessageIcon.Warning, 3000,
+            )
+            return
         self._restart_requested = restart
         self._exit_requested = True
         self.setEnabled(False)
@@ -2569,8 +2567,6 @@ class TokenWidget(QWidget):
         if self._supergpt_worker is not None:
             self._supergpt_worker.requestInterruption()
             self._supergpt_worker.wait()
-        if self._playwright_worker is not None and self._playwright_worker.isRunning():
-            self._playwright_worker.wait(5000)
         if self._exit_callback is not None:
             self._exit_callback()
         else:
@@ -2705,11 +2701,15 @@ class TokenWidget(QWidget):
         worker = self._playwright_worker
         self._playwright_worker = None
         if worker is not None:
+            worker.wait()
             worker.deleteLater()
+        if self._exit_requested:
+            return
 
         if cookie:
             self.cfg["cookie"] = cookie
-            self._playwright_recovery_attempted = False
+            if interactive:
+                self._playwright_recovery_attempted = False
             save_config(self.cfg)
             self._mimo_error = ""
             self._set_router_status("Cookie 续期成功", ok=True, clear_after=5000)
@@ -2808,17 +2808,14 @@ class TokenWidget(QWidget):
     def _on_fetch_done(self, bal_result: dict, usage_result: dict):
         if self._exit_requested:
             return
-        if not bal_result["ok"]:
-            self._mimo_error = bal_result.get("error", "余额查询失败")
-        elif not usage_result["ok"]:
-            self._mimo_error = usage_result.get("error", "用量查询失败")
-        else:
-            self._mimo_error = ""
-        expired = any(
-            "过期" in str(result.get("error") or "")
-            for result in (bal_result, usage_result)
-            if isinstance(result, dict)
+        self._mimo_error = "; ".join(
+            result.get("error") or fallback
+            for result, fallback in ((bal_result, "余额查询失败"), (usage_result, "用量查询失败"))
+            if not result["ok"]
         )
+        if bal_result["ok"] and usage_result["ok"]:
+            self._playwright_recovery_attempted = False
+        expired = any(result.get("auth_expired") for result in (bal_result, usage_result))
         if (
             expired
             and self.cfg.get("playwright_auto_refresh", True)

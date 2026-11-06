@@ -23,6 +23,14 @@ class PlaywrightSessionError(RuntimeError):
     """Playwright 未安装、启动、导航或关闭失败。"""
 
 
+class PlaywrightCookiePendingError(PlaywrightSessionError):
+    """SSO 或登录尚未完成，可以等待 Cookie 写入。"""
+
+
+class PlaywrightSessionClosedError(PlaywrightSessionError):
+    """浏览器或持久化上下文已关闭，继续轮询不会恢复它。"""
+
+
 def _load_sync_playwright() -> Callable[[], Any]:
     """懒加载可选依赖，避免普通启动路径要求安装 Playwright。"""
     try:
@@ -76,6 +84,7 @@ class PlaywrightSession:
         self.launch_options = dict(launch_options or {})
         self._playwright: Any = None
         self._context: Any = None
+        self._runtime_failure = ""
 
     @property
     def context(self) -> Any:
@@ -98,11 +107,13 @@ class PlaywrightSession:
             sync_playwright = _load_sync_playwright()
             self._playwright = sync_playwright().start()
             stage = "启动 Chromium"
+            self._runtime_failure = ""
             options = dict(self.launch_options)
             options.setdefault("headless", self.headless)
             self._context = self._playwright.chromium.launch_persistent_context(
                 str(self.user_data_dir), **options
             )
+            self._context.on("close", lambda _: self._mark_runtime_failure("上下文已关闭"))
             return self._context
         except PlaywrightSessionError:
             self._close_runtime()
@@ -115,10 +126,38 @@ class PlaywrightSession:
                     value = getattr(exc, name, None)
                     if isinstance(value, int):
                         error_codes += f"，{name}={value}"
+            hint = "请确认 Chromium 已安装且专用目录可写"
+            if any(marker in str(exc).lower() for marker in
+                   ("processsingleton", "singletonlock", "user data directory is already in use")):
+                hint = "专用 profile 可能被其他 Chromium 占用；关闭其他续期任务后重试，不要删除 profile"
             raise PlaywrightSessionError(
                 f"Playwright 持久化会话启动失败，阶段：{stage}"
-                f"（{type(exc).__name__}{error_codes}）；请确认 Chromium 已安装且专用目录可写"
+                f"（{type(exc).__name__}{error_codes}）；{hint}"
             ) from exc
+
+    def _mark_runtime_failure(self, reason: str) -> None:
+        if not self._runtime_failure:
+            self._runtime_failure = reason
+
+    def _operation_error(self, stage: str, exc: Exception | None = None) -> PlaywrightSessionError:
+        mode = "headless" if self.headless else "headed"
+        kind = type(exc).__name__ if exc is not None else "浏览器事件"
+        if self._runtime_failure or kind == "TargetClosedError":
+            reason = self._runtime_failure or "目标已关闭"
+            return PlaywrightSessionClosedError(
+                f"Playwright 浏览器会话已关闭或页面崩溃，阶段：{stage}（{mode}，{kind}，{reason}）；"
+                "请在登录完成前保持续期窗口打开；若窗口自行退出，检查 Chromium 崩溃记录或安全软件，"
+                "关闭其他续期任务后重试，不要删除专用 profile"
+            )
+        return PlaywrightSessionError(f"Playwright {stage}失败（{mode}，{kind}）")
+
+    def _wait(self, page: Any, milliseconds: float) -> None:
+        try:
+            page.wait_for_timeout(milliseconds)
+        except Exception as exc:
+            raise self._operation_error("等待 SSO", exc) from exc
+        if self._runtime_failure:
+            raise self._operation_error("等待 SSO")
 
     def open_mimo(
         self,
@@ -131,12 +170,11 @@ class PlaywrightSession:
         context = self.start()
         try:
             page = context.pages[0] if context.pages else context.new_page()
+            page.on("crash", lambda _: self._mark_runtime_failure("页面崩溃"))
             page.goto(url, wait_until=wait_until, timeout=timeout)
             return page
         except Exception as exc:
-            raise PlaywrightSessionError(
-                f"打开 MiMo 平台页面失败（{type(exc).__name__}）"
-            ) from exc
+            raise self._operation_error("打开 MiMo 平台页面", exc) from exc
 
     def _page_url(self) -> str:
         context = self._context
@@ -163,18 +201,18 @@ class PlaywrightSession:
                 and cookie.get("value") is not None
             ]
         except Exception as exc:
-            raise PlaywrightSessionError(
-                f"读取 MiMo Cookie 失败（{type(exc).__name__}）"
-            ) from exc
+            raise self._operation_error("读取 MiMo Cookie", exc) from exc
+        if self._runtime_failure:
+            raise self._operation_error("读取 MiMo Cookie")
 
         if not matched:
             page_url = self._page_url()
             if "account.xiaomi.com" in page_url or "/service/login" in page_url:
-                raise PlaywrightSessionError(
+                raise PlaywrightCookiePendingError(
                     "小米账号 SSO 尚未完成，平台 Cookie 还未写入；"
                     "请等待自动跳转，或在打开的浏览器中完成登录"
                 )
-            raise PlaywrightSessionError(
+            raise PlaywrightCookiePendingError(
                 "未找到 xiaomimimo.com Cookie，请先在会话页面登录 MiMo"
             )
         matched.sort(key=_cookie_sort_key)
@@ -192,40 +230,29 @@ class PlaywrightSession:
         if timeout_seconds <= 0:
             raise PlaywrightSessionError("Cookie 刷新超时必须大于 0 秒")
         self.headless = not interactive
+        deadline = time.monotonic() + timeout_seconds
         page = self.open_mimo(timeout=min(timeout_seconds * 1000, 60_000))
-        wait_for_timeout = getattr(page, "wait_for_timeout", None)
-        if wait_for_timeout is not None:
-            wait_for_timeout(min(int(SSO_SETTLE_SECONDS * 1000), timeout_seconds * 1000))
+        self._wait(page, max(0, min(SSO_SETTLE_SECONDS, deadline - time.monotonic())) * 1000)
 
         # 始终轮询到超时：serviceToken 常在首屏跳转/SSO 之后才出现，
         # 不能在打开后立刻读一次就失败。
-        deadline = time.monotonic() + timeout_seconds
         last_error = ""
-        navigate_attempts = 0
+        rejected_cookie = None
         while time.monotonic() < deadline:
             try:
                 cookie = self.get_cookie()
                 if previous_cookie is not None and cookie == previous_cookie:
                     last_error = "等待 MiMo 更新登录状态"
+                elif cookie == rejected_cookie:
+                    pass
                 elif cookie_validator is not None and not cookie_validator(cookie):
+                    rejected_cookie = cookie
                     last_error = "Cookie 尚未生效，请在打开的浏览器中完成登录或验证码"
                 else:
                     return cookie
-            except PlaywrightSessionError as exc:
+            except PlaywrightCookiePendingError as exc:
                 last_error = str(exc)
-                # 卡在小米登录页时，定期回到平台页，帮助 SSO/前端再次触发回跳。
-                page_url = self._page_url()
-                if (
-                    "account.xiaomi.com" in page_url
-                    and navigate_attempts < 2
-                    and time.monotonic() + 8 < deadline
-                ):
-                    navigate_attempts += 1
-                    try:
-                        page.goto(MIMO_URL, wait_until="domcontentloaded", timeout=20_000)
-                    except Exception:
-                        pass
-            time.sleep(SSO_POLL_SECONDS)
+            self._wait(page, max(0, min(SSO_POLL_SECONDS, deadline - time.monotonic())) * 1000)
         raise PlaywrightSessionError(
             last_error or "等待 MiMo 更新登录状态超时，请完成登录或验证码验证"
         )

@@ -38,73 +38,106 @@ def _headers(cookie: str) -> dict:
     }
 
 
+def _mimo_http_error(resp) -> str | None:
+    status = resp.status_code
+    if 200 <= status < 300:
+        return None
+    if status == 401:
+        return "Cookie 已过期，请重新获取（HTTP 401）"
+    if 300 <= status < 400:
+        return f"HTTP {status} 重定向（未跟随），请检查平台登录状态"
+    content_type = str(resp.headers.get("Content-Type", "")).lower()
+    kind = "HTML" if "html" in content_type else "JSON" if "json" in content_type else "其他/未知"
+    reason = "，服务器拒绝访问，不能据此判断 Cookie 过期" if status == 403 else ""
+    return f"HTTP {status}（响应类型：{kind}{reason}）"
+
+
+def _mimo_request_error(exc: Exception) -> str:
+    if isinstance(exc, requests.exceptions.SSLError):
+        return "TLS 证书或连接失败（直连，未读取代理环境变量）"
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "请求超时（直连）"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return "网络连接失败（直连）"
+    # 异常可能包含请求头、响应正文或本机路径，不能回显原文。
+    return f"请求或响应解析失败（{type(exc).__name__}）"
+
+
 def fetch_balance(cookie: str) -> dict:
     resp = None
+    result = {"ok": False, "balance": None, "error": None,
+              "endpoint": BALANCE_URL, "status_code": None, "auth_expired": False}
     try:
         with requests.Session() as session:
             session.trust_env = False
-            resp = session.get(BALANCE_URL, headers=_headers(cookie), timeout=10)
-        if resp.status_code == 401:
-            return {"ok": False, "balance": None, "error": "Cookie 已过期，请重新获取"}
-        if resp.status_code >= 400:
-            return {"ok": False, "balance": None, "error": f"HTTP {resp.status_code}"}
+            resp = session.get(BALANCE_URL, headers=_headers(cookie), timeout=10,
+                               allow_redirects=False)
+        result.update(status_code=resp.status_code, auth_expired=resp.status_code == 401)
+        error = _mimo_http_error(resp)
+        if error:
+            result["error"] = f"/api/v1/balance: {error}"
+            return result
         data = resp.json()
-        balance: int | float | str | None = None
-        if isinstance(data, dict):
-            d = data.get("data", data)
-            if isinstance(d, (int, float)):
-                balance = d
-            elif isinstance(d, dict):
-                balance = d.get("balance") or d.get("amount") or d.get("remain")
-            elif isinstance(d, str):
-                balance = d
-            # Direct on root
+        balance = None
+        if isinstance(data, dict) and data.get("code") in (None, 0, "0", 200, "200"):
+            value = data.get("data", data)
+            if isinstance(value, dict):
+                balance = next((value[k] for k in ("balance", "amount", "remain")
+                                if value.get(k) is not None), None)
+            elif isinstance(value, (int, float, str)):
+                balance = value
             if balance is None:
                 balance = data.get("balance")
-        return {"ok": True, "balance": balance, "error": None}
-    except requests.exceptions.ConnectionError:
-        return {"ok": False, "balance": None, "error": "网络连接失败"}
-    except Exception as e:
-        return {"ok": False, "balance": None, "error": str(e)[:100]}
+        try:
+            valid = not isinstance(balance, bool) and _math.isfinite(float(balance))
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:
+            result["error"] = "/api/v1/balance: HTTP 200 JSON 未返回有效余额，未确认登录有效"
+            return result
+        result.update(ok=True, balance=balance)
+    except Exception as exc:
+        result["error"] = f"/api/v1/balance: {_mimo_request_error(exc)}"
     finally:
         if resp is not None:
             resp.close()
+    return result
 
 
 def fetch_usage(cookie: str) -> dict:
-    """Try multiple endpoints until one returns valid data."""
-    headers = _headers(cookie)
-    errors = []
+    """按顺序尝试用量端点，诊断仅保留端点、状态和安全错误。"""
+    from urllib.parse import urlsplit
 
+    attempts = []
     for url in USAGE_URLS:
         resp = None
+        attempt = {"endpoint": url, "status_code": None, "error": None}
+        attempts.append(attempt)
         try:
             with requests.Session() as session:
                 session.trust_env = False
-                resp = session.get(url, headers=headers, timeout=10)
+                resp = session.get(url, headers=_headers(cookie), timeout=10,
+                                   allow_redirects=False)
+            attempt["status_code"] = resp.status_code
+            attempt["error"] = _mimo_http_error(resp)
+            if not attempt["error"]:
+                data = resp.json()
+                if (isinstance(data, dict) and data.get("code") in (None, 0, "0", 200, "200")
+                        and (data.get("code") in (0, "0", 200, "200") or "data" in data)):
+                    return {"ok": True, "data": data, "error": None, "url": url,
+                            "attempts": attempts, "auth_expired": False}
+                attempt["error"] = "JSON 格式不匹配或 API 返回业务错误"
             if resp.status_code == 401:
-                return {"ok": False, "data": None, "error": "Cookie 已过期，请重新获取"}
-            if resp.status_code == 404:
-                errors.append(f"{url.split('/')[-1]}: 404")
-                continue
-            if resp.status_code >= 400:
-                errors.append(f"{url.split('/')[-1]}: {resp.status_code}")
-                continue
-            data = resp.json()
-            # Accept any successful JSON response with actual content
-            if isinstance(data, dict) and data.get("code") == 0:
-                return {"ok": True, "data": data, "error": None, "url": url}
-            # Some endpoints might not have code field
-            if isinstance(data, dict) and "data" in data:
-                return {"ok": True, "data": data, "error": None, "url": url}
-            errors.append(f"{url.split('/')[-1]}: 格式不匹配")
-        except Exception as e:
-            errors.append(f"{url.split('/')[-1]}: {str(e)[:30]}")
+                break
+        except Exception as exc:
+            attempt["error"] = _mimo_request_error(exc)
         finally:
             if resp is not None:
                 resp.close()
-
-    return {"ok": False, "data": None, "error": f"所有端点均失败: {'; '.join(errors[:3])}"}
+    errors = "; ".join(f"{urlsplit(a['endpoint']).path}: {a['error']}" for a in attempts)
+    return {"ok": False, "data": None, "error": f"用量端点失败: {errors}",
+            "attempts": attempts,
+            "auth_expired": any(a["status_code"] == 401 for a in attempts)}
 
 DEFAULT_THIRD_PARTY_BASE_URL = "https://codex.wlbclub.com"
 

@@ -49,7 +49,7 @@ if sys.platform == "win32":
             QFontDatabase.addApplicationFont(str(font_path))
 
 from widget import (  # noqa: E402
-    SettingsDialog, TokenWidget, ThirdPartyFetchWorker, ProviderKeysWorker,
+    SettingsDialog, TokenWidget, ThirdPartyFetchWorker, ProviderKeysWorker, PlaywrightCookieWorker,
     MIMO_MODE, THIRD_PARTY_MODE, OVERVIEW_MODE,
     BASE_HEIGHT, OVERVIEW_HEIGHT, DUAL_BAR_GAP,
     BG_COLOR, BAR_BG, BALANCE_LAYER_COLORS, TEXT_COLOR, ACCENT_GREEN, ACCENT_YELLOW, ACCENT_RED, DIM, SuperGPTBalanceWorker, _format_overview_expiry,
@@ -298,14 +298,76 @@ class TestPlaywrightRecovery(unittest.TestCase):
         w._refresh_playwright_cookie = Mock()
 
         w._on_fetch_done(
-            {"ok": False, "balance": None, "error": "Cookie 已过期，请重新获取"},
-            {"ok": False, "data": None, "error": "Cookie 已过期，请重新获取"},
+            {"ok": False, "balance": None, "error": "Cookie 已过期，请重新获取", "auth_expired": True},
+            {"ok": False, "data": None, "error": "Cookie 已过期，请重新获取", "auth_expired": True},
         )
 
         w._refresh_playwright_cookie.assert_called_once_with(
             interactive=False,
             require_cookie_change=True,
         )
+        w.close()
+
+    def test_403_does_not_trigger_renewal_and_both_endpoint_errors_are_visible(self):
+        w = _make_widget(cookie="fake", playwright_auto_refresh=True)
+        w._refresh_playwright_cookie = Mock()
+        w._on_fetch_done(
+            {"ok": False, "error": "balance HTTP 403 Cookie 过期未知", "auth_expired": False},
+            {"ok": False, "error": "tokenPlan/usage HTTP 403", "auth_expired": False},
+        )
+        w._refresh_playwright_cookie.assert_not_called()
+        self.assertIn("balance HTTP 403", w._mimo_error)
+        self.assertIn("tokenPlan/usage HTTP 403", w.toolTip())
+        w.close()
+
+    def test_manual_validator_waits_only_for_confirmed_401(self):
+        for result, expected in (({"ok": True}, True),
+                                 ({"ok": False, "auth_expired": True}, False)):
+            with patch("widget.api_client.fetch_balance", return_value=result):
+                self.assertIs(PlaywrightCookieWorker._cookie_is_usable("fake"), expected)
+        for reason in ("balance HTTP 403", "TLS 连接失败"):
+            with patch("widget.api_client.fetch_balance", return_value={"ok": False, "error": reason}):
+                with self.assertRaisesRegex(Exception, reason):
+                    PlaywrightCookieWorker._cookie_is_usable("fake")
+
+    def test_quit_keeps_running_playwright_worker_alive(self):
+        w = _make_widget(cookie="fake")
+        worker = Mock()
+        worker.isRunning.return_value = True
+        w._playwright_worker = worker
+        with patch.object(w._tray_icon, "showMessage") as message:
+            w._quit_app()
+        self.assertFalse(w._exit_requested)
+        self.assertIs(w._playwright_worker, worker)
+        message.assert_called_once()
+        w._playwright_worker = None
+        w.close()
+
+    def test_worker_validates_both_headless_and_headed_cookies(self):
+        for interactive in (False, True):
+            worker = PlaywrightCookieWorker(interactive=interactive, previous_cookie="fake-old")
+            with patch("widget.playwright_session.refresh_cookie", return_value=(None, "test error")) as refresh:
+                worker.run()
+            options = refresh.call_args.kwargs
+            self.assertIs(options["interactive"], interactive)
+            self.assertEqual(options["timeout_seconds"], 180 if interactive else 30)
+            self.assertEqual(options["previous_cookie"], "fake-old")
+            self.assertIs(options["cookie_validator"], PlaywrightCookieWorker._cookie_is_usable)
+
+    def test_recovery_is_not_rearmed_until_both_api_calls_succeed(self):
+        w = _make_widget(cookie="fake", playwright_auto_refresh=True)
+        w._refresh_playwright_cookie = Mock()
+        expired = {"ok": False, "error": "HTTP 401", "auth_expired": True}
+        success = {"ok": True, "balance": 0, "data": None}
+        w._on_fetch_done(success, expired)
+        w._do_fetch = Mock()
+        with patch("widget.save_config"):
+            w._on_playwright_cookie_done("fake-new", None, False)
+        w._on_fetch_done(success, expired)
+        self.assertEqual(w._refresh_playwright_cookie.call_count, 1)
+        w._on_fetch_done(success, success)
+        w._on_fetch_done(expired, expired)
+        self.assertEqual(w._refresh_playwright_cookie.call_count, 2)
         w.close()
 
     def test_playwright_success_is_silent_and_failure_warns(self):

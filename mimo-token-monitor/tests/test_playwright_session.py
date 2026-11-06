@@ -4,20 +4,30 @@ from pathlib import Path
 from unittest.mock import Mock, call, patch
 
 import playwright_session
-from playwright_session import PlaywrightSession, PlaywrightSessionError, refresh_cookie
+from playwright_session import (
+    PlaywrightSession,
+    PlaywrightSessionClosedError,
+    PlaywrightSessionError,
+    refresh_cookie,
+)
 
 
 class _FakePage:
     def __init__(self):
         self.goto_calls = []
         self.wait_calls = []
+        self.now = 0
         self.url = "https://platform.xiaomimimo.com/console/balance"
+
+    def on(self, *args):
+        pass
 
     def goto(self, *args, **kwargs):
         self.goto_calls.append((args, kwargs))
 
     def wait_for_timeout(self, timeout):
         self.wait_calls.append(timeout)
+        self.now += timeout / 1000
 
 
 class _FakeContext:
@@ -26,6 +36,9 @@ class _FakeContext:
         self.page = _FakePage()
         self.cookies_value = []
         self.close_calls = 0
+
+    def on(self, *args):
+        pass
 
     def new_page(self):
         self.pages.append(self.page)
@@ -151,6 +164,24 @@ class TestPlaywrightSession(unittest.TestCase):
                 session.start()
         self.assertNotIn("SECRET_COOKIE", str(raised.exception))
 
+    def test_target_closed_stops_cookie_polling_with_actionable_error(self):
+        context = _FakeContext()
+        context.cookies = Mock()
+        context.cookies.side_effect = type("TargetClosedError", (Exception,), {})()
+        playwright = _FakePlaywright(context)
+        manager = Mock()
+        manager.start.return_value = playwright
+        session = PlaywrightSession(tempfile.mkdtemp())
+
+        with patch.object(playwright_session, "_load_sync_playwright", return_value=lambda: manager):
+            with self.assertRaises(PlaywrightSessionClosedError) as raised:
+                session.refresh_cookie(timeout_seconds=30)
+
+        self.assertIn("浏览器会话已关闭", str(raised.exception))
+        self.assertIn("Chromium", str(raised.exception))
+        context.cookies.assert_called_once_with()
+        session.close()
+
     def test_existing_chrome_or_edge_profile_is_rejected(self):
         session = PlaywrightSession(
             Path(tempfile.gettempdir()) / "Google" / "Chrome" / "User Data"
@@ -215,6 +246,33 @@ class TestPlaywrightSession(unittest.TestCase):
                 else:
                     runtime.stop.assert_not_called()
 
+    def test_profile_lock_is_actionable_without_exposing_launch_log(self):
+        session = PlaywrightSession(tempfile.mkdtemp())
+        runtime = Mock()
+        manager = Mock()
+        manager.start.return_value = runtime
+        runtime.chromium.launch_persistent_context.side_effect = RuntimeError(
+            "ProcessSingleton fake-secret C:/private-profile"
+        )
+        with patch.object(playwright_session, "_load_sync_playwright", return_value=lambda: manager):
+            with self.assertRaises(PlaywrightSessionError) as raised:
+                session.start()
+        self.assertIn("占用", str(raised.exception))
+        self.assertIn("不要删除", str(raised.exception))
+        self.assertNotIn("fake-secret", str(raised.exception))
+        self.assertNotIn("private-profile", str(raised.exception))
+
+    def test_crash_event_is_kept_when_followed_by_context_close(self):
+        session = PlaywrightSession(tempfile.mkdtemp())
+        session._mark_runtime_failure("页面崩溃")
+        session._mark_runtime_failure("上下文已关闭")
+        session.open_mimo = Mock(return_value=_FakePage())
+        session.get_cookie = Mock()
+        with self.assertRaises(PlaywrightSessionClosedError) as raised:
+            session.refresh_cookie(interactive=True)
+        self.assertIn("页面崩溃", str(raised.exception))
+        session.get_cookie.assert_not_called()
+
     def test_start_oserror_without_codes_does_not_invent_them(self):
         error = OSError("SECRET_COOKIE")
         with (
@@ -268,59 +326,85 @@ class TestPlaywrightSession(unittest.TestCase):
 
     def test_interactive_refresh_waits_for_login_cookie(self):
         session = PlaywrightSession(tempfile.mkdtemp())
-        session.open_mimo = Mock()
+        page = _FakePage()
+        session.open_mimo = Mock(return_value=page)
         session.get_cookie = Mock(side_effect=["session_id=stale", "session_id=ready"])
-        with patch("playwright_session.time.sleep") as sleep:
-            with patch("playwright_session.time.monotonic", side_effect=[0, 0, 1]):
-                self.assertEqual(
-                    session.refresh_cookie(
-                        interactive=True,
-                        timeout_seconds=10,
-                        previous_cookie="session_id=stale",
-                    ),
-                    "session_id=ready",
-                )
-        sleep.assert_called_once_with(1)
+        with patch("playwright_session.time.monotonic", side_effect=lambda: page.now):
+            self.assertEqual(
+                session.refresh_cookie(interactive=True, timeout_seconds=10,
+                                       previous_cookie="session_id=stale"),
+                "session_id=ready",
+            )
+        self.assertEqual(page.wait_calls, [2000, 1000])
 
     def test_refresh_visits_protected_console_and_waits_for_frontend(self):
         session = PlaywrightSession(tempfile.mkdtemp(), headless=True)
         page = _FakePage()
         session.open_mimo = Mock(return_value=page)
         session.get_cookie = Mock(return_value="session_id=ready")
-
-        self.assertEqual(session.refresh_cookie(timeout_seconds=10), "session_id=ready")
-
+        with patch("playwright_session.time.monotonic", side_effect=lambda: page.now):
+            self.assertEqual(session.refresh_cookie(timeout_seconds=10), "session_id=ready")
         session.open_mimo.assert_called_once_with(timeout=10_000)
         self.assertEqual(page.wait_calls, [2000])
         self.assertEqual(playwright_session.MIMO_URL, "https://platform.xiaomimimo.com/#/console/balance")
 
-    def test_interactive_refresh_keeps_waiting_until_cookie_validator_passes(self):
+    def test_interactive_refresh_validates_each_changed_cookie_only_once(self):
         session = PlaywrightSession(tempfile.mkdtemp())
-        session.open_mimo = Mock()
-        session.get_cookie = Mock(
-            side_effect=["tracking=1", "tracking=1", "mimo_token=ready"]
-        )
-        validator = Mock(side_effect=[False, False, True])
-        clock = iter([0, 0, 1, 1, 2, 2, 3])
-
-        with (
-            patch("playwright_session.time.sleep") as sleep,
-            patch("playwright_session.time.monotonic", side_effect=lambda: next(clock)),
-        ):
+        page = _FakePage()
+        session.open_mimo = Mock(return_value=page)
+        session.get_cookie = Mock(side_effect=["tracking=1", "tracking=1", "mimo_token=ready"])
+        validator = Mock(side_effect=[False, True])
+        with patch("playwright_session.time.monotonic", side_effect=lambda: page.now):
             self.assertEqual(
-                session.refresh_cookie(
-                    interactive=True,
-                    timeout_seconds=10,
-                    cookie_validator=validator,
-                ),
+                session.refresh_cookie(interactive=True, timeout_seconds=10,
+                                       cookie_validator=validator),
                 "mimo_token=ready",
             )
+        self.assertEqual(page.wait_calls, [2000, 1000, 1000])
+        self.assertEqual(validator.call_args_list, [call("tracking=1"), call("mimo_token=ready")])
 
-        self.assertEqual(sleep.call_count, 2)
-        self.assertEqual(
-            validator.call_args_list,
-            [call("tracking=1"), call("tracking=1"), call("mimo_token=ready")],
-        )
+    def test_validator_failure_is_preserved_without_retry(self):
+        session = PlaywrightSession(tempfile.mkdtemp())
+        page = _FakePage()
+        session.open_mimo = Mock(return_value=page)
+        session.get_cookie = Mock(return_value="fake=value")
+        validator = Mock(side_effect=PlaywrightSessionError("balance HTTP 403"))
+        with self.assertRaisesRegex(PlaywrightSessionError, "balance HTTP 403"):
+            session.refresh_cookie(interactive=True, cookie_validator=validator)
+        validator.assert_called_once_with("fake=value")
+
+    def test_sso_wait_does_not_navigate_away_from_login_and_has_total_deadline(self):
+        session = PlaywrightSession(tempfile.mkdtemp())
+        page = _FakePage()
+        session.open_mimo = Mock(return_value=page)
+        session.get_cookie = Mock(side_effect=playwright_session.PlaywrightCookiePendingError("SSO"))
+        with patch("playwright_session.time.monotonic", side_effect=lambda: page.now):
+            with self.assertRaisesRegex(PlaywrightSessionError, "SSO"):
+                session.refresh_cookie(interactive=True, timeout_seconds=5)
+        self.assertEqual(page.now, 5)
+        self.assertEqual(page.goto_calls, [])
+
+    def test_close_during_settle_preserves_stage_without_reading_cookies(self):
+        session = PlaywrightSession(tempfile.mkdtemp())
+        page = _FakePage()
+        page.wait_for_timeout = Mock(side_effect=type("TargetClosedError", (Exception,), {})("fake-secret"))
+        session.open_mimo = Mock(return_value=page)
+        session.get_cookie = Mock()
+        with self.assertRaises(PlaywrightSessionClosedError) as raised:
+            session.refresh_cookie(interactive=True)
+        self.assertIn("等待 SSO", str(raised.exception))
+        self.assertIn("headed", str(raised.exception))
+        self.assertIn("TargetClosedError", str(raised.exception))
+        self.assertNotIn("fake-secret", str(raised.exception))
+        session.get_cookie.assert_not_called()
+
+    def test_cookie_read_error_is_fatal_even_without_target_closed_type(self):
+        session = PlaywrightSession(tempfile.mkdtemp())
+        session.open_mimo = Mock(return_value=_FakePage())
+        session.get_cookie = Mock(side_effect=PlaywrightSessionError("driver failed"))
+        with self.assertRaisesRegex(PlaywrightSessionError, "driver failed"):
+            session.refresh_cookie(interactive=True)
+        session.get_cookie.assert_called_once()
 
     def test_module_refresh_cookie_forwards_validator(self):
         session = Mock()

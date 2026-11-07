@@ -79,10 +79,11 @@ python -m playwright install chromium
 续期会打开平台页并等待小米账号 SSO 回跳，读取 `api-platform_serviceToken` 等
 `xiaomimimo.com` Cookie（SSO 往往需要十余秒，不能打开后立刻读取）。自动续期和过期恢复
 默认使用 headless Chromium，不会闪现浏览器窗口；手动「Playwright 续期」会打开有界面浏览器，
-并保持到 Cookie 通过 API 校验或超时，以便完成登录/验证码。
+并保持到 Cookie 通过 API 校验或超时，以便完成登录/验证码。该窗口使用独立的 Chromium profile，
+不会自动共享内置浏览器的登录状态；请在新打开的 Chromium 窗口中完成登录。
 
 若当前配置的 Cookie 仍有效、只是独立 Playwright 会话尚未写入平台 Cookie，自动续期失败只会在
-悬浮窗底部和托盘提示「Playwright 未登录，当前 Cookie 仍可用」，不会弹阻塞对话框。真正需要
+悬浮窗底部和托盘提示「Playwright 未登录，当前 Cookie 仍可用」，手动和自动续期都不会弹阻塞对话框。真正需要
 人工登录时，可从托盘或悬浮窗菜单手动执行「Playwright 续期」。验证码仍然需要人工输入。
 Playwright 不能延长服务端设置的 Cookie 有效期。
 

@@ -2672,7 +2672,7 @@ class TokenWidget(QWidget):
             self._set_router_status(status)
             self._tray_icon.showMessage(
                 "Playwright 续期",
-                "已打开浏览器，请完成 MiMo 登录或验证码；窗口会保持到登录成功或超时",
+                "已打开独立 Chromium，请在该窗口中完成 MiMo 登录或验证码；它不共享内置浏览器登录状态",
                 QSystemTrayIcon.MessageIcon.Information,
                 5000,
             )
@@ -2727,26 +2727,18 @@ class TokenWidget(QWidget):
         cookie_ok = self._current_cookie_still_works()
 
         # Playwright 独立会话没登录 ≠ 配置里的 Cookie 失效。
-        # 后者仍可用时，自动续期失败只给状态/托盘提示，不弹阻塞对话框。
-        if cookie_ok and not interactive:
+        # 后者仍可用时，手动和自动续期都只给状态/托盘提示，不弹阻塞对话框。
+        if cookie_ok:
             status = "Playwright 未登录，当前 Cookie 仍可用"
             self._set_router_status(status, ok=True, clear_after=10000)
             self._tray_icon.showMessage(
                 "Playwright 续期",
-                status + "。如需自动续期，请手动执行一次「Playwright 续期」并完成登录。",
+                status + "。如需自动续期，请在新打开的独立 Chromium 窗口中完成登录；内置浏览器登录不会自动共享。",
                 QSystemTrayIcon.MessageIcon.Information,
                 6000,
             )
             self.update()
             return
-
-        if cookie_ok:
-            first_line = "Playwright 登录未完成，当前 Cookie 仍可用"
-            message = (
-                f"{message}\n\n"
-                "当前配置的 Cookie 仍然有效，用量可继续刷新。\n"
-                "若要启用 Playwright 自动续期，请在打开的浏览器中完成登录。"
-            )
 
         # 先把状态画在悬浮窗上，并且在对话框关闭前不清除
         #（否则用户看弹窗超过 clear_after 时，关掉后悬浮窗已经没字了）。

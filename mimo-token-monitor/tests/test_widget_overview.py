@@ -413,6 +413,27 @@ class TestPlaywrightRecovery(unittest.TestCase):
         self.assertIs(w._router_status_ok, True)
         w.close()
 
+    def test_manual_renew_failure_is_also_soft_when_cookie_still_works(self):
+        w = _make_widget(cookie="still-valid")
+        w._playwright_worker = Mock()
+
+        with patch.object(w, "_current_cookie_still_works", return_value=True), patch(
+            "widget.QMessageBox"
+        ) as message_box, patch.object(w._tray_icon, "showMessage") as show_message:
+            message_box.Icon.Warning = object()
+            message_box.StandardButton.Ok = object()
+            w._on_playwright_cookie_done(
+                None,
+                "小米账号 SSO 尚未完成，平台 Cookie 还未写入",
+                True,
+            )
+
+        message_box.assert_not_called()
+        show_message.assert_called_once()
+        self.assertIn("仍可用", w._router_status)
+        self.assertIs(w._router_status_ok, True)
+        w.close()
+
     def test_interactive_renew_is_blocked_while_worker_runs(self):
         w = _make_widget(cookie="stale")
         running_worker = Mock()

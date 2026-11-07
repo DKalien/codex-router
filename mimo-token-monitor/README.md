@@ -83,7 +83,7 @@ python -m playwright install chromium
 不会自动共享内置浏览器的登录状态；请在新打开的 Chromium 窗口中完成登录。
 
 若当前配置的 Cookie 仍有效、只是独立 Playwright 会话尚未写入平台 Cookie，自动续期失败只会在
-悬浮窗底部和托盘提示「Playwright 未登录，当前 Cookie 仍可用」，手动和自动续期都不会弹阻塞对话框。真正需要
+悬浮窗底部和托盘提示「Playwright 未登录，当前 Cookie 仍可用」；SSO 尚未完成也只提示等待，手动和自动续期都不会弹阻塞对话框。真正需要
 人工登录时，可从托盘或悬浮窗菜单手动执行「Playwright 续期」。验证码仍然需要人工输入。
 Playwright 不能延长服务端设置的 Cookie 有效期。
 

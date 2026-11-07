@@ -59,7 +59,7 @@ Python 模块采用单目录扁平结构：
 - 跨窗口吸附在主屏和副屏均识别原生标题为 `ETF Tracker` 或 `MiMo Token Monitor` 的可见、非最小化窗口，阈值为 15 个 Qt 逻辑像素。`GetWindowRect()` 返回物理像素；拖动时必须按当前 `QScreen.geometry()` 原点和 `devicePixelRatio` 转换后再计算，并将最终坐标转换回 Qt 逻辑坐标。
 - API 认证依赖 Cookie（关键名为 `api-platform_serviceToken`）。支持通过 CDP 自动导入（需 Edge 快捷方式添加调试参数，见 README）、Playwright 独立会话自动续期，或手动从 DevTools 复制。
 - MiMo API：HTTP 401 使用显式 `auth_expired` 标记触发一次自动恢复，HTTP 403 只标记拒绝访问；余额必须返回有限数值（零有效），不能凭 HTTP 200 判断 Cookie 有效。错误保留各失败端点、状态和响应类型，原始异常/正文不回显。MiMo 请求拒绝重定向；余额和用量全部恢复成功后才重置恢复次数。
-- Playwright 续期 UI：开始/成功/失败会在悬浮窗底部状态行与托盘通知；失败状态在模态框关闭前不自动清除，关闭后再保留约 12 秒。独立 Chromium 不共享内置浏览器登录状态；若当前 Cookie 仍可用而仅 Playwright 会话未登录，手动和自动续期失败都只给软提示，不弹阻塞对话框；已有续期任务时手动点击会提示进行中而不是静默忽略；运行期间退出/重启会提示等待，结果槽先等待线程结束再销毁。工作线程信号名为 `result_ready`，避免与 `QThread.finished` 冲突。
+- Playwright 续期 UI：开始/成功/失败会在悬浮窗底部状态行与托盘通知；失败状态在模态框关闭前不自动清除，关闭后再保留约 12 秒。独立 Chromium 不共享内置浏览器登录状态；若当前 Cookie 仍可用而仅 Playwright 会话未登录，或 SSO 仍在等待，手动和自动续期都只给软提示，不弹阻塞对话框；已有续期任务时手动点击会提示进行中而不是静默忽略；运行期间退出/重启会提示等待，结果槽先等待线程结束再销毁。工作线程信号名为 `result_ready`，避免与 `QThread.finished` 冲突。
 - 平台目标为 Windows（字体 `Microsoft YaHei`，`.ico` 图标）。
 - 内置 `PLAN_TIERS` 常量（4 个挡位：Lite ¥39 / Standard ¥99 / Pro ¥329 / Max ¥659），通过 `_get_plan_tier_info()` 根据套餐总额自动匹配挡位并计算每 Credit 单价，在悬浮窗内显示已用额度折合金额。
 - MiMo 余额为 0 时自动隐藏（包括右上角金额和 tooltip 余额行）；SuperGPT API余额为 0 时仍显示金额，进度条为空。

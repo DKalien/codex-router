@@ -2697,6 +2697,18 @@ class TokenWidget(QWidget):
             return False
         return bool(result.get("ok"))
 
+    @staticmethod
+    def _is_playwright_login_pending(error: str | None) -> bool:
+        message = str(error or "")
+        return any(
+            marker in message
+            for marker in (
+                "SSO 尚未完成",
+                "未找到 xiaomimimo.com Cookie",
+                "等待 MiMo 更新登录状态",
+            )
+        )
+
     def _on_playwright_cookie_done(self, cookie, error, interactive: bool):
         worker = self._playwright_worker
         self._playwright_worker = None
@@ -2724,6 +2736,21 @@ class TokenWidget(QWidget):
 
         message = error or "无法刷新登录状态；如需登录或验证码验证，请从菜单手动续期。"
         first_line = message.splitlines()[0][:80]
+
+        # SSO 尚未完成只是登录等待状态；即使当前 Cookie 的即时探测遇到
+        # 临时网络/403，也不应弹出阻塞错误框。
+        if self._is_playwright_login_pending(message):
+            status = "等待独立 Chromium 完成 MiMo 登录"
+            self._set_router_status(status, ok=True, clear_after=10000)
+            self._tray_icon.showMessage(
+                "Playwright 续期",
+                status + "；请在新打开的独立 Chromium 窗口中完成登录，内置浏览器登录不会自动共享。",
+                QSystemTrayIcon.MessageIcon.Information,
+                6000,
+            )
+            self.update()
+            return
+
         cookie_ok = self._current_cookie_still_works()
 
         # Playwright 独立会话没登录 ≠ 配置里的 Cookie 失效。

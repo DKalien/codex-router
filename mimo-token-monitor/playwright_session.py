@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-MIMO_URL = "https://platform.xiaomimimo.com/#/console/balance"
+MIMO_URL = "https://platform.xiaomimimo.com/console/balance"
 TARGET_URL = MIMO_URL
 COOKIE_DOMAIN = "xiaomimimo.com"
 SERVICE_TOKEN_COOKIE = "api-platform_serviceToken"

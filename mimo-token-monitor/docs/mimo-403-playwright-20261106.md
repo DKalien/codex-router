@@ -82,3 +82,15 @@ Router 根目录：`node scripts-check.mjs` 通过；`python -m compileall -q mi
 官方参考：[BrowserContext cookies / close](https://playwright.dev/python/docs/api/class-browsercontext)、
 [Page crash](https://playwright.dev/python/docs/api/class-page#page-event-crash)、
 [同步库的 time.sleep 限制](https://playwright.dev/python/docs/library#time-sleep-leads-to-outdated-state)。
+
+## 后续：2026-11-07 登录恢复
+
+用户随后提供的截图中，余额和用量均明确返回 HTTP 401，不能沿用 11 月 6 日 Cookie 可用的结论。
+此前两轮修改只处理弹窗，未恢复认证；SSO 超时后窗口已由 finally 关闭，绿色“等待登录”提示也不符合实际。
+
+本轮获用户明确授权后，复用监控器原有独立 profile，访问平台当前的 `/console/balance`，
+由 profile 自动完成 SSO 回跳。程序在本机校验余额及用量均成功后，仅更新原 settings.db 中的 Cookie 一行，
+没有复制其他浏览器凭据、输出 Cookie 或覆盖其他设置。用户已确认重启悬浮窗后 MiMo 恢复显示。
+
+常规 Playwright 入口同步改为本次验证成功的无 hash URL；这只对齐已验证路径，不断言旧 hash URL 是所有故障的根因。
+SSO 超时提示改为“续期已结束，MiMo 登录未完成”，保留非阻塞通知和重新打开入口，不再暗示窗口仍在等待，也不改写失败前的 Cookie。

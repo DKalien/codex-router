@@ -405,11 +405,11 @@ class TestPlaywrightRecovery(unittest.TestCase):
         ) as message_box, patch.object(w._tray_icon, "showMessage") as show_message:
             message_box.Icon.Warning = object()
             message_box.StandardButton.Ok = object()
-            w._on_playwright_cookie_done(None, "未找到 xiaomimimo.com Cookie", False)
+            w._on_playwright_cookie_done(None, "续期校验失败", False)
 
         message_box.assert_not_called()
         show_message.assert_called_once()
-        self.assertIn("等待独立 Chromium", w._router_status)
+        self.assertIn("仍可用", w._router_status)
         self.assertIs(w._router_status_ok, True)
         w.close()
 
@@ -424,36 +424,45 @@ class TestPlaywrightRecovery(unittest.TestCase):
             message_box.StandardButton.Ok = object()
             w._on_playwright_cookie_done(
                 None,
-                "小米账号 SSO 尚未完成，平台 Cookie 还未写入",
+                "续期校验失败",
                 True,
             )
 
         message_box.assert_not_called()
         show_message.assert_called_once()
-        self.assertIn("等待独立 Chromium", w._router_status)
+        self.assertIn("仍可用", w._router_status)
         self.assertIs(w._router_status_ok, True)
         w.close()
 
-    def test_sso_pending_is_soft_even_when_cookie_probe_temporarily_fails(self):
-        w = _make_widget(cookie="temporarily-unreachable")
-        w._playwright_worker = Mock()
+    def test_sso_timeout_is_nonblocking_but_never_reported_as_still_waiting(self):
+        for interactive in (False, True):
+            with self.subTest(interactive=interactive):
+                w = _make_widget(cookie="expired")
+                w._playwright_worker = Mock()
+                w._mimo_error = "HTTP 401"
 
-        with patch.object(w, "_current_cookie_still_works", return_value=False), patch(
-            "widget.QMessageBox"
-        ) as message_box, patch.object(w._tray_icon, "showMessage") as show_message:
-            message_box.Icon.Warning = object()
-            message_box.StandardButton.Ok = object()
-            w._on_playwright_cookie_done(
-                None,
-                "小米账号 SSO 尚未完成，平台 Cookie 还未写入；请等待自动跳转",
-                True,
-            )
+                with (
+                    patch.object(w, "_current_cookie_still_works") as probe,
+                    patch("widget.QMessageBox") as message_box,
+                    patch.object(w._tray_icon, "showMessage") as show_message,
+                    patch("widget.save_config") as save,
+                ):
+                    w._on_playwright_cookie_done(
+                        None,
+                        "小米账号 SSO 尚未完成，平台 Cookie 还未写入；请等待自动跳转",
+                        interactive,
+                    )
 
-        message_box.assert_not_called()
-        show_message.assert_called_once()
-        self.assertIn("等待独立 Chromium", w._router_status)
-        self.assertIs(w._router_status_ok, True)
-        w.close()
+                message_box.assert_not_called()
+                probe.assert_not_called()
+                save.assert_not_called()
+                self.assertIn("续期已结束", w._router_status)
+                self.assertIs(w._router_status_ok, False)
+                self.assertIn("登录窗口已关闭", show_message.call_args.args[1])
+                self.assertIn("重新打开", show_message.call_args.args[1])
+                self.assertEqual(w.cfg["cookie"], "expired")
+                self.assertEqual(w._mimo_error, "HTTP 401")
+                w.close()
 
     def test_interactive_renew_is_blocked_while_worker_runs(self):
         w = _make_widget(cookie="stale")

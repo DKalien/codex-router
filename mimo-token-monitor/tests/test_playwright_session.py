@@ -346,7 +346,7 @@ class TestPlaywrightSession(unittest.TestCase):
             self.assertEqual(session.refresh_cookie(timeout_seconds=10), "session_id=ready")
         session.open_mimo.assert_called_once_with(timeout=10_000)
         self.assertEqual(page.wait_calls, [2000])
-        self.assertEqual(playwright_session.MIMO_URL, "https://platform.xiaomimimo.com/#/console/balance")
+        self.assertEqual(playwright_session.MIMO_URL, "https://platform.xiaomimimo.com/console/balance")
 
     def test_interactive_refresh_validates_each_changed_cookie_only_once(self):
         session = PlaywrightSession(tempfile.mkdtemp())

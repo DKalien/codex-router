@@ -2737,15 +2737,14 @@ class TokenWidget(QWidget):
         message = error or "无法刷新登录状态；如需登录或验证码验证，请从菜单手动续期。"
         first_line = message.splitlines()[0][:80]
 
-        # SSO 尚未完成只是登录等待状态；即使当前 Cookie 的即时探测遇到
-        # 临时网络/403，也不应弹出阻塞错误框。
+        # 结果到达时会话已结束，不能继续提示用户在已关闭的窗口里等待。
         if self._is_playwright_login_pending(message):
-            status = "等待独立 Chromium 完成 MiMo 登录"
-            self._set_router_status(status, ok=True, clear_after=10000)
+            status = "续期已结束，MiMo 登录未完成"
+            self._set_router_status(status, ok=False, clear_after=12000)
             self._tray_icon.showMessage(
                 "Playwright 续期",
-                status + "；请在新打开的独立 Chromium 窗口中完成登录，内置浏览器登录不会自动共享。",
-                QSystemTrayIcon.MessageIcon.Information,
+                status + "。登录窗口已关闭，请从菜单重新打开「Playwright 续期」并在独立 Chromium 中登录；本次未更新 Cookie。",
+                QSystemTrayIcon.MessageIcon.Warning,
                 6000,
             )
             self.update()

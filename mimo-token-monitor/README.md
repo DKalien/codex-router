@@ -89,6 +89,9 @@ python -m playwright install chromium
 Playwright 不能延长服务端设置的 Cookie 有效期。
 
 续期只在明确的 HTTP 401 后自动恢复一次；HTTP 403、网络错误、TLS 错误和业务错误不会被当作 Cookie 过期。
+MiMo 查询遇到官网定义的 `SIGN_MISSING`、`SIGN_KEY_MISSING` 或 `TIMESTAMP_INVALID` 时，
+使用当前 Cookie 获取会话签名密钥，按官网 GET 协议添加签名并最多重试一次。签名错误单独显示，
+其中 HTTP 401 也须排除签名错误后才触发登录恢复。签名密钥仅在本次调用内存中使用，密钥响应限读 64 KiB。
 手动和自动续期均等待 Cookie 通过余额 API 校验，不重复验证同一份已被 401 拒绝的 Cookie，
 等待期间不会主动导航离开小米登录页。403 或其他非登录错误会立即保留具体 API 错误并结束本次续期。
 余额与用量均恢复成功后才重置自动恢复次数；也可手动续期或重新导入 Cookie。

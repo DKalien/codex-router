@@ -94,3 +94,33 @@ Router 根目录：`node scripts-check.mjs` 通过；`python -m compileall -q mi
 
 常规 Playwright 入口同步改为本次验证成功的无 hash URL；这只对齐已验证路径，不断言旧 hash URL 是所有故障的根因。
 SSO 超时提示改为“续期已结束，MiMo 登录未完成”，保留非阻塞通知和重新打开入口，不再暗示窗口仍在等待，也不改写失败前的 Cookie。
+
+## 后续：2026-11-09 签名协议兼容
+
+本次以保存的 Cookie 只读查询余额，复现 HTTP 403，固定错误码为 `SIGN_MISSING`。
+前一轮恢复登录只解决了当时的认证故障，未覆盖该签名协议要求。
+
+核对官网当前公开 [main 脚本](https://platform.xiaomimimo.com/static/main.dd4c96b8f4cc7ba6.chunk.js)
+与 [vendor 脚本](https://platform.xiaomimimo.com/static/169.a934bc08c59a6200.chunk.js)，
+确认登录会话从 `/api/v1/user/sign-key` 获取 `signKey`、`epoch`，用 UTF-8 密钥计算 HMAC-SHA256。
+GET 签名原文为 method、path、按原始编码排序的 query、空正文摘要、秒级时间戳，以换行连接，
+生成 `X-Sign`、`X-Timestamp` 和 `X-Key-Epoch`，并按 `x-server-time` 校准时间。
+
+共享 MiMo GET 路径现在仅在固定的缺签名、密钥过期、时间戳错误时获取密钥并重试一次。
+密钥每次调用单独获取并校验，响应限读 64 KiB，仅在调用内存中使用。
+签名错误独立于 Cookie 过期，普通 403 和 `SIGN_INVALID` 保留错误。
+
+真实校验过程如下，未输出 Cookie、密钥、签名值或账户数据。
+
+| 查询 | 原请求 | 签名密钥接口 | 签名重试 |
+| --- | --- | --- | --- |
+| `/api/v1/balance` | 403 / SIGN_MISSING | 200 | 200，余额校验通过 |
+| `/api/v1/tokenPlan/usage` | 403 / SIGN_MISSING | 200 | 200，用量校验通过 |
+
+用户已确认重启悬浮窗后 MiMo 恢复显示。
+新增 `test_mimo_signing.py` 覆盖双端点恢复、签名参考值、服务端时间、单次重试、登录失效分类、
+重定向拒绝、密钥响应验证及错误脱敏。当前既有 UI 未提交修改独立保留。
+
+本轮 `python -m unittest discover -s tests` 共 316 项通过，0 失败、0 skip，包含当前工作区的 UI 测试。
+`node scripts-check.mjs`、变更 Python 文件的 compileall 和 `git diff --check` 均通过。
+全量测试仍有既有 SQLite 未关闭连接的 ResourceWarning。

@@ -2,10 +2,14 @@ import os
 import atexit
 import threading
 import requests
+import hashlib
+import hmac
 import json as _json
 import math as _math
 import pathlib as _pl
+import time
 from datetime import datetime as _datetime
+from urllib.parse import urlsplit
 import gpt_browser
 from usage_url import UsageUrlError, usage_endpoint
 
@@ -38,10 +42,106 @@ def _headers(cookie: str) -> dict:
     }
 
 
+_MIMO_SIGN_ERRORS = {
+    "SIGN_KEY_MISSING": "签名密钥不存在或已过期",
+    "SIGN_MISSING": "缺少签名请求头",
+    "SIGN_INVALID": "签名校验失败",
+    "TIMESTAMP_INVALID": "时间戳超出有效窗口",
+}
+
+
+class _MimoSigningError(RuntimeError):
+    def __init__(self, message: str, *, auth_expired: bool = False):
+        super().__init__(message)
+        self.auth_expired = auth_expired
+
+
+def _mimo_sign_error(response) -> str | None:
+    if response.status_code not in (401, 403):
+        return None
+    if "json" not in str(response.headers.get("Content-Type", "")).lower():
+        return None
+    if not isinstance(response.content, bytes) or len(response.content) > 64 * 1024:
+        return None
+    try:
+        data = response.json()
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    code = data.get("code")
+    if isinstance(code, str) and code in _MIMO_SIGN_ERRORS:
+        return code
+    for code, message in _MIMO_SIGN_ERRORS.items():
+        if data.get("message") == message:
+            return code
+    return None
+
+
+def _mimo_sign_headers(session, url: str, cookie: str) -> dict:
+    """按官网 GET 协议签名，会话密钥只在本次调用中使用。"""
+    try:
+        with session.get(f"{BASE}/api/v1/user/sign-key", headers=_headers(cookie),
+                         timeout=10, allow_redirects=False, stream=True) as response:
+            if response.status_code != 200:
+                raise _MimoSigningError(
+                    f"/api/v1/user/sign-key: HTTP {response.status_code}",
+                    auth_expired=response.status_code == 401,
+                )
+            body = bytearray()
+            for chunk in response.iter_content(chunk_size=8192):
+                body.extend(chunk)
+                if len(body) > 64 * 1024:
+                    raise _MimoSigningError("签名密钥响应超过 64 KiB")
+            payload = _json.loads(body)
+            if not isinstance(payload, dict) or payload.get("code") not in (None, 0, "0", 200, "200"):
+                raise _MimoSigningError("签名密钥接口未成功")
+            data = payload.get("data", payload)
+            if not isinstance(data, dict):
+                raise _MimoSigningError("签名密钥响应格式无效")
+            key = data.get("signKey")
+            epoch = float(data.get("epoch"))
+            if (not isinstance(key, str) or not key or len(key) > 4096
+                    or isinstance(data.get("epoch"), bool) or not _math.isfinite(epoch)
+                    or epoch < 0 or not epoch.is_integer()):
+                raise _MimoSigningError("签名密钥字段无效")
+            now = time.time()
+            try:
+                server_time = float(response.headers.get("x-server-time"))
+                if server_time > 1e12:
+                    server_time /= 1000
+                if _math.isfinite(server_time) and server_time > 0:
+                    now = server_time
+            except (TypeError, ValueError, OverflowError):
+                pass
+    except _MimoSigningError:
+        raise
+    except Exception as exc:
+        raise _MimoSigningError("获取签名密钥失败：" + _mimo_request_error(exc)) from None
+    parsed = urlsplit(url)
+    query = "&".join(sorted(filter(None, parsed.query.split("&"))))
+    timestamp = str(int(now))
+    message = "\n".join(("GET", parsed.path, query, "", timestamp))
+    signature = hmac.new(key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    return {"X-Sign": signature, "X-Timestamp": timestamp, "X-Key-Epoch": str(int(epoch))}
+
+
+def _mimo_get(session, url: str, cookie: str):
+    response = session.get(url, headers=_headers(cookie), timeout=10, allow_redirects=False)
+    if _mimo_sign_error(response) not in ("SIGN_KEY_MISSING", "SIGN_MISSING", "TIMESTAMP_INVALID"):
+        return response
+    response.close()
+    headers = {**_headers(cookie), **_mimo_sign_headers(session, url, cookie)}
+    return session.get(url, headers=headers, timeout=10, allow_redirects=False)
+
+
 def _mimo_http_error(resp) -> str | None:
     status = resp.status_code
     if 200 <= status < 300:
         return None
+    sign_code = _mimo_sign_error(resp)
+    if sign_code:
+        return f"HTTP {status}（{_MIMO_SIGN_ERRORS[sign_code]}，{sign_code}）"
     if status == 401:
         return "Cookie 已过期，请重新获取（HTTP 401）"
     if 300 <= status < 400:
@@ -70,9 +170,9 @@ def fetch_balance(cookie: str) -> dict:
     try:
         with requests.Session() as session:
             session.trust_env = False
-            resp = session.get(BALANCE_URL, headers=_headers(cookie), timeout=10,
-                               allow_redirects=False)
-        result.update(status_code=resp.status_code, auth_expired=resp.status_code == 401)
+            resp = _mimo_get(session, BALANCE_URL, cookie)
+        result.update(status_code=resp.status_code,
+                      auth_expired=resp.status_code == 401 and not _mimo_sign_error(resp))
         error = _mimo_http_error(resp)
         if error:
             result["error"] = f"/api/v1/balance: {error}"
@@ -96,6 +196,8 @@ def fetch_balance(cookie: str) -> dict:
             result["error"] = "/api/v1/balance: HTTP 200 JSON 未返回有效余额，未确认登录有效"
             return result
         result.update(ok=True, balance=balance)
+    except _MimoSigningError as exc:
+        result.update(error=str(exc), auth_expired=exc.auth_expired)
     except Exception as exc:
         result["error"] = f"/api/v1/balance: {_mimo_request_error(exc)}"
     finally:
@@ -106,19 +208,18 @@ def fetch_balance(cookie: str) -> dict:
 
 def fetch_usage(cookie: str) -> dict:
     """按顺序尝试用量端点，诊断仅保留端点、状态和安全错误。"""
-    from urllib.parse import urlsplit
-
     attempts = []
     for url in USAGE_URLS:
         resp = None
-        attempt = {"endpoint": url, "status_code": None, "error": None}
+        attempt = {"endpoint": url, "status_code": None, "error": None, "auth_expired": False}
         attempts.append(attempt)
         try:
             with requests.Session() as session:
                 session.trust_env = False
-                resp = session.get(url, headers=_headers(cookie), timeout=10,
-                                   allow_redirects=False)
+                resp = _mimo_get(session, url, cookie)
             attempt["status_code"] = resp.status_code
+            sign_code = _mimo_sign_error(resp)
+            attempt["auth_expired"] = resp.status_code == 401 and not sign_code
             attempt["error"] = _mimo_http_error(resp)
             if not attempt["error"]:
                 data = resp.json()
@@ -127,8 +228,11 @@ def fetch_usage(cookie: str) -> dict:
                     return {"ok": True, "data": data, "error": None, "url": url,
                             "attempts": attempts, "auth_expired": False}
                 attempt["error"] = "JSON 格式不匹配或 API 返回业务错误"
-            if resp.status_code == 401:
+            if resp.status_code == 401 or sign_code:
                 break
+        except _MimoSigningError as exc:
+            attempt.update(error=str(exc), auth_expired=exc.auth_expired)
+            break
         except Exception as exc:
             attempt["error"] = _mimo_request_error(exc)
         finally:
@@ -137,7 +241,7 @@ def fetch_usage(cookie: str) -> dict:
     errors = "; ".join(f"{urlsplit(a['endpoint']).path}: {a['error']}" for a in attempts)
     return {"ok": False, "data": None, "error": f"用量端点失败: {errors}",
             "attempts": attempts,
-            "auth_expired": any(a["status_code"] == 401 for a in attempts)}
+            "auth_expired": any(a["auth_expired"] for a in attempts)}
 
 DEFAULT_THIRD_PARTY_BASE_URL = "https://codex.wlbclub.com"
 

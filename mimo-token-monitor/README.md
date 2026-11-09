@@ -45,8 +45,10 @@ python -m pip install -r mimo-token-monitor\requirements.txt
 `mimo-token-monitor/launcher.py`，工作目录设为该子目录，图标使用其中的 `icon.ico`。
 源码仓库不自带 `dist/MiMo-Token-Monitor.exe`；需要 EXE 时按下文构建轻量启动器。
 
-启动器只在整个代码工作区干净且可安全快进时拉取更新；嵌套在 Router 中时默认识别
-父目录为代码仓库、分支为 `lite`，独立布局仍沿用 `main`。显式配置的
+嵌套在 Router 中时，启动器默认跳过代码同步，并识别父目录为代码仓库、分支为 `lite`。
+通过托盘「检查并更新代码…」检查远端、查看 Router 核心与监控器的变更范围，确认后才在干净工作区快进更新。
+执行前会再次核对检查时的远端提交 SHA，远端已变化时需重新检查、确认。
+显式设置 `MIMO_TOKEN_MONITOR_CODE_SYNC_ENABLED=1` 可启用启动同步，独立布局默认仍启用且使用 `main` 分支。显式配置的
 `MIMO_TOKEN_MONITOR_CODE_REPO_ROOT`、`MIMO_TOKEN_MONITOR_CODE_PROJECT_PATH` 和
 `MIMO_TOKEN_MONITOR_CODE_GIT_BRANCH` 优先。启动不会自动提交或推送。
 Python 源码变更后重启悬浮窗即可加载；构建的 EXE 只在 `launcher.py` 变化时需要重打包。
@@ -76,10 +78,10 @@ python -m playwright install chromium
 该配置目录位于 `MIMO_TOKEN_MONITOR_DATA_DIR` 下，不使用也不修改现有 Edge/Chrome 用户目录。
 该目录包含登录状态，请勿复制给他人或提交到 Git。
 
-续期会打开平台页并等待小米账号 SSO 回跳，读取 `api-platform_serviceToken` 等
+续期会打开 `https://platform.xiaomimimo.com/console/balance` 并等待小米账号 SSO 回跳，读取 `api-platform_serviceToken` 等
 `xiaomimimo.com` Cookie（SSO 往往需要十余秒，不能打开后立刻读取）。自动续期和过期恢复
 默认使用 headless Chromium，不会闪现浏览器窗口；手动「Playwright 续期」会打开有界面浏览器，
-并保持到 Cookie 通过 API 校验或超时，以便完成登录/验证码。该窗口使用独立的 Chromium profile，
+登录等待默认自动 30 秒、手动 180 秒，Cookie 通过 API 校验后提前结束。该窗口使用独立的 Chromium profile，
 不会自动共享内置浏览器的登录状态；请在新打开的 Chromium 窗口中完成登录。
 
 若当前配置的 Cookie 仍有效、只是独立 Playwright 会话尚未写入平台 Cookie，自动续期失败只会在
@@ -88,12 +90,12 @@ python -m playwright install chromium
 人工登录时，可从托盘或悬浮窗菜单手动执行「Playwright 续期」。验证码仍然需要人工输入。
 Playwright 不能延长服务端设置的 Cookie 有效期。
 
-续期只在明确的 HTTP 401 后自动恢复一次；HTTP 403、网络错误、TLS 错误和业务错误不会被当作 Cookie 过期。
+查询失败后的登录自动恢复仅由明确的 Cookie 失效 HTTP 401 触发，最多一次。
 MiMo 查询遇到官网定义的 `SIGN_MISSING`、`SIGN_KEY_MISSING` 或 `TIMESTAMP_INVALID` 时，
 使用当前 Cookie 获取会话签名密钥，按官网 GET 协议添加签名并最多重试一次。签名错误单独显示，
 其中 HTTP 401 也须排除签名错误后才触发登录恢复。签名密钥仅在本次调用内存中使用，密钥响应限读 64 KiB。
 手动和自动续期均等待 Cookie 通过余额 API 校验，不重复验证同一份已被 401 拒绝的 Cookie，
-等待期间不会主动导航离开小米登录页。403 或其他非登录错误会立即保留具体 API 错误并结束本次续期。
+等待期间保持小米登录页的 SSO 流程。完成上述签名处理后，普通 403 或其他非登录错误会保留具体 API 错误并结束本次续期。
 余额与用量均恢复成功后才重置自动恢复次数；也可手动续期或重新导入 Cookie。
 续期线程仍在运行时，退出/重启会提示先结束任务；可先关闭登录浏览器，再退出悬浮窗。
 
@@ -154,12 +156,16 @@ MiMo Requests 仍使用 `trust_env=False` 直连、保持 TLS 校验；Chromium 
 - 未配置共享 API Key 时切换会显示提示，不会发送空请求
 
 WLB 和 SuperGPT 的密钥统一保存在 Router 的受保护状态目录中，使用 Router 原有的原子写入和私有文件权限，
-不再写入悬浮窗 SQLite / JSON 设置。首次启动新版会把旧设置中非空的 Key 迁移到共享存储（以旧悬浮窗设置值为准），
-成功后清除旧密钥字段；失败时保留旧配置并显示错误，不继续启动。可通过 `MIMO_TOKEN_MONITOR_ROUTER_ROOT`
+首次启动新版会检查旧设置中非空的 Key，默认保留 Router 当前生效值（含环境变量覆盖）。
+仅当 Router 没有生效 Key 时写入旧值，值冲突时提示用户选择保留现值或覆盖。迁移只写入密钥，供应商启用状态沿用原值。
+成功项清除旧密钥字段，失败项保留供重试并显示错误。可通过 `MIMO_TOKEN_MONITOR_ROUTER_ROOT`
 指定 Router 源码目录，默认从安装清单查找；需要本机可用的 Node。
 从悬浮窗修改 Key 或运行 `provider-key ... set` 后，Router 下一次请求和悬浮窗下一次刷新会重新读取密钥，无需重启 Router。
 读取顺序兼容 Router：对应供应商的环境变量优先，其次读取状态目录和兼容旧目录中的密钥文件；环境变量覆盖了不同 Key 时，
 设置保存会明确报错，需先移除覆盖变量。Base URL 仍用于悬浮窗查询接口。
+
+WLB / SuperGPT 的 Base URL 默认仅接受不含内嵌凭据、查询参数或片段的 HTTPS 地址。
+旧配置中的非默认域名首次使用前需确认，确认后才向该域名发送共享 Key。两个用量接口均拒绝 HTTP 重定向。
 
 ### 总览与 SuperGPT 余额
 
@@ -241,6 +247,21 @@ python -m PyInstaller MiMo-Token-Monitor.spec --clean
   - 路由控制：菜单显示“已开启”“已关闭”或“状态未知”；主代理可选择自动（WLB → GPT → SuperGPT）或切换到 WLB / SuperGPT / GPT，子代理可选择自动（GPT → SuperGPT）或手动切换供应商，Pi 可独立切换 WLB / SuperGPT / GPT（官方），也可开启、关闭或重启 Codex Router
   - 重启悬浮窗：退出当前进程并释放单实例锁后启动新实例
   - 悬停托盘图标：显示用量概览
+
+### 托盘菜单异常诊断
+
+托盘父菜单每次弹出前将非零 `contentsMargins` 归零。注入边距的回归测试已通过，真实偶发空白的触发原因仍待现场证据确认。
+诊断文件位于系统临时目录，Windows 可在 PowerShell 执行 `[IO.Path]::GetTempPath()` 查看位置。
+
+| 文件 | 写入时机与内容 |
+| --- | --- |
+| `mimo-token-monitor-tray-menu-probe-<pid>.log` | 当前进程的启动 `startup`、菜单显示 `menu-show`、首次弹出钩子 `first-popup` 事件 |
+| `mimo-token-monitor-tray-menu.log` | 检测到异常时追加 Qt 尺寸、`sizeHint`、条目底部、边距、样式、屏幕/DPR 和 Windows 原生窗口尺寸 |
+| `mimo-token-monitor-tray-menu.png` | 菜单显示时检测到异常才截取菜单，覆盖上次异常图片 |
+
+菜单再次出现底部空白时，记录发生时间并查看对应进程的 probe 文件，确认当前版本的菜单钩子是否运行，
+再对照异常日志和图片。只有 probe 文件时，表示记录到了菜单事件，尚无异常记录。
+`pythonw.exe` 的 stderr 缺失时会接到 `os.devnull`，排查时使用上述专用文件。
 
 ### Codex Router 维护
 

@@ -1,6 +1,14 @@
 # MiMo 403 与 Playwright 续期调查（2026-11-06）
 
-起点：`lite` / `09725a86`，工作区干净。只读取仓库实现和已安装依赖元数据，
+## 当前结论（截至 2026-11-09）
+
+11 月 7 日经用户授权恢复登录，11 月 9 日又实际复现 `SIGN_MISSING`，完成签名兼容并验证余额与用量成功，
+用户已确认重启后恢复显示。两个后续阶段见本文末尾记录。
+原始 `TargetClosedError` 的进程退出原因仍未知，已修复关闭后持续轮询及诊断丢失的问题。
+
+以下至「API 依据」保留 11 月 6 日的调查记录和当时边界，后续授权及验证结果另按日期记录。
+
+11 月 6 日起点为 `lite` / `09725a86`，工作区干净。该阶段只读取仓库实现和已安装依赖元数据，
 未读取真实 Cookie、Token、settings.db、浏览器 profile 或账户数据；没有访问真实账户，未改 Router/Pi 配置，未执行远端 Git 写操作。
 
 ## 执行路径与边界
@@ -64,9 +72,9 @@ Router 根目录：`node scripts-check.mjs` 通过；`python -m compileall -q mi
   这验证了本机存在 headless 启动不确定性，不能证明它就是用户的 TargetClosedError 根因。
 - 没有重新安装浏览器、杀其他进程、清理真实 profile 或调整安全软件。
 
-## 仍未知与下一步
+## 11 月 6 日阶段的未知项与下一步
 
-没有对真实 MiMo 账户发请求，因而未证实截图当时具体哪个 endpoint、响应类型、业务 code、Cookie 或网络出口。
+当时没有对真实 MiMo 账户发请求，尚未证实截图对应的具体 endpoint、响应类型、业务 code、Cookie 或网络出口。
 也没有捕获用户 Chromium 的退出码/崩溃转储，无法在“用户关窗、外部进程结束、崩溃、安全软件、profile 冲突”之间下结论。
 
 用户重启悬浮窗后可按 README 的安全步骤记录 API 路径/状态/类型，并在日常浏览器 DevTools 中比较平台自己发出的相同 API。
@@ -119,8 +127,20 @@ GET 签名原文为 method、path、按原始编码排序的 query、空正文�
 
 用户已确认重启悬浮窗后 MiMo 恢复显示。
 新增 `test_mimo_signing.py` 覆盖双端点恢复、签名参考值、服务端时间、单次重试、登录失效分类、
-重定向拒绝、密钥响应验证及错误脱敏。当前既有 UI 未提交修改独立保留。
+重定向拒绝、密钥响应验证及错误脱敏。该轮签名修复单独提交为 `283e9c3a`，
+当时独立保留的托盘 UI 修改随后提交为 `291f4361`。托盘的现场复测仍待确认，诊断步骤见 [README](../README.md#托盘菜单异常诊断)。
 
 本轮 `python -m unittest discover -s tests` 共 316 项通过，0 失败、0 skip，包含当前工作区的 UI 测试。
 `node scripts-check.mjs`、变更 Python 文件的 compileall 和 `git diff --check` 均通过。
 全量测试仍有既有 SQLite 未关闭连接的 ResourceWarning。
+
+## 2026-11-09 文档同步验证
+
+本次只调整文档，按当前实现校正启动同步、密钥迁移、签名重试与续期说明，补充托盘诊断文件及待完成的现场验证。
+在 `mimo-token-monitor/` 运行以下相关回归，均无失败或 skip。
+
+- `python -m unittest discover -s tests -p test_mimo_signing.py`，10 项通过。
+- `python -m unittest discover -s tests -p test_sync_runtime.py`，35 项通过。
+
+根目录 `node scripts-check.mjs`、`git diff --check` 及 8 份变更 Markdown 的本地链接检查通过。
+316 项全量结果保留为上轮代码验证记录，本轮未重复全量测试或账户请求，真实托盘复测仍待完成。

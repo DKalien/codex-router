@@ -200,8 +200,9 @@ python -m pip install -r mimo-token-monitor\requirements.txt
 ```
 
 桌面监控当前面向 Windows，依赖 Win32 单实例和窗口 API；`bin/model-router codex monitor` 仅提供 shell 分发入口，不表示 Linux/macOS GUI 已受支持。Windows 入口运行子项目自己的 `launcher.py`，
-嵌套布局会自动把代码同步目标识别为当前 Router 仓库的 `lite` 分支；直接运行
-`mimo-token-monitor/main.py` 仍可跳过源码同步。修改 Router 核心或监控器源码后，按各自
+嵌套布局会自动把代码同步目标识别为当前 Router 仓库的 `lite` 分支，默认跳过启动同步。
+更新通过托盘「检查并更新代码…」检查远端、展示变更范围，经确认后在干净工作区快进。
+直接运行 `mimo-token-monitor/main.py` 也跳过源码同步。修改 Router 核心或监控器源码后，按各自
 测试门禁验证：Router 运行 `npm run check` / `npm test`，监控器在子目录运行
 `python -m unittest discover -s tests`。监控器配置仍保存于本机外置目录，密钥只使用 Router
 受保护的供应商存储，不写入 Git。完整说明见 [监控器 README](mimo-token-monitor/README.md)。

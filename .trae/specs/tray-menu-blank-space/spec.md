@@ -1,4 +1,4 @@
-# Spec：托盘菜单底部多出空白区（偶发）——根因与最小修复
+# 托盘菜单底部偶发空白的调查与修复
 
 ## 1. 需求（还原）
 
@@ -33,7 +33,7 @@
 - 覆盖场景：首次 popup、路由子菜单开/关、`_set_router_state`、`_set_gpt_route`、
   `_reload_claude_profile_menu`、连续 5 次 popup/hide、屏幕右下角定位、Claude 子菜单开/关。
 
-### 2.3 像素级复现（决定性）
+### 2.3 注入边距的复现
 
 对同一套 QAction 构建的纯 `QMenu` 施加 `setContentsMargins(0, 0, 16, 126)` 后
 `resize(sizeHint())`，渲染结果为 196×326，逐行结构与缺陷截图**完全一致**：
@@ -52,13 +52,13 @@
 - `QMenu::paintEvent`：`PE_PanelMenu` 铺满整个窗口，再按 `actionRects` 画条目，剩余区域画
   `CE_MenuEmptyArea`（windowsvista 下 `#f0f0f0`），底色 `#f2f2f2`、边框 `#cccccc`。
 
-**结论（机制层已证实）**：异常菜单的窗口高度来自一个 right≈16 / bottom≈126 的
-`sizeHint()`，即 `QWidget::contentsMargins()` 的 right/bottom 被计入了菜单尺寸；条目仍从顶部紧排，
-右下多出的空间被 `CE_MenuEmptyArea` 填成灰白空块，面板与边框贯穿全高。正常菜单该边距恒为 0。
+注入结果证明非零 right/bottom 边距能够产生相同的空白结构，条目仍从顶部紧排，
+右下空间由菜单空区绘制。真实故障当时的 `contentsMargins()` 和 `sizeHint()` 尚未捕获，
+截图相似度不足以确定现场也由边距引起。
 
-## 3. 已排除项 / 剩余缺口
+## 3. 已测范围与剩余缺口
 
-已排除（均有证据）：
+初轮检查与已测场景中未发现以下路径造成异常，结论受当时场景覆盖范围限制。
 
 1. 滚动菜单模式与滚动条（`SH_Menu_Scrollable=0`，条目未超屏，`actionRects` 单列）；
 2. 反复 popup 导致的尺寸累积（连续 5 次 popup/hide，`geometry == sizeHint`）；
@@ -67,86 +67,51 @@
 5. `minimumWidth`/`minimumHeight`、`QWidgetAction`、`tearOff` 分支（全仓无相关调用）；
 6. Router Node 核心（与菜单渲染无关，本次不改）。
 
-**剩余缺口**：`rightmargin`/`bottommargin` 只能由 `QWidget::setContentsMargins` 写入；
-Qt 内 `QMenu` 自身仅 torn-off 分支调用（`qmenu.cpp` L110），而本仓库**全无** `setContentsMargins`
-调用。故"运行期是谁写入该边距"无法靠静态分析闭环，需在下次真实出现时由运行期证据确认。
+初轮源码检查时，业务代码未设置托盘父菜单的非零边距。当前已增加归零保护，
+但尚无现场证据表明真实故障存在非零边距，也无法确定其潜在写入来源。
+下一次复现需要同时记录 Qt 几何、条目区域、屏幕/DPR 与 Windows 原生窗口尺寸。
 
-## 4. 触发条件与"偶发"成因（当前最佳解释）
+## 4. 待验证的触发假设
 
-`QSystemTrayIcon` 复用**同一个** `_tray_menu` 实例（`widget.py` L1082/L1196），其
-`contentsMargins` 一旦被置为非零就会被后续每次 `sizeHint()` 继承，直到进程退出；
-`popup()` 也只按 `sizeHint()` 给窗口尺寸，不会纠正。因此表现为：
+`QSystemTrayIcon` 复用同一个 `_tray_menu` 实例。若其边距在运行期变为非零，
+后续弹出可能持续沿用异常尺寸。该假设尚待运行期记录验证，
+样式、DPI/主题或其他平台事件也没有被证实为触发条件。
 
-- 只在某个外部/平台侧事件（样式 polish、DPI/主题切换、其它窗口 setContentsMargins 误用等）
-  写入边距的那一次开始出现；
-- 之后的每次弹出都保持异常 → 用户感觉"偶发出现、抓不住"，且重启悬浮窗即恢复。
+## 5. 已实现的保护与诊断
 
-这是"偶发"的直接解释：**状态一旦被污染就持久化在复用实例上，而不是每次弹出都可能发生**。
+### 5.1 菜单生命周期
 
-## 5. 修复方案（最小范围，一处逻辑 + 一处测试）
+`widget.py` 的 `_setup_tray()` 将父菜单 `aboutToShow` 连接到 `_on_tray_menu_about_to_show()`。
+该方法先调用 `_normalize_tray_menu_geometry()`，仅在边距非零时归零，
+随后记录首次弹出 probe，并通过 `QTimer.singleShot(0, ...)` 采样显示后的几何信息。
+`aboutToHide` 也触发几何采样，菜单 Show 事件由 `_TrayMenuProbeFilter` 记录。
 
-### 5.1 `mimo-token-monitor/widget.py`
+归零发生在 Qt 重新计算弹出布局之前，注入边距的测试验证 `sizeHint()` 能回到基线。
+诊断代码同时覆盖尺寸大于 `sizeHint()`、条目下方留白超过阈值及非零边距的情况。
 
-1. 在 `_setup_tray()` 中注册父菜单的 `aboutToShow` 归一化钩子（当前父菜单只有 `aboutToHide`）：
+### 5.2 专用诊断文件
 
-```python
-tray_menu.aboutToShow.connect(self._normalize_tray_menu_geometry)
-```
+系统临时目录中的 `mimo-token-monitor-tray-menu-probe-<pid>.log` 记录启动、菜单显示和首次弹出钩子，
+`mimo-token-monitor-tray-menu.log` 只追加检测到的异常，
+`mimo-token-monitor-tray-menu.png` 在显示阶段检测到异常时覆盖保存菜单截图。
+文件字段与使用步骤见 [监控器 README](../../../mimo-token-monitor/README.md#托盘菜单异常诊断)。
 
-2. 新增方法（紧邻 `_setup_claude_profile_menu`）：
+`_normalize_tray_menu_geometry()` 的 stderr 输出仅在控制台可用时可见。
+`main.py` 在 `pythonw.exe` 缺少 stderr 时连接 `os.devnull`，因此现场排查依赖专用文件。
 
-```python
-def _normalize_tray_menu_geometry(self) -> None:
-    """Keep the reused tray menu compact.
+### 5.3 回归覆盖
 
-    QMenu::sizeHint() adds QWidget::contentsMargins() right/bottom to the
-    action rects, while items are still laid out from the top-left corner,
-    so a stale non-zero margin renders a blank CE_MenuEmptyArea strip.
-    """
-    menu = getattr(self, "_tray_menu", None)
-    if menu is None:
-        return
-    margins = menu.contentsMargins()
-    if margins.left() or margins.top() or margins.right() or margins.bottom():
-        print(
-            "[tray] QMenu contentsMargins="
-            f"{margins.left()},{margins.top()},{margins.right()},{margins.bottom()}"
-            " 已归零",
-            file=sys.stderr,
-        )
-        menu.setContentsMargins(0, 0, 0, 0)
-```
+`tests/test_sync_runtime.py` 覆盖四项行为。
 
-- `aboutToShow` 在 `popup()` 的 `updateActionRects()` **之前**触发，因此归零后本次
-  `sizeHint()` 立即按内容计算，不需要 `adjustSize()`（避免隐藏态下按陈旧 `actionRects` 计算）。
-- 边距为 0 时不做任何写入（正常路径行为完全不变，无 flicker）。
-- 若下次复现，stderr 会打印真实边距值，即为**运行期根因证据**（`main.py` 已把 stderr 落盘）。
-
-### 5.2 `mimo-token-monitor/tests/test_sync_runtime.py`
-
-新增回归测试（复用现有 `managed_widget` 上下文）：
-
-```python
-def test_tray_menu_about_to_show_resets_stale_contents_margins(self):
-    with managed_widget({"position": [100, 100]}) as widget:
-        menu = widget._tray_menu
-        baseline = menu.sizeHint()
-        menu.setContentsMargins(0, 0, 16, 126)   # 缺陷截图对应的边距
-        inflated = menu.sizeHint()
-        self.assertGreater(inflated.height(), baseline.height())
-        menu.aboutToShow.emit()
-        self.assertEqual(menu.contentsMargins().right(), 0)
-        self.assertEqual(menu.contentsMargins().bottom(), 0)
-        self.assertEqual(menu.sizeHint(), baseline)
-```
+- 注入 `(0,0,16,126)` 后，`aboutToShow` 将边距归零并恢复 `sizeHint()`。
+- 正常几何不写异常日志，注入异常几何后写入诊断。
+- `first-popup` 每个 widget 只写一次。
+- `startup` 每个进程、文件只写一次。
 
 ## 6. 验证
 
-1. `cd mimo-token-monitor && python -m unittest discover -s tests` 全绿；
-2. `node scripts-check.mjs`、Router 侧检查不涉及（未改动 `src/`）；
-3. Windows 手工验证：
-   - 正常：托盘右键 → 菜单紧凑、条目下方无空块（8 条目 + 分隔线）；
-   - 故障注入：开一次 Python 交互会话构造同样菜单并 `setContentsMargins(0,0,16,126)`，
-     确认复现截图后，再验证 `aboutToShow` 钩子能把高度拉回 `sizeHint()`；
-   - 真实环境：菜单弹出 → 悬停"路由控制"展开子菜单 → 移开 → 关闭 → 重复 10 次以上，
-     菜单高度不变、底部无空白；若再出现，收集 stderr 中的 `[tray] QMenu contentsMargins=...` 行。
+2026-11-09 的 MiMo 签名修复全量验证包含上述托盘测试，共 316 项通过，0 失败、0 skip，
+`node scripts-check.mjs` 通过。托盘代码随后提交为 `291f4361`。
+
+Windows 真实托盘复测仍待完成。操作为弹出菜单、展开与关闭路由子菜单、关闭菜单，重复 10 次以上，
+观察菜单高度及底部空白。若复现，记录时间并收集对应 probe、异常日志和菜单截图。

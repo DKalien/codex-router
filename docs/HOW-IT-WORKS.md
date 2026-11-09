@@ -78,7 +78,12 @@ Windows 的 `start`/`restart` 只由平台管理器执行最多 60 秒的就绪�
 SuperGPT 余额、托盘维护和 Claude HUD 快照。它以独立进程运行，操作 Router 时调用现有 Node 入口。
 WLB 和 SuperGPT 查询每次刷新读取与 Router 共用的密钥；设置保存通过 stdin 调用 Router 的
 `writeProviderCredential` / `enableProvider`，沿用原子写入和私有 ACL，不把 Key 放进命令行或设置数据库。
-旧设置中的非空 Key 首次启动迁入共享存储，以旧悬浮窗设置值为准；成功后清理旧字段，失败停止启动并提示。
+首次启动迁移旧设置中的非空 Key 时，默认保留 Router 当前生效值（含环境变量覆盖）。
+共享存储缺少 Key 时才写入旧值，值冲突时由用户选择，迁移只写入密钥并保留原供应商启用状态。
+成功项清理旧字段，失败项保留供重试并提示错误。
+
+合并布局默认跳过启动代码同步。托盘「检查并更新代码…」先展示 Router 核心和监控器的变更范围，
+确认后核对远端提交 SHA，并仅在干净工作区执行快进更新。
 
 启动方式、Python 依赖、旧独立仓库备份与本地数据边界见 [监控器说明](../mimo-token-monitor/README.md)。
 从旧目录切到新目录时继续使用同一个 `MIMO_TOKEN_MONITOR_DATA_DIR`，不迁移或覆盖 Cookie、设置和浏览器资料。

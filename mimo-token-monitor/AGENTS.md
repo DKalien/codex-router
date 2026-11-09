@@ -58,13 +58,14 @@ Python 模块采用单目录扁平结构：
 - 窗口使用 `FramelessWindowHint` + `Tool`，默认附加 `WindowStaysOnTopHint`；标题栏图钉按钮可切换置顶状态并保存到 `always_on_top`。通过 `mouseMoveEvent` 实现拖动，拖动时有屏幕边缘吸附逻辑。拖动时设置 `WA_NoSystemBackground` 防止 Windows DWM 残留阴影导致闪烁。
 - 跨窗口吸附在主屏和副屏均识别原生标题为 `ETF Tracker` 或 `MiMo Token Monitor` 的可见、非最小化窗口，阈值为 15 个 Qt 逻辑像素。`GetWindowRect()` 返回物理像素；拖动时必须按当前 `QScreen.geometry()` 原点和 `devicePixelRatio` 转换后再计算，并将最终坐标转换回 Qt 逻辑坐标。
 - API 认证依赖 Cookie（关键名为 `api-platform_serviceToken`）。支持通过 CDP 自动导入（需 Edge 快捷方式添加调试参数，见 README）、Playwright 独立会话自动续期，或手动从 DevTools 复制。
-- MiMo API：HTTP 401 使用显式 `auth_expired` 标记触发一次自动恢复，HTTP 403 只标记拒绝访问；余额必须返回有限数值（零有效），不能凭 HTTP 200 判断 Cookie 有效。错误保留各失败端点、状态和响应类型，原始异常/正文不回显。MiMo 请求拒绝重定向；余额和用量全部恢复成功后才重置恢复次数。
+- MiMo API 仅在明确 Cookie 失效时使用 `auth_expired` 标记触发一次自动恢复，普通 HTTP 403 标记拒绝访问，签名错误按下一条处理。余额须返回有限数值（零有效）才校验成功。错误保留各失败端点、状态和响应类型并脱敏，MiMo 请求拒绝重定向。余额和用量全部恢复成功后才重置恢复次数。
 - MiMo 会话签名：仅识别官网固定签名错误码和固定中文消息。`SIGN_MISSING`、`SIGN_KEY_MISSING`、`TIMESTAMP_INVALID` 获取 `/api/v1/user/sign-key` 后按 HMAC-SHA256 GET 协议重试一次；`SIGN_INVALID` 和普通 403 保留错误。签名类 HTTP 401 不触发 Cookie 续期，签名密钥接口明确 HTTP 401 才标记登录失效。使用服务端时间校准，密钥响应限读 64 KiB，密钥仅在本次调用内存中使用。修改后运行 `python -m unittest discover -s tests -p test_mimo_signing.py` 及全量 unittest。
 - Playwright 续期 UI：开始/成功/失败会在悬浮窗底部状态行与托盘通知；失败状态在模态框关闭前不自动清除，关闭后再保留约 12 秒。独立 Chromium 不共享内置浏览器登录状态；若当前 Cookie 仍可用而仅 Playwright 会话未登录，或 SSO 等待超时，手动和自动续期都只给软提示，不弹阻塞对话框。结果回传时会话和窗口已经关闭，SSO 超时须明确显示续期结束和重新打开登录入口，不能显示绿色等待；已有续期任务时手动点击会提示进行中而不是静默忽略；运行期间退出/重启会提示等待，结果槽先等待线程结束再销毁。工作线程信号名为 `result_ready`，避免与 `QThread.finished` 冲突。
 - 平台目标为 Windows（字体 `Microsoft YaHei`，`.ico` 图标）。
 - 内置 `PLAN_TIERS` 常量（4 个挡位：Lite ¥39 / Standard ¥99 / Pro ¥329 / Max ¥659），通过 `_get_plan_tier_info()` 根据套餐总额自动匹配挡位并计算每 Credit 单价，在悬浮窗内显示已用额度折合金额。
 - MiMo 余额为 0 时自动隐藏（包括右上角金额和 tooltip 余额行）；SuperGPT API余额为 0 时仍显示金额，进度条为空。
 - 系统托盘：`QSystemTrayIcon` 实现最小化到托盘，右上角绘制最小化按钮（`─`），双击托盘图标恢复窗口，托盘 tooltip 与悬浮窗同步更新；“重启悬浮窗”直接退出当前进程并在释放单实例锁后启动新进程。
+- 托盘菜单诊断由 `widget.py` 在弹出前归零非零边距，并在系统临时目录记录进程 probe 与异常几何信息，详见 [README 的诊断步骤](README.md#托盘菜单异常诊断)。注入边距的复现与真实偶发故障的触发原因须分开记录，后者仍待现场验证。
 - Codex Router 维护：`router_control.py` 优先使用 `MIMO_TOKEN_MONITOR_ROUTER_ROOT`，否则按 `$CODEX_HOME`（默认 `~/.codex`）读取 `codex-router/install-manifest.json` 的 `current.sourceRoot`，并校验所需入口文件。状态调用 `node src/status.mjs --json`；主代理 GPT/WLB/SuperGPT 切换调用 `node src/gpt-route.mjs official|wlb|supergpt`，子代理供应商切换调用 `node src/gpt-route.mjs subagent official|wlb|supergpt|auto`，Pi 路由切换调用 `node src/gpt-route.mjs pi official|wlb|supergpt`（先检查 Router 已开启，不自动启停服务）；启停复用 `codex-router.ps1 enable|disable`；重启调用 `node src/service.mjs restart`。全部命令由 `RouterWorker` 后台串行执行，首个失败即停止，操作期间禁用路由菜单并阻止退出；托盘菜单关闭后的状态刷新延迟到事件循环下一轮，避免覆盖刚触发的操作。
 - 路由操作开始时，悬浮窗底部显示进行中状态，完成后显示成功或失败摘要并在 5 秒后清除；托盘通知仍保留，用于即时反馈。
 - 单实例：使用 Windows Mutex 防止重复启动，并通过命名事件唤醒已有窗口；禁止把第二次启动保留在阻塞提示框中。

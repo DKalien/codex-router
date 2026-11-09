@@ -200,6 +200,63 @@ class TestExitRuntime(unittest.TestCase):
                 ["切换 Pi 到 WLB", "切换 Pi 到 SuperGPT", "切换 Pi 到 GPT"],
             )
 
+    def test_tray_menu_about_to_show_resets_stale_contents_margins(self):
+        with managed_widget({"position": [100, 100]}) as widget:
+            menu = widget._tray_menu
+            baseline = menu.sizeHint()
+            menu.setContentsMargins(0, 0, 16, 126)   # 缺陷截图对应的边距
+            inflated = menu.sizeHint()
+            self.assertGreater(inflated.height(), baseline.height())
+            menu.aboutToShow.emit()
+            self.assertEqual(menu.contentsMargins().right(), 0)
+            self.assertEqual(menu.contentsMargins().bottom(), 0)
+            self.assertEqual(menu.sizeHint(), baseline)
+
+    def test_tray_menu_geometry_anomaly_is_logged(self):
+        import tempfile
+        with managed_widget({"position": [100, 100]}) as widget, \
+                tempfile.TemporaryDirectory() as tmpdir:
+            log_path = os.path.join(tmpdir, "tray-menu.log")
+            shot_path = os.path.join(tmpdir, "tray-menu.png")
+            with patch.object(TokenWidget, "_tray_menu_log_path", return_value=log_path), \
+                    patch.object(TokenWidget, "_tray_menu_shot_path", return_value=shot_path):
+                widget._log_tray_menu_geometry("hidden")
+                self.assertFalse(os.path.exists(log_path))
+                widget._tray_menu.setContentsMargins(0, 0, 16, 126)
+                widget._log_tray_menu_geometry("shown")
+            with open(log_path, encoding="utf-8") as handle:
+                content = handle.read()
+        self.assertIn("margins=0,0,16,126", content)
+
+    def test_tray_menu_about_to_show_writes_probe_once(self):
+        import tempfile
+        with managed_widget({"position": [100, 100]}) as widget, \
+                tempfile.TemporaryDirectory() as tmpdir:
+            probe_path = os.path.join(tmpdir, "probe.log")
+            with patch.object(TokenWidget, "_tray_menu_probe_path", return_value=probe_path), \
+                    patch.object(TokenWidget, "_tray_menu_log_path",
+                                 return_value=os.path.join(tmpdir, "anomaly.log")), \
+                    patch.object(TokenWidget, "_tray_menu_shot_path",
+                                 return_value=os.path.join(tmpdir, "shot.png")):
+                widget._tray_menu.aboutToShow.emit()
+                widget._tray_menu.aboutToShow.emit()
+            with open(probe_path, encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("event=first-popup", lines[0])
+
+    def test_tray_menu_startup_probe_written_once_per_process(self):
+        import tempfile
+        with managed_widget({"position": [100, 100]}) as widget, \
+                tempfile.TemporaryDirectory() as tmpdir:
+            probe_path = os.path.join(tmpdir, "probe.log")
+            for _ in range(3):
+                widget._write_tray_menu_probe("startup", path=probe_path)
+            with open(probe_path, encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("event=startup", lines[0])
+
     def test_route_switch_actions_and_confirmed_selection(self):
         with managed_widget({"position": [100, 100]}) as widget:
             widget._tray_icon.showMessage = Mock()

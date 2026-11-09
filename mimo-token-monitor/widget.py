@@ -1,4 +1,4 @@
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint, QRect, QRectF, QPointF
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint, QRect, QRectF, QPointF, QEvent, QObject
 from PyQt6.QtGui import QColor, QPainter, QBrush, QPen, QAction, QFont, QFontMetrics, QIcon, QCursor, QPolygonF, QPainterPath
 from PyQt6.QtWidgets import (
     QWidget, QMenu, QDialog, QFormLayout,
@@ -12,6 +12,7 @@ import json
 import math
 import os
 import sys
+import tempfile
 import api_client
 import code_sync
 from claude_profiles import (
@@ -33,6 +34,9 @@ import usage_url
 import window_snap
 
 SNAP_THRESHOLD = 15  # px, 距屏幕边缘多少像素内触发吸附
+# (pid, event, log path) already written: keeps the startup heartbeat to one line
+# per process even when a test process constructs many TokenWidget instances.
+_PROBE_ONCE: set[tuple[int, str, str]] = set()
 
 MIMO_MODE = "mimo"
 THIRD_PARTY_MODE = "third_party"
@@ -765,6 +769,19 @@ class ClaudeProfilesDialog(QDialog):
 
 
 # ── Main widget ─────────────────────────────────────────────────
+class _TrayMenuProbeFilter(QObject):
+    """Record the popup's Show event so "no first-popup" can be interpreted."""
+
+    def __init__(self, owner, parent=None):
+        super().__init__(parent)
+        self._owner = owner
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Show:
+            self._owner._write_tray_menu_probe("menu-show")
+        return False
+
+
 class TokenWidget(QWidget):
     def __init__(self, cfg: dict, exit_callback=None):
         super().__init__()
@@ -1081,6 +1098,9 @@ class TokenWidget(QWidget):
         # 托盘右键菜单
         tray_menu = QMenu(self)
         self._tray_menu = tray_menu
+        self._write_tray_menu_probe("startup", path=self._tray_menu_probe_path())
+        self._tray_menu_probe_filter = _TrayMenuProbeFilter(self, tray_menu)
+        tray_menu.installEventFilter(self._tray_menu_probe_filter)
 
         show_act = QAction("显示主窗口", self)
         show_act.triggered.connect(self._show_window)
@@ -1180,6 +1200,8 @@ class TokenWidget(QWidget):
         tray_menu.aboutToHide.connect(
             lambda: QTimer.singleShot(0, self._refresh_router_state)
         )
+        tray_menu.aboutToHide.connect(lambda: self._log_tray_menu_geometry("hidden"))
+        tray_menu.aboutToShow.connect(self._on_tray_menu_about_to_show)
 
         tray_menu.addSeparator()
 
@@ -1203,6 +1225,137 @@ class TokenWidget(QWidget):
         if QSystemTrayIcon.isSystemTrayAvailable():
             self._refresh_router_state()
             self._router_poll_timer.start(30_000)
+
+    def _normalize_tray_menu_geometry(self) -> None:
+        """Keep the reused tray menu compact.
+
+        QMenu::sizeHint() adds QWidget::contentsMargins() right/bottom to the
+        action rects while items are still laid out from the top-left corner,
+        so a stale non-zero margin renders a blank CE_MenuEmptyArea strip.
+        """
+        menu = getattr(self, "_tray_menu", None)
+        if menu is None:
+            return
+        margins = menu.contentsMargins()
+        if margins.left() or margins.top() or margins.right() or margins.bottom():
+            print(
+                "[tray] QMenu contentsMargins="
+                f"{margins.left()},{margins.top()},{margins.right()},{margins.bottom()}"
+                " 已归零",
+                file=sys.stderr,
+            )
+            menu.setContentsMargins(0, 0, 0, 0)
+
+    def _on_tray_menu_about_to_show(self) -> None:
+        """Normalize margins, prove the popup hook ran, then sample final geometry."""
+        self._normalize_tray_menu_geometry()
+        if not getattr(self, "_tray_menu_probe_seen", False):
+            self._tray_menu_probe_seen = True
+            self._write_tray_menu_probe("first-popup")
+        QTimer.singleShot(0, lambda: self._log_tray_menu_geometry("shown"))
+
+    def _tray_menu_probe_path(self) -> str:
+        """Per-process heartbeat file, so "no log" can be told apart from "no anomaly"."""
+        return os.path.join(
+            tempfile.gettempdir(),
+            f"mimo-token-monitor-tray-menu-probe-{os.getpid()}.log",
+        )
+
+    def _write_tray_menu_probe(self, event: str, path: str | None = None) -> bool:
+        """Return False when the diagnostic itself cannot write, instead of failing silently."""
+        target = path or self._tray_menu_probe_path()
+        if event == "startup":
+            key = (os.getpid(), event, target)
+            if key in _PROBE_ONCE:
+                return True
+            _PROBE_ONCE.add(key)
+        try:
+            with open(target, "a", encoding="utf-8") as handle:
+                handle.write(
+                    f"{datetime.now().isoformat(timespec='seconds')} "
+                    f"pid={os.getpid()} event={event}\n"
+                )
+            return True
+        except OSError:
+            return False
+
+    def _tray_menu_log_path(self) -> str:
+        """Dedicated log file: pythonw redirects stderr to os.devnull."""
+        return os.path.join(tempfile.gettempdir(), "mimo-token-monitor-tray-menu.log")
+
+    def _tray_menu_shot_path(self) -> str:
+        return os.path.join(tempfile.gettempdir(), "mimo-token-monitor-tray-menu.png")
+
+    def _log_tray_menu_geometry(self, phase: str) -> None:
+        """Record tray menu geometry whenever it exceeds sizeHint or has margins."""
+        menu = getattr(self, "_tray_menu", None)
+        if menu is None:
+            return
+        hint = menu.sizeHint()
+        geo = menu.geometry()
+        margins = menu.contentsMargins()
+        content_bottom = 0
+        for action in menu.actions():
+            rect = menu.actionGeometry(action)
+            if rect.height() > 0:
+                content_bottom = max(content_bottom, rect.y() + rect.height())
+        abnormal = bool(
+            margins.left() or margins.top() or margins.right() or margins.bottom()
+        )
+        if not abnormal and menu.isVisible():
+            abnormal = (
+                geo.width() > hint.width()
+                or geo.height() > hint.height()
+                or (content_bottom > 0 and hint.height() - content_bottom > 8)
+            )
+        if not abnormal:
+            return
+
+        record = (
+            f"{datetime.now().isoformat(timespec='seconds')} phase={phase}"
+            f" geo={geo.x()},{geo.y()},{geo.width()}x{geo.height()}"
+            f" hint={hint.width()}x{hint.height()}"
+            f" content_h={content_bottom}"
+            f" margins={margins.left()},{margins.top()},{margins.right()},{margins.bottom()}"
+            f" actions={len(menu.actions())}"
+        )
+        style = QApplication.style()
+        if style is not None:
+            record += f" style={style.objectName()}"
+        screen = menu.screen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            record += (
+                f" screen={screen.name()} dpr={screen.devicePixelRatio()}"
+                f" avail={available.width()}x{available.height()}"
+            )
+        record += f" dpr_window={QApplication.instance().devicePixelRatio()}"
+        record += f" native={self._popup_native_size(menu)}"
+
+        try:
+            with open(self._tray_menu_log_path(), "a", encoding="utf-8") as handle:
+                handle.write(record + "\n")
+            if phase == "shown":
+                menu.grab().save(self._tray_menu_shot_path())
+        except OSError:
+            pass
+
+    @staticmethod
+    def _popup_native_size(menu: QMenu) -> str:
+        """Return the Win32 client/window size of the popup, to separate Qt vs frame issues."""
+        handle = menu.windowHandle()
+        if handle is None or sys.platform != "win32":
+            return "?"
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            rect = wintypes.RECT()
+            if not ctypes.windll.user32.GetWindowRect(int(handle.winId()), ctypes.byref(rect)):
+                return "?"
+            return f"{rect.right - rect.left}x{rect.bottom - rect.top}"
+        except Exception:
+            return "?"
 
     def _setup_claude_profile_menu(self, tray_menu: QMenu) -> None:
         """Add a tray submenu for switching Claude Code environment templates."""

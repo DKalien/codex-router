@@ -505,16 +505,18 @@ function normalizeRoutedInput(input) {
   return input
     .filter((item) => item?.type !== "compaction_trigger")
     .map((item) => {
-      // 仅恢复具名 codex_app 孤立结果，不伪造没有对应调用的 call_id。
-      if (
-        item?.type !== "function_call_output" ||
-        item.namespace !== "codex_app" ||
-        typeof item.name !== "string" || !item.name ||
-        (typeof item.call_id === "string" && item.call_id) ||
-        item.output === undefined
-      ) return item;
-      const output = typeof item.output === "string" ? item.output : JSON.stringify(item.output);
-      return messageItem(`[Codex app 工具结果：codex_app.${item.name}]\n${output}`);
+      // 孤立工具结果缺少 call_id 就无法与调用配对，严格的标准 Responses HTTP
+      // 上游会以 "function_call_output requires call_id" 拒绝整个请求（如
+      // Codex apps 注入的 namespace "agent" 页面快照）。折算成普通消息保留
+      // 命名空间、名称和输出，不伪造没有对应调用的 call_id。
+      if (item?.type !== "function_call_output" || (typeof item.call_id === "string" && item.call_id)) return item;
+      const name = typeof item.name === "string" && item.name
+        ? (typeof item.namespace === "string" && item.namespace ? `${item.namespace}.${item.name}` : item.name)
+        : "";
+      const label = name ? `[孤立工具结果：${name}]` : "[孤立工具结果]";
+      const output = typeof item.output === "string" ? item.output
+        : item.output === undefined ? undefined : JSON.stringify(item.output);
+      return messageItem(output === undefined ? label : `${label}\n${output}`);
     })
     .map((item) => {
       if (item?.type !== "compaction") return item;

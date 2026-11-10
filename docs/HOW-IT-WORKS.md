@@ -230,9 +230,12 @@ Windows 原生解码器崩溃。后台凭据 ACL 与服务管理的非交互 Pow
 协作载荷 relay 和 compact 响应分别最多缓冲 4 MiB 与 32 MiB，超限会立即取消上游
 流；这些限制在数据到达时执行，不会先由 `arrayBuffer()` 无界收集。
 
-第三方普通和压缩请求共用历史规范化入口：对于缺少有效调用 ID、但具有名称和输出的
-`codex_app` 工具结果，保留名称及原始输出文本（结构化输出转为 JSON），转换为可读
-用户消息；不伪造调用 ID。官方请求、有调用 ID 的结果和其他命名空间保持原样。
+第三方普通和压缩请求共用历史规范化入口：缺少有效调用 ID 的孤立工具结果无法与
+调用配对，严格的标准 Responses HTTP 上游会以 `function_call_output requires
+call_id` 拒绝整个请求（如 Codex apps 注入的 `codex_app` / `agent` 命名空间页面
+快照）。路由器对任意命名空间的孤立结果保留命名空间、名称及原始输出文本（结构化
+输出转为 JSON），转换为可读用户消息；不伪造调用 ID。官方请求和有调用 ID 的
+工具结果保持原样。
 
 路由器只监听回环地址，并在读取请求前检查每次安装生成的 caller 凭据。
 `src/start.mjs` 设置 `NODE_USE_ENV_PROXY=1` 并将 `HTTP_PROXY`/`HTTPS_PROXY`

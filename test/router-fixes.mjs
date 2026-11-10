@@ -475,7 +475,7 @@ test("zstd 请求解压覆盖官方及第三方入口，并提前拒绝超大帧
   }
 });
 
-test("孤立 app 工具结果在第三方普通及压缩请求保留，官方和其他工具保持原样", async () => {
+test("孤立工具结果在第三方普通及压缩请求折算为可读历史，官方和合法工具结果保持原样", async () => {
   const received = [];
   const upstream = http.createServer(async (request, response) => {
     const chunks = [];
@@ -487,13 +487,19 @@ test("孤立 app 工具结果在第三方普通及压缩请求保留，官方和
   const port = await listen(upstream);
   const router = await startRouter({ CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${port}`, WLB_BASE_URL: `http://127.0.0.1:${port}`, WLB_API_KEY: "test-wlb-key" });
   const orphan = { type: "function_call_output", namespace: "codex_app", name: "read_thread", output: { text: "保留结果" } };
+  const agentOrphan = { type: "function_call_output", namespace: "agent", name: "codex_apps_open_page", output: "{\"page_id\":null}" };
   const untouched = [
     { ...orphan, call_id: "existing-call" },
+  ];
+  const input = [
+    orphan,
+    { ...orphan, call_id: "", output: "字符串结果" },
+    agentOrphan,
     { ...orphan, namespace: "other" },
     { type: "function_call_output", output: "无名称" },
     { type: "function_call_output", namespace: "codex_app", name: "read_thread" },
+    ...untouched,
   ];
-  const input = [orphan, { ...orphan, call_id: "", output: "字符串结果" }, ...untouched];
   try {
     for (const model of ["gpt-5.6-sol", "wlb-relay/gpt-5.6-sol"]) {
       for (const endpoint of ["responses", "responses/compact"]) {
@@ -505,12 +511,21 @@ test("孤立 app 工具结果在第三方普通及压缩请求保留，官方和
         const actual = received.at(-1).input;
         if (model.startsWith("gpt-")) assert.deepEqual(actual, input);
         else {
-          assert.equal(actual[0].type, "message");
-          assert.equal(actual[0].role, "user");
-          assert.match(actual[0].content[0].text, /codex_app\.read_thread/);
-          assert.ok(actual[0].content[0].text.endsWith(JSON.stringify(orphan.output)));
-          assert.ok(actual[1].content[0].text.endsWith("字符串结果"));
-          assert.deepEqual(actual.slice(2, 6), untouched);
+          const texts = actual.slice(0, 6).map((item) => {
+            assert.equal(item.type, "message");
+            assert.equal(item.role, "user");
+            return item.content[0].text;
+          });
+          assert.match(texts[0], /codex_app\.read_thread/);
+          assert.ok(texts[0].endsWith(JSON.stringify(orphan.output)));
+          assert.ok(texts[1].endsWith("字符串结果"));
+          assert.match(texts[2], /agent\.codex_apps_open_page/);
+          assert.ok(texts[2].endsWith(agentOrphan.output));
+          assert.match(texts[3], /other\.read_thread/);
+          assert.ok(texts[4].endsWith("无名称"));
+          assert.match(texts[5], /codex_app\.read_thread/);
+          assert.ok(!texts[5].includes("\n"), "缺少输出的孤立结果不伪造输出");
+          assert.deepEqual(actual.slice(6, 6 + untouched.length), untouched);
         }
       }
     }

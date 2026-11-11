@@ -1304,6 +1304,11 @@ async function handleResponses(request, response, requestUrl, client = "codex") 
           }
         }
       } catch (error) {
+        // 此分支直接返回 JSON，不会进入通用错误日志；留一条脱敏原因以便定位
+        // 额度探测超时、供应商未启用或状态文件写入失败。
+        console.error(
+          `[codex-router] auto-route unavailable model=${requestedModel || "unknown"} subagent=${subagentAuto} reason=${formatErrorChain(error, { messages: true })}`,
+        );
         writeJson(response, 503, { error: { type: autoMode ? "auto_route_unavailable" : "invalid_gpt_route", message: autoMode ? "自动路由暂时不可用，请检查额度查询及供应商配置。" : error.message } });
         return;
       }

@@ -2,6 +2,10 @@
 
 ## Lite 分支（未发布）
 
+- 补齐孤立工具结果折算的 Pi 路由专项回归测试：覆盖 `/pi/v1/responses` 与
+  `/pi/v1/responses/compact` 的官方及第三方路由、`agent`/`codex_app` 等命名空间、
+  缺失/空/null/非字符串调用 ID 及合法配对边界；文档明确非空调用 ID 但未配对的
+  结果不参与折算的既有契约。
 - 第三方普通和压缩请求把所有缺少调用 ID 的孤立工具结果（任意命名空间，如 Codex
   apps 注入的 `agent` 命名空间页面快照）折算为可读用户消息，保留命名空间、名称
   与输出，不伪造调用 ID；修复严格上游以 `function_call_output requires call_id`

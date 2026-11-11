@@ -535,6 +535,122 @@ test("孤立工具结果在第三方普通及压缩请求折算为可读历史�
   }
 });
 
+test("Pi 命名空间孤立工具结果与 call_id 配对边界遵循与 Codex 相同的转换契约", async () => {
+  const received = [];
+  const upstream = (name) => http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const raw = Buffer.concat(chunks).toString("utf8");
+    received.push({ name, url: request.url, body: raw ? JSON.parse(raw) : null });
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify(request.method === "GET"
+      ? { object: "list", data: [{ id: "gpt-6-pi" }] }
+      : {
+          output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+          usage: { input_tokens: 3, output_tokens: 1 },
+        }));
+  });
+  const piOfficial = upstream("pi-official");
+  const wlb = upstream("wlb");
+  const piPort = await listen(piOfficial);
+  const wlbPort = await listen(wlb);
+  const router = await startRouter({
+    PI_NATIVE_BASE_URL: `http://127.0.0.1:${piPort}/v1`,
+    WLB_BASE_URL: `http://127.0.0.1:${wlbPort}`,
+    WLB_API_KEY: "test-wlb-key",
+  });
+  const cli = (...args) =>
+    spawnSync(process.execPath, [path.join(root, "src/gpt-route.mjs"), ...args], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CODEX_HOME: router.stateDir,
+        MODEL_ROUTER_STATE_DIR: router.stateDir,
+        WLB_API_KEY: "test-wlb-key",
+      },
+    });
+  // 合法配对、非空但未配对，以及各命名空间下缺失/空/null/非字符串 call_id 的孤立结果。
+  const pairedCall = { type: "function_call", call_id: "call_paired", name: "read_thread", arguments: "{}" };
+  const paired = { type: "function_call_output", call_id: "call_paired", namespace: "codex_app", name: "read_thread", output: "配对结果" };
+  const unpaired = { type: "function_call_output", call_id: "call_missing", namespace: "agent", name: "open_page", output: "未配对但带调用 ID" };
+  const orphans = [
+    { type: "function_call_output", namespace: "codex_app", name: "read_thread", output: { text: "快照" } },
+    { type: "function_call_output", namespace: "agent", name: "codex_apps_open_page", output: "{\"page_id\":null}" },
+    { type: "function_call_output", namespace: "other", name: "tool_x", output: "其它命名空间" },
+    { type: "function_call_output", call_id: "", name: "empty_tool", output: "空调用 ID" },
+    { type: "function_call_output", call_id: null, name: "null_tool", output: "null 调用 ID" },
+    { type: "function_call_output", call_id: 123, name: "num_tool", output: 456 },
+    { type: "function_call_output", namespace: "codex_app", name: "read_thread" },
+  ];
+  const input = [pairedCall, paired, unpaired, ...orphans];
+  const send = async (endpoint) => {
+    const response = await fetch(
+      `http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/pi/v1/${endpoint}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer test-credential" },
+        body: JSON.stringify({ model: "gpt-6-pi", input, stream: false }),
+      },
+    );
+    if (response.status !== 200) throw new Error(await response.text());
+    await response.arrayBuffer();
+    return received.at(-1);
+  };
+  const expectOrphanTexts = (items) => {
+    const texts = items.map((item) => {
+      assert.equal(item.type, "message");
+      assert.equal(item.role, "user");
+      assert.equal("call_id" in item, false, "折算消息不伪造调用 ID");
+      return item.content[0].text;
+    });
+    assert.match(texts[0], /codex_app\.read_thread/);
+    assert.ok(texts[0].endsWith(JSON.stringify(orphans[0].output)));
+    assert.match(texts[1], /agent\.codex_apps_open_page/);
+    assert.ok(texts[1].endsWith(orphans[1].output));
+    assert.match(texts[2], /other\.tool_x/);
+    assert.ok(texts[2].endsWith("其它命名空间"));
+    assert.match(texts[3], /empty_tool/);
+    assert.ok(texts[3].endsWith("空调用 ID"));
+    assert.match(texts[4], /null_tool/);
+    assert.ok(texts[4].endsWith("null 调用 ID"));
+    assert.match(texts[5], /num_tool/);
+    assert.ok(texts[5].endsWith("456"), "结构化输出折算为 JSON 文本");
+    assert.match(texts[6], /codex_app\.read_thread/);
+    assert.ok(!texts[6].includes("\n"), "缺少输出的孤立结果不伪造输出");
+  };
+  try {
+    // Codex 全局路由切到 WLB 不影响 Pi 自己的官方路由。
+    assert.equal(cli("wlb").status, 0);
+    let record = await send("responses");
+    assert.equal(record.name, "pi-official");
+    assert.equal(record.url, "/v1/responses");
+    assert.deepEqual(record.body.input, input);
+    record = await send("responses/compact");
+    assert.equal(record.name, "pi-official");
+    assert.deepEqual(record.body.input, input);
+    // Pi 切到 WLB：合法配对和非空 call_id（含未配对）保持原样，孤立结果全命名空间折算。
+    assert.equal(cli("pi", "wlb").status, 0);
+    record = await send("responses");
+    assert.equal(record.name, "wlb");
+    assert.equal(record.body.model, "gpt-6-pi");
+    assert.equal(record.body.input.length, input.length);
+    assert.deepEqual(record.body.input[0], pairedCall);
+    assert.deepEqual(record.body.input[1], paired);
+    assert.deepEqual(record.body.input[2], unpaired);
+    expectOrphanTexts(record.body.input.slice(3));
+    // 压缩请求走同一折算路径，转换项顺序一致，其后追加压缩提示。
+    record = await send("responses/compact");
+    assert.equal(record.name, "wlb");
+    assert.ok(record.body.input.length > input.length);
+    assert.deepEqual(record.body.input.slice(0, 3), [pairedCall, paired, unpaired]);
+    expectOrphanTexts(record.body.input.slice(3, 3 + orphans.length));
+  } finally {
+    await router.close();
+    await close(piOfficial);
+    await close(wlb);
+  }
+});
+
 test("无 content-type 的 SSE 仍能统计 Token 并原样透传", async () => {
   const body =
     'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":3}}}\n\n';

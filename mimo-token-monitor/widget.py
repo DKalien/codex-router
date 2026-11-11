@@ -779,6 +779,8 @@ class _TrayMenuProbeFilter(QObject):
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.Show:
             self._owner._write_tray_menu_probe("menu-show")
+        elif event.type() == QEvent.Type.Resize:
+            self._owner._log_tray_menu_resize()
         return False
 
 
@@ -1238,11 +1240,11 @@ class TokenWidget(QWidget):
             return
         margins = menu.contentsMargins()
         if margins.left() or margins.top() or margins.right() or margins.bottom():
-            print(
-                "[tray] QMenu contentsMargins="
-                f"{margins.left()},{margins.top()},{margins.right()},{margins.bottom()}"
-                " 已归零",
-                file=sys.stderr,
+            # stderr is os.devnull under pythonw: this line is the only record of
+            # what the margins were before the popup computed its size.
+            self._write_tray_menu_probe(
+                f"margins-before-popup={margins.left()},{margins.top()},"
+                f"{margins.right()},{margins.bottom()}"
             )
             menu.setContentsMargins(0, 0, 0, 0)
 
@@ -1285,6 +1287,21 @@ class TokenWidget(QWidget):
 
     def _tray_menu_shot_path(self) -> str:
         return os.path.join(tempfile.gettempdir(), "mimo-token-monitor-tray-menu.png")
+
+    def _log_tray_menu_resize(self) -> None:
+        """Timestamp every resize that disagrees with sizeHint (the anomaly moment)."""
+        menu = getattr(self, "_tray_menu", None)
+        if menu is None:
+            return
+        hint = menu.sizeHint()
+        margins = menu.contentsMargins()
+        dirty = margins.left() or margins.top() or margins.right() or margins.bottom()
+        if menu.size() == hint and not dirty:
+            return
+        self._write_tray_menu_probe(
+            f"resize={menu.width()}x{menu.height()} hint={hint.width()}x{hint.height()}"
+            f" margins={margins.left()},{margins.top()},{margins.right()},{margins.bottom()}"
+        )
 
     def _log_tray_menu_geometry(self, phase: str) -> None:
         """Record tray menu geometry whenever it exceeds sizeHint or has margins."""
@@ -1332,6 +1349,9 @@ class TokenWidget(QWidget):
         record += f" dpr_window={QApplication.instance().devicePixelRatio()}"
         record += f" native={self._popup_native_size(menu)}"
 
+        inflated = menu.isVisible() and (
+            geo.width() > hint.width() or geo.height() > hint.height()
+        )
         try:
             with open(self._tray_menu_log_path(), "a", encoding="utf-8") as handle:
                 handle.write(record + "\n")
@@ -1339,6 +1359,14 @@ class TokenWidget(QWidget):
                 menu.grab().save(self._tray_menu_shot_path())
         except OSError:
             pass
+
+        # Clearing margins does not shrink an already sized popup, so undo the
+        # inflation explicitly; otherwise this show keeps the blank strip.
+        if inflated:
+            menu.resize(hint)
+            self._write_tray_menu_probe(
+                f"corrected={geo.width()}x{geo.height()}->{hint.width()}x{hint.height()}"
+            )
 
     @staticmethod
     def _popup_native_size(menu: QMenu) -> str:

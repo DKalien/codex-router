@@ -257,6 +257,30 @@ class TestExitRuntime(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("event=startup", lines[0])
 
+    def test_tray_menu_geometry_correction_shrinks_inflated_popup(self):
+        import tempfile
+        with managed_widget({"position": [100, 100]}) as widget, \
+                tempfile.TemporaryDirectory() as tmpdir:
+            menu = widget._tray_menu
+            compact = menu.sizeHint()
+            with patch.object(TokenWidget, "_tray_menu_log_path",
+                              return_value=os.path.join(tmpdir, "anomaly.log")), \
+                    patch.object(TokenWidget, "_tray_menu_shot_path",
+                                 return_value=os.path.join(tmpdir, "shot.png")), \
+                    patch.object(TokenWidget, "_tray_menu_probe_path",
+                                 return_value=os.path.join(tmpdir, "probe.log")):
+                menu.setContentsMargins(0, 0, 16, 126)
+                menu.resize(menu.sizeHint())
+                menu.show()
+                QApplication.processEvents()
+                self.assertGreater(menu.geometry().height(), compact.height())
+                # 真实现场：几何已膨胀，但边距此时已为 0
+                menu.setContentsMargins(0, 0, 0, 0)
+                self.assertEqual(menu.sizeHint(), compact)
+                widget._log_tray_menu_geometry("shown")
+                self.assertEqual(menu.size(), compact)
+                menu.hide()
+
     def test_route_switch_actions_and_confirmed_selection(self):
         with managed_widget({"position": [100, 100]}) as widget:
             widget._tray_icon.showMessage = Mock()

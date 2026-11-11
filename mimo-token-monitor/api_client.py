@@ -362,12 +362,18 @@ def fetch_third_party_usage(base_url: str, api_key: str, window: str = "7d") -> 
     try:
         with requests.Session() as session:
             session.trust_env = False
-            resp = session.get(
-                url,
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=15,
-                allow_redirects=False,
-            )
+            for attempt in range(2):
+                try:
+                    resp = session.get(
+                        url,
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        timeout=15,
+                        allow_redirects=False,
+                    )
+                    break
+                except requests.exceptions.Timeout:
+                    if attempt:
+                        raise
         if resp.status_code in (301, 302, 303, 307, 308):
             return {
                 "ok": False,
@@ -393,12 +399,20 @@ def fetch_third_party_usage(base_url: str, api_key: str, window: str = "7d") -> 
                 "url": url,
             }
         return {"ok": True, "data": parsed, "error": None, "url": url}
+    except requests.exceptions.Timeout as exc:
+        reason = {
+            "ConnectTimeout": "连接超时",
+            "ReadTimeout": "读取响应超时",
+        }.get(type(exc).__name__, "请求超时")
+        return {"ok": False, "data": None,
+                "error": f"{reason}（15 秒，已重试 1 次）", "url": url}
     except requests.exceptions.ConnectionError:
         return {"ok": False, "data": None, "error": "网络连接失败", "url": url}
     except requests.exceptions.JSONDecodeError:
         return {"ok": False, "data": None, "error": "响应不是有效 JSON", "url": url}
-    except Exception as e:
-        return {"ok": False, "data": None, "error": str(e)[:100], "url": url}
+    except Exception as exc:
+        return {"ok": False, "data": None,
+                "error": f"请求或响应解析失败（{type(exc).__name__}）", "url": url}
     finally:
         if resp is not None:
             resp.close()

@@ -215,6 +215,74 @@ class _SelfRedirectServer(_LocalUsageServer):
 class TestThirdPartyUsageHardening(unittest.TestCase):
     """Issue #3 验收：URL 校验先行、拒绝重定向、错误不回显密钥。"""
 
+    @patch("api_client.requests.Session")
+    def test_wlb_timeout_retries_once_and_recovers(self, session):
+        import requests
+
+        client = session.return_value.__enter__.return_value
+        response = Mock(status_code=200)
+        response.json.return_value = {
+            "rate_limits": [{"window": "7d", "limit": 100, "used": 1}]
+        }
+        client.get.side_effect = [requests.exceptions.ReadTimeout("fake-secret-key"), response]
+
+        result = fetch_third_party_usage("https://example.test", "fake-secret-key")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client.get.call_count, 2)
+        self.assertIs(client.trust_env, False)
+        self.assertEqual(client.get.call_args_list[0], client.get.call_args_list[1])
+        self.assertEqual(client.get.call_args.kwargs["timeout"], 15)
+        self.assertIs(client.get.call_args.kwargs["allow_redirects"], False)
+        response.close.assert_called_once()
+
+    def test_wlb_timeout_retry_is_bounded_and_redacted(self):
+        import requests
+
+        cases = (
+            (requests.exceptions.ReadTimeout, "读取响应超时"),
+            (requests.exceptions.ConnectTimeout, "连接超时"),
+            (requests.exceptions.Timeout, "请求超时"),
+        )
+        for error_type, expected in cases:
+            with self.subTest(error=error_type.__name__), patch("api_client.requests.Session") as session:
+                client = session.return_value.__enter__.return_value
+                client.get.side_effect = error_type("fake-secret-key")
+
+                result = fetch_third_party_usage("https://example.test", "fake-secret-key")
+
+                self.assertFalse(result["ok"])
+                self.assertIn(expected, result["error"])
+                self.assertIn("已重试 1 次", result["error"])
+                self.assertNotIn("fake-secret-key", result["error"])
+                self.assertEqual(client.get.call_count, 2)
+
+    def test_wlb_non_timeout_errors_are_single_attempt_and_redacted(self):
+        import requests
+
+        for error in (requests.exceptions.ConnectionError("fake-secret-key"), RuntimeError("fake-secret-key")):
+            with self.subTest(error=type(error).__name__), patch("api_client.requests.Session") as session:
+                client = session.return_value.__enter__.return_value
+                client.get.side_effect = error
+
+                result = fetch_third_party_usage("https://example.test", "fake-secret-key")
+
+                self.assertFalse(result["ok"])
+                self.assertNotIn("fake-secret-key", result["error"])
+                client.get.assert_called_once()
+
+    def test_wlb_http_errors_are_single_attempt(self):
+        for status in (401, 403, 429, 500, 503):
+            with self.subTest(status=status), patch("api_client.requests.Session") as session:
+                response = Mock(status_code=status)
+                session.return_value.__enter__.return_value.get.return_value = response
+
+                result = fetch_third_party_usage("https://example.test", "fake-secret-key")
+
+                self.assertFalse(result["ok"])
+                session.return_value.__enter__.return_value.get.assert_called_once()
+                response.close.assert_called_once()
+
     def test_invalid_urls_fail_before_any_request(self):
         from usage_url import LOOPBACK_HTTP_ENV
 

@@ -306,6 +306,7 @@ class TestPlaywrightRecovery(unittest.TestCase):
             interactive=False,
             require_cookie_change=True,
         )
+        self.assertIn("Playwright 续期", w._mimo_error)
         w.close()
 
     def test_403_does_not_trigger_renewal_and_both_endpoint_errors_are_visible(self):

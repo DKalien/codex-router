@@ -3035,6 +3035,8 @@ class TokenWidget(QWidget):
         if bal_result["ok"] and usage_result["ok"]:
             self._playwright_recovery_attempted = False
         expired = any(result.get("auth_expired") for result in (bal_result, usage_result))
+        if expired and self._mimo_error:
+            self._mimo_error += "；请右键悬浮窗 →「Playwright 续期」重新登录 MiMo"
         if (
             expired
             and self.cfg.get("playwright_auto_refresh", True)

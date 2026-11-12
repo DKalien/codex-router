@@ -72,7 +72,8 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
   Node Router 在请求到来时刷新额度，默认缓存 30 秒；没有整机常驻定时器，悬浮窗也不参与额度决策。
   同一请求至多尝试三家、每家一次，只有明确额度失败且尚未输出时才继续降级，SuperGPT 为终点。
   自动模式的官方错误体限读 64 KiB；超限明确返回 502 且不继续降级，限内的原生非额度错误保留原始字节。
-  查询失败时保留已有档位；首次无法可靠判断则明确报错，不凭网络、认证或普通限流错误猜测额度。
+  查询失败时保留已有档位；首次无法可靠判断则返回 503，并写入脱敏的 `auto-route unavailable`
+  日志（含模型、是否子代理和错误链），不凭网络、认证或普通限流错误猜测额度。
   子代理可用 `route subagent auto` 按官方 GPT → SuperGPT 自动切换，阈值与主代理一致；WLB 不进入子代理自动循环。`codex-auto-review` 特殊模型继续使用官方。
 - **GPT 子代理**：已识别的原生 `gpt-*` 子代理默认走官方，普通请求和压缩请求
   共用规则，且不读取主代理的全局路由状态。可运行 `route subagent official|wlb|supergpt|auto|status`
@@ -101,6 +102,9 @@ Codex ──(官方模型目录 + config.toml: openai_base_url)──▶ router.
   第三方 reasoning 会被丢弃，不会作为未持久化的 `rs_*` item 继续回放。
 - **压缩历史**：第三方摘要必须完整且非空；HTTP 200 中的失败、不完整或空摘要
   返回 502，不生成替换历史，避免丢失续接上下文。省略 status 的有效摘要仍兼容。
+  部分中转即使 `stream=false` 也返回事件流：压缩响应先按 JSON 解析，失败后按
+  有界 SSE 事件取 `response.completed` / `response.failed`，`error` 事件作为上游
+  错误体统一翻译脱敏，不把解析失败误报成本地 502。
 - **错误和日志安全**：请求日志默认关闭；启用后会自动遮盖 HTTP/WS caller URL
   中的 capability。普通及压缩请求的第三方上游错误体最多读取 64 KiB，返回前会遮盖 Bearer、token、
   key、secret、caller capability、查询参数和控制字符；可解析的 quoted JSON 字段仍保留

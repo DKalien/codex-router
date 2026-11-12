@@ -150,6 +150,8 @@ version 1，并在每次写入时生成新 revision，兼容没有 revision 的�
 Node Router 在请求到来时刷新额度，默认缓存 30 秒；没有整机常驻定时器，悬浮窗也不参与额度决策。
 同一请求至多尝试三家、每家一次，只有明确额度失败且尚未输出时才继续降级，SuperGPT 为终点。
 查询失败时保留已有档位；首次无法可靠判断则明确报错，不凭网络、认证或普通限流错误猜测额度。
+无法定档而返回 503 时，路由器写入一条脱敏的 `auto-route unavailable` 日志（模型、
+是否子代理和错误链），因为该分支不经过通用错误日志。
 子代理 auto 按官方 GPT → SuperGPT 自动切换，阈值与主代理一致；WLB 不进入子代理自动循环。`codex-auto-review` 特殊模型继续使用官方。
 
 `status --json` 在自动模式返回 `gptRoute.mode="auto"`、`effectiveMode` 和脱敏的
@@ -183,7 +185,10 @@ Codex 后端；主代理或子代理选择 `wlb` 或 `supergpt` 时注入对应�
 `POST <provider base URL>/responses`。Codex 的账户和安装凭据不会发送给第三方
 服务商。数据流会直接透传；`/responses/compact` 使用相同的直连路径，并在需要时
 生成由路由器管理的续接摘要。摘要响应含 error、明确的非 completed 状态或空白
-摘要时返回 502，不生成替换历史；省略 status 但摘要有效时仍兼容。
+摘要时返回 502，不生成替换历史；省略 status 但摘要有效时仍兼容。部分中转即使
+`stream=false` 也返回事件流：路由器先按 JSON 解析，失败后按有界 SSE 事件取
+`response.completed` / `response.failed`，`error` 事件作为上游错误体交统一翻译
+与脱敏，避免解析失败被误报成本地 502。
 
 `GET /models` 和 `GET /v1/models` 始终使用官方身份透传到官方上游，并保留请求查询
 参数和官方完整响应元数据；WLB 和 SuperGPT 路由不会把模型列表替换成本地简化目录。没有当前

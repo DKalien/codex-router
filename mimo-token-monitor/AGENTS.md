@@ -66,7 +66,7 @@ Python 模块采用单目录扁平结构：
 - 内置 `PLAN_TIERS` 常量（4 个挡位：Lite ¥39 / Standard ¥99 / Pro ¥329 / Max ¥659），通过 `_get_plan_tier_info()` 根据套餐总额自动匹配挡位并计算每 Credit 单价，在悬浮窗内显示已用额度折合金额。
 - MiMo 余额为 0 时自动隐藏（包括右上角金额和 tooltip 余额行）；SuperGPT API余额为 0 时仍显示金额，进度条为空。
 - 系统托盘：`QSystemTrayIcon` 实现最小化到托盘，右上角绘制最小化按钮（`─`），双击托盘图标恢复窗口，托盘 tooltip 与悬浮窗同步更新；“重启悬浮窗”直接退出当前进程并在释放单实例锁后启动新进程。
-- 托盘菜单诊断由 `widget.py` 在弹出前归零非零边距，并在系统临时目录记录进程 probe 与异常几何信息，详见 [README 的诊断步骤](README.md#托盘菜单异常诊断)。注入边距的复现与真实偶发故障的触发原因须分开记录，后者仍待现场验证。
+- 托盘菜单诊断由 `widget.py` 在弹出前归零非零边距，并在系统临时目录记录进程 probe 与异常几何信息，详见 [README 的诊断步骤](README.md#托盘菜单异常诊断)。弹出后窗口大于 `sizeHint` 时缩回并按尺寸差移动同样的偏移，保持右下角托盘/任务栏锚点；小于 `sizeHint` 的屏幕边缘夹取不补偿。注入边距的复现与真实偶发故障的触发原因须分开记录，后者仍待现场验证。
 - Codex Router 维护：`router_control.py` 优先使用 `MIMO_TOKEN_MONITOR_ROUTER_ROOT`，否则按 `$CODEX_HOME`（默认 `~/.codex`）读取 `codex-router/install-manifest.json` 的 `current.sourceRoot`，并校验所需入口文件。状态调用 `node src/status.mjs --json`；主代理 GPT/WLB/SuperGPT 切换调用 `node src/gpt-route.mjs official|wlb|supergpt`，子代理供应商切换调用 `node src/gpt-route.mjs subagent official|wlb|supergpt|auto`，Pi 路由切换调用 `node src/gpt-route.mjs pi official|wlb|supergpt`（先检查 Router 已开启，不自动启停服务）；启停复用 `codex-router.ps1 enable|disable`；重启调用 `node src/service.mjs restart`。全部命令由 `RouterWorker` 后台串行执行，首个失败即停止，操作期间禁用路由菜单并阻止退出；托盘菜单关闭后的状态刷新延迟到事件循环下一轮，避免覆盖刚触发的操作。
 - 路由操作开始时，悬浮窗底部显示进行中状态，完成后显示成功或失败摘要并在 5 秒后清除；托盘通知仍保留，用于即时反馈。
 - 单实例：使用 Windows Mutex 防止重复启动，并通过命名事件唤醒已有窗口；禁止把第二次启动保留在阻塞提示框中。

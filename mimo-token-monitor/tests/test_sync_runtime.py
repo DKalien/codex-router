@@ -273,12 +273,52 @@ class TestExitRuntime(unittest.TestCase):
                 menu.resize(menu.sizeHint())
                 menu.show()
                 QApplication.processEvents()
-                self.assertGreater(menu.geometry().height(), compact.height())
+                menu.move(320, 480)
+                QApplication.processEvents()
+                inflated = menu.geometry()
+                self.assertGreater(inflated.height(), compact.height())
                 # 真实现场：几何已膨胀，但边距此时已为 0
                 menu.setContentsMargins(0, 0, 0, 0)
                 self.assertEqual(menu.sizeHint(), compact)
                 widget._log_tray_menu_geometry("shown")
-                self.assertEqual(menu.size(), compact)
+                corrected = menu.geometry()
+                self.assertEqual(corrected.size(), compact)
+                # 收缩必须保持弹窗右下角锚点，否则底边会离开任务栏
+                self.assertEqual(
+                    corrected.x(), inflated.x() + inflated.width() - compact.width()
+                )
+                self.assertEqual(
+                    corrected.y(), inflated.y() + inflated.height() - compact.height()
+                )
+                self.assertEqual(
+                    corrected.x() + corrected.width(), inflated.x() + inflated.width()
+                )
+                self.assertEqual(
+                    corrected.y() + corrected.height(), inflated.y() + inflated.height()
+                )
+                menu.hide()
+
+    def test_tray_menu_screen_clamped_popup_is_not_moved(self):
+        import tempfile
+        with managed_widget({"position": [100, 100]}) as widget, \
+                tempfile.TemporaryDirectory() as tmpdir:
+            menu = widget._tray_menu
+            hint = menu.sizeHint()
+            with patch.object(TokenWidget, "_tray_menu_log_path",
+                              return_value=os.path.join(tmpdir, "anomaly.log")), \
+                    patch.object(TokenWidget, "_tray_menu_shot_path",
+                                 return_value=os.path.join(tmpdir, "shot.png")), \
+                    patch.object(TokenWidget, "_tray_menu_probe_path",
+                                 return_value=os.path.join(tmpdir, "probe.log")):
+                # 屏幕边缘夹取导致的合法变小：比 sizeHint 小，不补偿位置
+                menu.resize(hint.width() - 20, hint.height() - 40)
+                menu.show()
+                QApplication.processEvents()
+                menu.move(300, 500)
+                QApplication.processEvents()
+                before = menu.geometry()
+                widget._log_tray_menu_geometry("shown")
+                self.assertEqual(menu.geometry(), before)
                 menu.hide()
 
     def test_route_switch_actions_and_confirmed_selection(self):

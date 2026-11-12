@@ -1250,6 +1250,11 @@ class TokenWidget(QWidget):
 
     def _on_tray_menu_about_to_show(self) -> None:
         """Normalize margins, prove the popup hook ran, then sample final geometry."""
+        menu = getattr(self, "_tray_menu", None)
+        if menu is not None:
+            # The popup hook only sees the pre-show widget size; keeping it in
+            # the anomaly record tells whether the next inflation started here.
+            self._tray_menu_pre_show_size = menu.size()
         self._normalize_tray_menu_geometry()
         if not getattr(self, "_tray_menu_probe_seen", False):
             self._tray_menu_probe_seen = True
@@ -1328,11 +1333,16 @@ class TokenWidget(QWidget):
         if not abnormal:
             return
 
+        pre_show = "?"
+        pre_show_size = getattr(self, "_tray_menu_pre_show_size", None)
+        if phase == "shown" and pre_show_size is not None:
+            pre_show = f"{pre_show_size.width()}x{pre_show_size.height()}"
         record = (
             f"{datetime.now().isoformat(timespec='seconds')} phase={phase}"
             f" geo={geo.x()},{geo.y()},{geo.width()}x{geo.height()}"
             f" hint={hint.width()}x{hint.height()}"
             f" content_h={content_bottom}"
+            f" pre_show={pre_show}"
             f" margins={margins.left()},{margins.top()},{margins.right()},{margins.bottom()}"
             f" actions={len(menu.actions())}"
         )
@@ -1362,10 +1372,20 @@ class TokenWidget(QWidget):
 
         # Clearing margins does not shrink an already sized popup, so undo the
         # inflation explicitly; otherwise this show keeps the blank strip.
+        # QWidget::resize() keeps the top-left corner, which would lift the
+        # bottom edge off the tray/taskbar anchor by the same delta, so move by
+        # that delta to keep the bottom-right corner where the popup put it.
+        # A popup smaller than sizeHint was legitimately clamped by the screen
+        # edge; it is not inflated, so its position is left alone.
         if inflated:
+            target_x = geo.x() + geo.width() - hint.width()
+            target_y = geo.y() + geo.height() - hint.height()
             menu.resize(hint)
+            menu.move(target_x, target_y)
+            final = menu.geometry()
             self._write_tray_menu_probe(
-                f"corrected={geo.width()}x{geo.height()}->{hint.width()}x{hint.height()}"
+                f"corrected={geo.width()}x{geo.height()}@{geo.x()},{geo.y()}"
+                f"->{final.width()}x{final.height()}@{final.x()},{final.y()}"
             )
 
     @staticmethod

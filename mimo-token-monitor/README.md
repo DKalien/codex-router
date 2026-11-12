@@ -253,13 +253,17 @@ python -m PyInstaller MiMo-Token-Monitor.spec --clean
 
 ### 托盘菜单异常诊断
 
-托盘父菜单每次弹出前将非零 `contentsMargins` 归零。注入边距的回归测试已通过，真实偶发空白的触发原因仍待现场证据确认。
+托盘父菜单每次弹出前将非零 `contentsMargins` 归零。若弹出后窗口仍大于 `sizeHint`（历史现场为
+`196x328` vs `180x200`），会把窗口缩回 `sizeHint` 并按尺寸差移动同样的偏移，保持弹窗右下角
+仍贴在原来的托盘/任务栏锚点上；`QWidget::resize()` 只改尺寸、不动左上角，单独收缩会让底边上移，
+表现为菜单悬空。比 `sizeHint` 小的弹窗属于屏幕边缘合法夹取，不做位置补偿。
+注入边距的回归测试已通过，真实偶发膨胀的触发原因仍待现场证据确认。
 诊断文件位于系统临时目录，Windows 可在 PowerShell 执行 `[IO.Path]::GetTempPath()` 查看位置。
 
 | 文件 | 写入时机与内容 |
 | --- | --- |
-| `mimo-token-monitor-tray-menu-probe-<pid>.log` | 当前进程的启动 `startup`、菜单显示 `menu-show`、首次弹出钩子 `first-popup` 事件 |
-| `mimo-token-monitor-tray-menu.log` | 检测到异常时追加 Qt 尺寸、`sizeHint`、条目底部、边距、样式、屏幕/DPR 和 Windows 原生窗口尺寸 |
+| `mimo-token-monitor-tray-menu-probe-<pid>.log` | 当前进程的启动 `startup`、菜单显示 `menu-show`、首次弹出钩子 `first-popup`、边距归零 `margins-before-popup`，以及收缩补偿 `corrected=旧尺寸@旧位置->新尺寸@新位置` |
+| `mimo-token-monitor-tray-menu.log` | 检测到异常时追加 Qt 尺寸、`sizeHint`、条目底部、弹出前控件尺寸 `pre_show`、边距、样式、屏幕/DPR 和 Windows 原生窗口尺寸 |
 | `mimo-token-monitor-tray-menu.png` | 菜单显示时检测到异常才截取菜单，覆盖上次异常图片 |
 
 菜单再次出现底部空白时，记录发生时间并查看对应进程的 probe 文件，确认当前版本的菜单钩子是否运行，

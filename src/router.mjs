@@ -1080,7 +1080,14 @@ async function summarize(request, payload, route, signal) {
   const body = {
     ...payload,
     model: route.upstreamModel,
-    stream: false,
+    // Always stream the summarization even when the caller asked for a
+    // non-streaming compaction. Non-streaming support is not universal: the
+    // SuperGPT relay answers `stream: false` with HTTP 200 plus an SSE error
+    // event ("The request could not be completed"), and a replay of a nearly
+    // full context is exactly where a gateway that buffers the whole response
+    // runs into its own timeout. `parseCompactResponse` already accepts both
+    // shapes, so the final `response.completed` event yields the summary.
+    stream: true,
     // An empty tool list already disables tool use on every forwarder, and
     // xAI rejects tool_choice "none" paired with it, so the field is omitted
     // rather than sent redundantly.

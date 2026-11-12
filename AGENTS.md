@@ -124,9 +124,10 @@
 - SSE 用量解析缓存单事件最多 8 MiB，超限仍按字节透传并跳过该事件解析。
 - 第三方压缩必须拒绝失败、不完整或空摘要，不得返回替换历史；普通及压缩请求的
   上游错误统一限读 64 KiB 并脱敏。响应流及缓冲读取均遵循闲置超时和请求取消。
-  部分中转即使 `stream=false` 也返回 SSE：压缩响应必须先尝试 JSON，失败后按
-  有界 SSE 事件取 `response.completed`/`response.failed`，`error` 事件作为上游
-  错误体交统一翻译，禁止让解析失败冒泡成本地 502。
+  压缩摘要请求始终使用 `stream=true`：SuperGPT 对 `stream=false` 直接返回 200 +
+  SSE `error` 事件，且接近满上下文的非流式请求会撞上网关超时。压缩响应必须先
+  尝试 JSON，失败后按有界 SSE 事件取 `response.completed`/`response.failed`，
+  `error` 事件作为上游错误体交统一翻译，禁止让解析失败冒泡成本地 502。
 - 切回原生 GPT 时，只能回放 `encrypted_content` 符合原生 `gAAAAA...` token
   形状的 `reasoning`；其他服务商的 reasoning 必须整项丢弃，合法项也必须移除仅
   用于输出的 `content`，避免 `store=false` 下引用未持久化的外部 item。

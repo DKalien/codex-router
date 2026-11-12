@@ -1561,6 +1561,8 @@ test("SuperGPT 原名路由隔离凭据，支持 JSON/SSE/压缩，子代理和�
   const received = [];
   const catalog = { models: [{ slug: "gpt-future", future_capability: true }] };
   const sse = 'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":4,"output_tokens":2}}}\n\n';
+  // 压缩摘要现在固定走流式，测试上游必须给出带摘要的完成事件。
+  const compactSse = 'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"摘要"}]}]}}\n\n';
   const upstream = (provider) => http.createServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
@@ -1576,8 +1578,9 @@ test("SuperGPT 原名路由隔离凭据，支持 JSON/SSE/压缩，子代理和�
       response.writeHead(404, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ error: { message: "Model not supported" } }));
     } else if (body.stream) {
+      const compaction = JSON.stringify(body.input?.at(-1)?.content ?? "").includes("CONTEXT CHECKPOINT COMPACTION");
       response.writeHead(200, { "Content-Type": "text/event-stream" });
-      response.end(sse);
+      response.end(compaction ? compactSse : sse);
     } else {
       response.writeHead(200, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "摘要" }] }] }));
@@ -1744,6 +1747,44 @@ test("审计：SSE 压缩响应不会解析崩溃，错误体脱敏透传", asyn
     const completed = await send();
     assert.equal(completed.status, 200);
     assert.match(JSON.stringify(await completed.json()), /sse summary/);
+  } finally { await router.close(); await close(upstream); }
+});
+
+test("审计：第三方压缩始终以流式请求摘要", async () => {
+  const requests = [];
+  // SuperGPT 对 stream=false 返回 HTTP 200 + SSE 错误事件，无论请求大小；
+  // 只有流式请求才会真正生成摘要。压缩摘要必须走流式。
+  const upstream = http.createServer(async (request, response) => {
+    let raw = "";
+    for await (const chunk of request) raw += chunk;
+    const parsed = JSON.parse(raw);
+    requests.push(parsed);
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    if (parsed.stream !== true) {
+      response.end('event: error\ndata: {"error":{"code":"server_error","message":"The request could not be completed. Please try again later."},"type":"error"}\n\n');
+      return;
+    }
+    response.end('event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"streamed summary"}]}]}}\n\n');
+  });
+  const port = await listen(upstream);
+  const router = await startRouter({ SUPERGPT_BASE_URL: `http://127.0.0.1:${port}`, SUPERGPT_API_KEY: "test-key" });
+  writeFileSync(path.join(router.stateDir, "gpt-route.json"), JSON.stringify({ version: 1, route: "supergpt" }));
+  const send = (endpoint, body) => fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/${endpoint}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  try {
+    const input = [{ role: "user", content: "continue" }];
+    const compact = await send("responses/compact", { model: "gpt-test", stream: false, input });
+    assert.equal(compact.status, 200);
+    assert.match(JSON.stringify(await compact.json()), /streamed summary/);
+    assert.equal(requests.at(-1).stream, true, "non-streaming caller must still summarize over SSE");
+    assert.equal(requests.at(-1).input.at(-1).content[0].text.includes("CONTEXT CHECKPOINT COMPACTION"), true);
+
+    const triggered = await send("responses", { model: "gpt-test", stream: true, input: [...input, { type: "compaction_trigger" }] });
+    assert.equal(triggered.status, 200);
+    await triggered.text();
+    assert.equal(requests.at(-1).stream, true);
+    assert.equal(requests.at(-1).input.some((item) => item?.type === "compaction_trigger"), false);
   } finally { await router.close(); await close(upstream); }
 });
 

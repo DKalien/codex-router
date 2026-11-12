@@ -30,6 +30,7 @@ import {
   writeJson,
   zstdFrameContentSize,
 } from "./http-utils.mjs";
+import { SseEventBuffer, parseSseEvent } from "./sse-events.mjs";
 import {
   NATIVE_CATALOG_PATH,
   PORTS,
@@ -1037,6 +1038,29 @@ function extractResponseText(payload) {
   return text.join("\n");
 }
 
+// 部分中转即使 stream=false 也返回 SSE：成功时取最终 response 事件，
+// 失败时把 error 事件作为上游错误体交回调用方统一脱敏，避免解析崩溃。
+function parseCompactResponse(bytes) {
+  try {
+    return JSON.parse(bytes.toString("utf8"));
+  } catch {
+    let parsed;
+    let overflow = false;
+    const events = new SseEventBuffer((event) => {
+      const payload = parseSseEvent(event);
+      if (!payload) return;
+      if (payload.type === "response.completed" || payload.type === "response.failed") {
+        parsed = payload.response;
+      } else if (payload.type === "error" || payload.error) {
+        parsed = { error: payload.error ?? payload };
+      }
+    }, () => { overflow = true; });
+    events.write(bytes);
+    events.end();
+    return overflow ? undefined : parsed;
+  }
+}
+
 async function summarize(request, payload, route, signal) {
   const originalInput = Array.isArray(payload.input) ? payload.input : [];
   // Compaction replays the whole conversation, so any image still in it would
@@ -1109,10 +1133,13 @@ async function summarize(request, payload, route, signal) {
     }
     throw error;
   }
-  const bodyText = bytes.toString("utf8");
-  const parsed = JSON.parse(bodyText);
+  const parsed = parseCompactResponse(bytes);
+  if (parsed?.error) {
+    // SSE 错误事件没有 HTTP 状态码，按上游失败返回，交给统一翻译与脱敏。
+    return { ok: false, status: 502, bodyText: JSON.stringify({ error: parsed.error }) };
+  }
   const summary = extractResponseText(parsed);
-  if (parsed?.error || (parsed?.status !== undefined && parsed.status !== "completed") || !summary.trim()) {
+  if ((parsed?.status !== undefined && parsed.status !== "completed") || !summary.trim()) {
     return {
       ok: false, status: 502,
       payload: { error: { type: "invalid_compaction", message: "The provider did not return a complete, non-empty summary; conversation history was not replaced." } },

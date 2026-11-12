@@ -1715,6 +1715,38 @@ test("审计：失败或空摘要不能替换压缩历史", async () => {
   } finally { await router.close(); await close(upstream); }
 });
 
+test("审计：SSE 压缩响应不会解析崩溃，错误体脱敏透传", async () => {
+  let contentType = "application/json";
+  let body = "{}";
+  const upstream = http.createServer(async (request, response) => {
+    for await (const _ of request) {}
+    response.writeHead(200, { "Content-Type": contentType });
+    response.end(body);
+  });
+  const port = await listen(upstream);
+  const router = await startRouter({ SUPERGPT_BASE_URL: `http://127.0.0.1:${port}`, SUPERGPT_API_KEY: "test-key" });
+  writeFileSync(path.join(router.stateDir, "gpt-route.json"), JSON.stringify({ version: 1, route: "supergpt" }));
+  const send = () => fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/responses/compact`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "gpt-test", input: [{ role: "user", content: "continue" }] }),
+  });
+  try {
+    contentType = "text/event-stream";
+    body = 'event: error\ndata: {"error":{"code":"server_error","message":"upstream unavailable"},"type":"error"}\n\n';
+    const failed = await send();
+    assert.equal(failed.status, 502);
+    const failedBody = await failed.json();
+    assert.equal(failedBody.error.type, "server_error");
+    assert.match(failedBody.error.message, /upstream unavailable/);
+    assert.equal(failedBody.output, undefined, "failed compaction must not supply replacement history");
+
+    body = 'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"sse summary"}]}]}}\n\n';
+    const completed = await send();
+    assert.equal(completed.status, 200);
+    assert.match(JSON.stringify(await completed.json()), /sse summary/);
+  } finally { await router.close(); await close(upstream); }
+});
+
 test("审计：压缩错误和普通错误一致脱敏并保留 Retry-After", async () => {
   const secret = "sk-audit-placeholder-00000000000000000000";
   const upstream = http.createServer(async (request, response) => {

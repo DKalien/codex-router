@@ -489,6 +489,263 @@ test("透明转发：原生 compact 拒绝失败、不完整、空和超限结�
   } finally { await router.close(); await close(upstream); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test("原生 v2：分片多行 SSE 保持原字节，失败终态不会交付压缩历史", async () => {
+  const output = [{ type: "compaction", encrypted_content: "public-v2-fixture" }];
+  const completed = `event: response.completed\r\ndata: {"type":"response.completed",\r\ndata: "response":${JSON.stringify({ status: "completed", output })}}\r\n\r\n`;
+  const lateError = `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "fixture_error", message: "test-wlb-key" } })}\n\n`;
+  let bytes;
+  const received = [];
+  const upstream = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    received.push({ url: request.url, body: JSON.parse(Buffer.concat(chunks)) });
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    for (let offset = 0; offset < bytes.length; offset += 7) {
+      response.write(bytes.subarray(offset, offset + 7));
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    response.end();
+  });
+  const port = await listen(upstream);
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-v2-sse-"));
+  const router = await startRouter({
+    MODEL_ROUTER_REGISTRY: writeCompatibilityRegistry(directory, { summarizeCompaction: false }),
+    WLB_BASE_URL: `http://127.0.0.1:${port}`, WLB_API_KEY: "test-wlb-key",
+    CODEX_ROUTER_NATIVE_RETRIES: "0", CODEX_NATIVE_BASE_URL: "http://127.0.0.1:1",
+    CODEX_ROUTER_SESSIONS_PATH: "", CODEX_ROUTER_SESSION_INDEX: "",
+  });
+  writeFileSync(path.join(router.stateDir, "gpt-route.json"), JSON.stringify({ version: 1, route: "wlb" }));
+  const payload = { model: "gpt-v2-fixture", input: [{ role: "user", content: "公开合成事实" }, { type: "compaction_trigger" }], stream: true, store: false, max_output_tokens: 64 };
+  try {
+    const cases = [
+      { name: "success", body: `: 公开合成注释\r\n\r\n${completed}data: [DONE]\n\n`, status: 200 },
+      { name: "progress-and-duplicate-completed", body: 'data: {"type":"response.created","response":{"status":"in_progress"}}\n\ndata: {"type":"response.in_progress","response":{"status":"in_progress"}}\n\ndata: {"type":"response.compaction.compacting"}\n\n' + completed + completed, status: 200 },
+      { name: "completed-then-error", body: completed + lateError, status: 502 },
+      { name: "failed", body: `data: ${JSON.stringify({ type: "response.failed", response: { status: "failed", output } })}\n\n`, status: 502 },
+      { name: "incomplete", body: `data: ${JSON.stringify({ type: "response.incomplete", response: { status: "incomplete", output } })}\n\n`, status: 502 },
+      { name: "empty", body: 'data: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\n', status: 502 },
+    ];
+    for (const type of ["response.failed", "response.incomplete", "response.cancelled"]) {
+      // 终态事件类型本身即代表失败，缺少 status 也不能被后续成功覆盖。
+      const failed = `data: ${JSON.stringify({ type, response: { output } })}\n\n`;
+      cases.push({ name: `${type}-then-completed`, body: failed + completed, status: 502 });
+      cases.push({ name: `completed-then-${type}`, body: completed + failed, status: 502 });
+    }
+    for (const status of ["failed", "incomplete", "cancelled", "in_progress"]) {
+      const invalid = `data: ${JSON.stringify({ type: "response.completed", response: { status, output } })}\n\n`;
+      cases.push({ name: `${status}-then-completed`, body: invalid + completed, status: 502 });
+      cases.push({ name: `completed-then-${status}`, body: completed + invalid, status: 502 });
+    }
+    const headerFailures = [
+      { name: "event-error", body: '\uFEFFevent:error\r\ndata: {"message":"test-wlb-key"}\r\n\r\n' },
+      { name: "event-error-invalid-json", body: 'event: error\ndata: not JSON test-wlb-key\n\n' },
+      { name: "event-error-without-data", body: 'event: error\n\n' },
+      { name: "event-error-data-completed", body: `event: error\ndata: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output } })}\n\n` },
+      { name: "event-completed-data-error", body: 'event: response.completed\ndata: {"type":"error","message":"test-wlb-key"}\n\n' },
+    ];
+    for (const type of ["response.failed", "response.incomplete", "response.cancelled"]) {
+      headerFailures.push({ name: `event-${type}`, body: `event:${type}\rdata: ${JSON.stringify({ response: { output } })}\r\r` });
+    }
+    for (const failed of headerFailures) {
+      cases.push({ name: `${failed.name}-then-completed`, body: failed.body + completed, status: 502 });
+      cases.push({ name: `completed-then-${failed.name}`, body: completed + failed.body, status: 502 });
+    }
+    cases.push({
+      name: "event-only-progress-and-completed",
+      body: '\uFEFFevent:response.created\r\ndata: {"response":{"status":"in_progress"}}\r\n\r\nevent: response.compaction.compacting\ndata: {}\n\n' +
+        `event: response.completed\r\ndata: {"response":\r\ndata: ${JSON.stringify({ status: "completed", output })}}\r\n\r\n`,
+      status: 200,
+    });
+    for (const scenario of cases) {
+      bytes = Buffer.from(scenario.body);
+      const before = received.length;
+      const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/responses?fixture=native-v2`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+      });
+      const actual = Buffer.from(await response.arrayBuffer());
+      assert.equal(response.status, scenario.status, scenario.name);
+      assert.equal(received.length, before + 1, "失败不会重试或发起回放");
+      assert.equal(received.at(-1).url, "/responses?fixture=native-v2");
+      assert.deepEqual(received.at(-1).body, payload);
+      if (scenario.status === 200) assert.deepEqual(actual, bytes);
+      else {
+        const result = JSON.parse(actual);
+        assert.ok(result.error, scenario.name);
+        assert.equal(result.output, undefined);
+        assert.equal(actual.includes(Buffer.from("public-v2-fixture")), false);
+        assert.equal(actual.includes(Buffer.from("test-wlb-key")), false);
+      }
+    }
+  } finally { await router.close(); await close(upstream); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("原生 v2：独立验证 32 MiB 响应和 8 MiB SSE 事件边界", async () => {
+  const output = [{ type: "compaction", encrypted_content: "public-v2-fixture" }];
+  const completed = `data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output } })}\n\n`;
+  let bytes;
+  let contentType;
+  let requests = 0;
+  const upstream = http.createServer(async (request, response) => {
+    for await (const _ of request) {}
+    requests += 1;
+    response.writeHead(200, { "Content-Type": contentType });
+    response.end(bytes);
+  });
+  const port = await listen(upstream);
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-v2-bounds-"));
+  const router = await startRouter({
+    MODEL_ROUTER_REGISTRY: writeCompatibilityRegistry(directory, { summarizeCompaction: false }),
+    WLB_BASE_URL: `http://127.0.0.1:${port}`, WLB_API_KEY: "test-wlb-key",
+    CODEX_ROUTER_NATIVE_RETRIES: "0", CODEX_NATIVE_BASE_URL: "http://127.0.0.1:1",
+    CODEX_ROUTER_SESSIONS_PATH: "", CODEX_ROUTER_SESSION_INDEX: "",
+  });
+  writeFileSync(path.join(router.stateDir, "gpt-route.json"), JSON.stringify({ version: 1, route: "wlb" }));
+  try {
+    for (const limit of ["response", "event"]) {
+      contentType = limit === "response" ? "application/json" : "text/event-stream";
+      // 合法成功尾部保证拒绝来自限读，超大 SSE 注释之后也不能恢复交付历史。
+      bytes = limit === "response"
+        ? Buffer.concat([Buffer.alloc(32 * 1024 * 1024 + 1, 0x20), Buffer.from(JSON.stringify({ status: "completed", output }))])
+        : Buffer.concat([Buffer.from(": "), Buffer.alloc(8 * 1024 * 1024, 0x78), Buffer.from("\n\n" + completed)]);
+      const before = requests;
+      const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/responses`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "gpt-v2-fixture", input: [{ type: "compaction_trigger" }], stream: true, store: false }),
+      });
+      const result = await response.json();
+      assert.equal(response.status, 502, limit);
+      assert.ok(result.error, limit);
+      assert.equal(result.output, undefined);
+      assert.equal(requests, before + 1, "超限不会重试或发起回放");
+    }
+  } finally { await router.close(); await close(upstream); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("原生 v2：error 后的 completed 不得覆盖先前失败并交付压缩历史", async () => {
+  const output = [{ type: "compaction", encrypted_content: "public-v2-fixture" }];
+  const error = 'event: error\ndata: {"type":"error","error":{"type":"fixture_error","message":"public failure"}}\n\n';
+  const completed = `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output } })}\n\n`;
+  const upstream = http.createServer(async (request, response) => {
+    for await (const _ of request) {}
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(error + completed);
+  });
+  const port = await listen(upstream);
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-v2-terminal-error-"));
+  const router = await startRouter({
+    MODEL_ROUTER_REGISTRY: writeCompatibilityRegistry(directory, { summarizeCompaction: false }),
+    WLB_BASE_URL: `http://127.0.0.1:${port}`, WLB_API_KEY: "test-wlb-key",
+    CODEX_ROUTER_NATIVE_RETRIES: "0", CODEX_NATIVE_BASE_URL: "http://127.0.0.1:1",
+    CODEX_ROUTER_SESSIONS_PATH: "", CODEX_ROUTER_SESSION_INDEX: "",
+  });
+  writeFileSync(path.join(router.stateDir, "gpt-route.json"), JSON.stringify({ version: 1, route: "wlb" }));
+  try {
+    const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/responses`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "gpt-v2-fixture", input: [{ type: "compaction_trigger" }], stream: true, store: false }),
+    });
+    const text = await response.text();
+    assert.equal(response.status, 502, "上游已报告 error，后续 completed 不能解除失败状态");
+    assert.equal(JSON.parse(text).output, undefined);
+    assert.equal(text.includes("public-v2-fixture"), false);
+  } finally { await router.close(); await close(upstream); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("压缩 SSE：摘要的失败状态不可被完成覆盖，正常完成保留替换历史", async () => {
+  const summary = "public completed summary";
+  const output = [{ type: "message", role: "assistant", content: [{ type: "output_text", text: summary }] }];
+  const error = { type: "fixture_error", code: "fixture_failure", message: "test-summary-key" };
+  const completed = `data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output } })}\n\n`;
+  const errorEvent = `data: ${JSON.stringify({ type: "error", error })}\n\n`;
+  let body;
+  let contentType;
+  const received = [];
+  const upstream = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    received.push(JSON.parse(Buffer.concat(chunks)));
+    response.writeHead(200, { "Content-Type": contentType });
+    response.end(body);
+  });
+  const port = await listen(upstream);
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-summary-terminal-"));
+  const router = await startRouter({
+    MODEL_ROUTER_REGISTRY: writeCompatibilityRegistry(directory, { summarizeCompaction: true }),
+    SUPERGPT_BASE_URL: `http://127.0.0.1:${port}`, SUPERGPT_API_KEY: "test-summary-key",
+    CODEX_ROUTER_NATIVE_RETRIES: "0", CODEX_NATIVE_BASE_URL: "http://127.0.0.1:1",
+    CODEX_ROUTER_SESSIONS_PATH: "", CODEX_ROUTER_SESSION_INDEX: "",
+  });
+  writeFileSync(path.join(router.stateDir, "gpt-route.json"), JSON.stringify({ version: 1, route: "supergpt" }));
+  try {
+    const cases = [
+      { name: "progress-and-completed", body: 'data: {"type":"response.created","response":{"status":"in_progress"}}\n\n: keepalive\n\ndata: {"type":"response.compaction.compacting"}\n\n' + completed + completed, status: 200 },
+      { name: "error-then-completed", body: errorEvent + completed, status: 502, error: true },
+      { name: "completed-then-error", body: completed + errorEvent, status: 502, error: true },
+      { name: "nested-error-then-completed", body: `data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", error, output } })}\n\n` + completed, status: 502, error: true },
+      { name: "json-error", body: JSON.stringify({ error, output }), status: 502, error: true, json: true },
+      { name: "json-success", body: JSON.stringify({ status: "completed", output }), status: 200, json: true },
+    ];
+    for (const status of ["failed", "incomplete", "cancelled"]) {
+      const failed = `data: ${JSON.stringify({ type: `response.${status}`, response: { status, output } })}\n\n`;
+      cases.push({ name: `${status}-then-completed`, body: failed + completed, status: 502 });
+      cases.push({ name: `completed-then-${status}`, body: completed + failed, status: 502 });
+    }
+    const headerFailures = [
+      { name: "event-error", body: '\uFEFFevent:error\r\ndata: {"message":"test-summary-key"}\r\n\r\n' },
+      { name: "event-error-invalid-json", body: 'event: error\ndata: not JSON test-summary-key\n\n' },
+      { name: "event-error-data-completed", body: `event: error\ndata: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output } })}\n\n` },
+      { name: "event-completed-data-error", body: `event: response.completed\ndata: ${JSON.stringify({ type: "error", error })}\n\n` },
+    ];
+    for (const type of ["response.failed", "response.incomplete", "response.cancelled"]) {
+      headerFailures.push({ name: `event-${type}`, body: `event:${type}\rdata: ${JSON.stringify({ response: { output } })}\r\r` });
+    }
+    for (const failed of headerFailures) {
+      cases.push({ name: `${failed.name}-then-completed`, body: failed.body + completed, status: 502 });
+      cases.push({ name: `completed-then-${failed.name}`, body: completed + failed.body, status: 502 });
+    }
+    cases.push({
+      name: "event-only-progress-and-completed",
+      body: '\uFEFFevent:response.created\r\ndata: {"response":{"status":"in_progress"}}\r\n\r\nevent: response.in_progress\ndata: {}\n\n' +
+        `event: response.completed\r\ndata: {"response":\r\ndata: ${JSON.stringify({ status: "completed", output })}}\r\n\r\n`,
+      status: 200,
+    });
+    for (const v2 of [false, true]) {
+      for (const scenario of cases) {
+        body = scenario.body;
+        contentType = scenario.json ? "application/json" : "text/event-stream";
+        const input = [{ role: "user", content: "public fixture" }];
+        if (v2) input.push({ type: "compaction_trigger" });
+        const before = received.length;
+        const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/responses${v2 ? "" : "/compact"}`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "gpt-summary-fixture", stream: false, store: false, input }),
+        });
+        const text = await response.text();
+        const label = `${v2 ? "v2" : "v1"}/${scenario.name}`;
+        assert.equal(response.status, scenario.status, label);
+        assert.equal(received.length, before + 1, "摘要失败不会重试或回放");
+        assert.equal(received.at(-1).stream, true);
+        assert.equal(received.at(-1).input.some((item) => item.type === "compaction_trigger"), false);
+        assert.equal(text.includes("test-summary-key"), false, label);
+        assert.equal(router.stderr().includes("test-summary-key"), false, label);
+        if (scenario.status === 200) {
+          assert.ok(text.includes(v2 ? "kcr1:" + Buffer.from(summary).toString("base64") : summary), label);
+        } else {
+          const result = JSON.parse(text);
+          assert.ok(result.error, label);
+          assert.equal(result.output, undefined, label);
+          assert.equal(text.includes(summary), false, label);
+          assert.equal(text.includes("kcr1:"), false, label);
+          if (scenario.error) {
+            assert.equal(result.error.type, error.type, label);
+            assert.equal(result.error.code, error.code, label);
+          }
+        }
+      }
+    }
+  } finally { await router.close(); await close(upstream); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("透明转发：注册表验证兼容项名称与 boolean 类型", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-compatibility-schema-"));
   try {

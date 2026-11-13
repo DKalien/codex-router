@@ -332,3 +332,194 @@ compact 成功体先按 32 MiB 总量读取、解析 JSON/SSE，并要求无解�
 路由、服务 PID、caller secret 及凭据候选文件前后哈希一致，登记服务进程仍存活。
 文档 JSON 示例、相对链接、HTTPS 来源 URL 和新增内容的明显秘密模式检查通过，
 `git diff --check` 通过。未暂存或提交文件，Issue #5 继续 open。
+
+## 2026-11-13 离线 v2 边界补充（修复前记录）
+
+前两轮记录已以 `47ea2d9fedfe2d33cbb0df4e9420a15e55d04f66` 单独提交并推送，
+该提交仅含本审计文档。以下保留离线调查的修复前结果，后续 P2 修复和事件头补强
+已通过审核，见后两节。
+
+新增测试复用 `test/router-fixes.mjs` 的临时 Router、注册表及清理流程，只连接回环
+mock，显式关闭摘要兼容与重试，使用假凭据，官方目标固定为无服务的回环地址。
+input 仅为公开合成事实及末尾 trigger，真实供应商生成、回放和额度查询均为 0 次。
+
+| 专项 | 新增覆盖 | 结果 |
+| --- | --- | --- |
+| 分片 SSE 与历史安全 | 7 字节写入、多行 data、CRLF/LF、UTF-8 注释、完成响应及 DONE；input 和查询参数保留，成功字节相同 | 通过 |
+| 失败终态 | completed 后 error、独立 failed/incomplete、空 output；拒绝交付 compaction、错误脱敏、单次上游请求 | 通过 |
+| v2 独立限读 | 大于 32 MiB 的合法 JSON（空白前缀加有效 compaction）；大于 8 MiB 的 SSE 注释事件后接有效 completed | 通过，均为 502，无 output，不重试或回放 |
+| error 后 completed | 上游先报告 error，再追加含有效 compaction 的 completed | 新增回归失败，预期 502，实际 200 |
+
+最后一项为当时本地复现并交由 P2 Review 的容错缺陷。构造的是相互矛盾的 SSE 顺序，
+未在真实供应商响应中观察到。最小公开复现如下，字符串仅为合成占位值。
+
+```text
+event: error
+data: {"type":"error","error":{"type":"fixture_error","message":"public failure"}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"compaction","encrypted_content":"public-v2-fixture"}]}}
+
+```
+
+修复前 `parseCompactResponse` 将解析结果反复赋给 `parsed`，后续 completed 覆盖先前
+error，原生 v2 校验因此接受结果并交付压缩历史。反向顺序 completed 后 error 已验证
+拒绝。该解析函数还供摘要路径共用，摘要路径存在同类风险，但本轮未另做摘要复现。
+建议后续在共享解析函数中保留已观察到的错误状态，并验证两种顺序、failed/incomplete
+与成功路径。本轮按授权保留失败回归，生产业务代码未修改，测试未标记 skip 或 todo。
+
+执行 `node --test --test-name-pattern="原生 v2：" test/router-fixes.mjs`，3 项中 2 通过、
+1 失败、0 跳过；执行 `node --test test/router-fixes.mjs`，43 项中 42 通过、1 失败、
+0 跳过，原有 40 项全部通过。两次唯一失败均为上述新增 error 后 completed 回归，
+属于已复现的代码行为差异。`npm run check` 通过，仅有已有 npm store-dir 配置警告。
+本轮未重跑完整 `npm test`，历史 Windows CIM 权限失败及单项复验记录仍见前文。
+文档 JSON 示例、相对链接、HTTPS 来源 URL、敏感内容检查及 `git diff --check` 通过。
+17 个正式配置、路由、凭据候选及服务状态文件前后哈希一致，登记服务仍存活。
+离线调查收尾时，新增测试和本节均未暂存或提交。随后完成的修复及审核结果见后两节。
+
+### 供应商支持询证附录
+
+以下内容可直接作为非敏感支持问题，尚未发送。观测日期均为 2026-11-13（UTC+08），
+本摘录未保存秒级时间和请求编号。请求字段描述用于复核 schema，原始响应、密文、
+账户信息及密钥均省略。所有上下文为短公开合成数据。
+
+WLB 使用 `gpt-5.6-luna`，目标为 `https://codex.wlbclub.com`。
+
+- 直接 `POST /responses/compact`，正文含 model、input、instructions，极小合成上下文，
+  返回 502 JSON，`code=sub2_unavailable`、`type=api_error`。请确认该端点、模型及套餐
+  的支持范围、最小 schema，并说明错误发生层次及代码定义，是否存在临时通道异常。
+- 直接 `POST /responses`，input 为一条 user 消息加末尾 compaction_trigger，
+  `stream=true`、`store=false`、`max_output_tokens=64`，完成并报告 output_tokens=55；
+  同供应商一次 max32 回放完成，报告 5。请确认接受 max64 的校验及压缩预算规则，
+  与 OpenAI 专项最小 20000 的差异，给出当前模型适用的输出或费用硬上限和公开依据。
+
+SuperGPT 使用 `gpt-5.6-sol`，目标为 `https://api.supergpt.dev/v1`。
+
+- 直接 `POST /responses/compact`，同型最小 model/input/instructions schema，返回
+  502 JSON，未取得可记录的 code/type/param。请确认端点与当前模型支持、所需参数，
+  以及如何区分端点、分组权限和上游通道故障。
+- 普通 `POST /responses` 设置 `stream=false` 时，直连及隔离 Router 均为 HTTP 200
+  加 SSE `server_error`。请确认是否支持非流式 JSON，若仅支持流式应使用何种请求契约，
+  该错误是否可能产生费用，以及错误事件与 HTTP 状态的约定。
+- trigger v2 使用上述单条 user 消息加末尾 trigger，`stream=true`、`store=false`、
+  `max_output_tokens=64`，200 SSE completed，生成 compaction，output_tokens=67。
+  请说明 67 的组成、是否汇总独立压缩过程、max64 的实际处理方式，以及与专项最小
+  20000 的差异。该请求未回放，请提供当前模型的预算硬上限与支持文档。
+- 请列明 compact v1/v2 的输入、输出、reasoning、缓存及独立计费项，对应哪条用量
+  记录，适用单价与倍率如何确定，以及取消、超时和 SSE 错误的结算规则。当前仅凭
+  output_tokens 无法确认最终费用，答复无需包含账号或私人对话。
+
+共同依据为 [OpenAI 输出长度帮助](https://help.openai.com/en/articles/5072518-controlling-the-length-of-openai-model-responses)、
+[Responses create 参考](https://developers.openai.com/api/reference/resources/responses/methods/create) 和
+[SuperGPT 计费说明](https://console.supergpt.dev/help/models-and-billing)。询证期间保留现有
+summarizeCompaction、orphanToolOutputs 和 omitClientMetadata，真实 E2E 预算缺口及
+Keyless 具体环境仍待确认，Issue #5 继续 open。
+
+## 2026-11-13 压缩 SSE 失败状态保留的 P2 修复（已审核）
+
+上一节保留修复前的失败回归与供应商询证附录，本节记录后续修复证据。根因确认在
+共享 `parseCompactResponse` 的 SSE 分支，后到的 completed 会覆盖已解析的错误。
+缺陷仅由本地反常 SSE mock 复现，真实供应商是否曾返回此类序列仍未观察到。
+
+解析器现保留单次响应中首个明确失败，最终结果优先返回该失败。顶层 error、嵌套
+response.error、failed/incomplete/cancelled 终态及 completed 事件中显式非 completed
+的 status 均会锁定失败，后续 completed 无法恢复成功。created、in_progress、
+compacting 与 keepalive 正常忽略，重复有效 completed 继续兼容。JSON 首次解析分支
+保持原行为，8 MiB SSE 事件及 32 MiB 响应边界继续生效。
+
+普通请求与官方路径未改动；原生 compact 仍有界验证后交还成功原字节，摘要路径
+继续共用该解析器，将失败交给既有错误脱敏流程，失败时不生成替换历史。
+
+- 保留上一轮三条独立 v2 回归，扩展其事件顺序矩阵。failed/incomplete/cancelled
+  即使省略 status，也验证位于 completed 前后都拒绝；completed 自带 failed、
+  incomplete、cancelled 或 in_progress status 的前后顺序同样拒绝。
+- 增加一条摘要专项，通过 SuperGPT 配置 ID 的回环 mock 验证 v1/v2。覆盖 error 与
+  completed 的两种顺序、completed 中嵌套错误、failed/incomplete/cancelled、正常进度
+  及重复 completed。JSON 成功/错误结构继续验证，错误中的合成供应商 Key 不进入
+  客户端或日志，失败响应没有 output、摘要或 kcr1 替换历史。
+- 成功 SSE 的分片、多行 data、混合换行、UTF-8 及 byte-exact 回归继续通过。测试仅
+  使用假凭据、公开合成数据、临时 registry/状态目录与回环端点，真实 API 调用为 0。
+
+修复后 `node --test --test-name-pattern="原生 v2：" test/router-fixes.mjs` 为 3 通过、
+0 失败、0 跳过；摘要专项 `node --test --test-name-pattern="压缩 SSE：摘要" test/router-fixes.mjs`
+为 1 通过、0 失败、0 跳过。`node --test test/router-fixes.mjs` 共 44 项，全部通过。
+`node --check src/router.mjs` 与 `npm run check` 通过，源码 97 处相对导入均存在。
+
+全套 `npm test` 共 134 项，首次结果为 129 通过、3 失败、2 跳过，完整保留以下差异。
+
+| 首次失败 | 证据与后续复验 | 判断 |
+| --- | --- | --- |
+| 持续 SSE chunk 会重置 idle timeout | 客户端 fetch 在发请求时报告 `bad port`；定向重跑通过 | 本地测试端口被 fetch 拒绝，该次未进入压缩解析。具体端口未记录，未修改选端口逻辑 |
+| WLB 明确额度耗尽在输出前持久化官方并等待 | 首次入口循环的断言为 502，预期 200，日志未标明循环中的具体 endpoint；本轮较早的整份 Router 回归及后续定向复验均通过 | 首次 502 根因未确定，未将其直接归因于端口或本次修改，保留偶发性限制供 Review |
+| Windows stop terminates only the verified service process tree | 沙箱 Get-CimInstance 查询退出码 5；沙箱外相同单项通过 | 与历史权限边界一致，复验仅操作专用临时测试进程 |
+
+`node --test --test-name-pattern="持续 SSE chunk|WLB 明确额度耗尽" test/router-fixes.mjs`
+为 2 通过、0 失败、0 跳过；沙箱外
+`node --test --test-name-pattern="Windows stop terminates only the verified service process tree" test/windows-service-process.mjs`
+为 1 通过、0 失败、0 跳过。两项平台条件跳过仍保留，未把分项复验计为全套一次通过。
+全套运行已覆盖 `test/response-usage-hardening.mjs` 与 `test/http-health-bounds.mjs`，均通过。
+
+收尾核对 17 个正式配置、主/子代理/Pi 路由、凭据候选及服务状态文件前后哈希一致，
+登记服务进程仍存活。原有审计内容与供应商询证附录完整保留，仅新增修复实现、测试
+及本节证据，修复验证收尾时均未暂存、提交或推送，现已通过提交前审核。
+`git diff --check`、文档及敏感内容检查通过。
+真实原生 v2 E2E 的预算阻塞、v1 502 归因和 Keyless 环境缺口继续保留，Issue #5 open。
+
+## 2026-11-13 compact SSE 事件头补强（已审核）
+
+Review 指出的事件头缺口已由本地 mock 证实。修改生产逻辑前，在原生 v2 与摘要 v1
+加入 `event: error`、data 仅含 message、随后正常 completed 的用例，两项回归均为
+预期 502、实际 200。直接调用补强前源码中的解析函数也确认，仅 event 头标记的 error、
+response.failed、response.incomplete、response.cancelled 均可被后续 completed 覆盖。
+后面三类的合成 data 仅含 response/output，省略 type、error 和失败 status，以独立
+验证事件名识别。以上均为公开合成数据，未从真实供应商观测到这些异常序列。
+
+WHATWG SSE 规范将 event 类型与 data 文本分别处理，data 无需包含 JSON type。
+字段名区分大小写、冒号后只移除一个可选空格，支持 CRLF/CR/LF、UTF-8 BOM 和多行
+data。项目现有 SseEventBuffer 提供事件边界，parseSseEvent 只返回 data 的 JSON。
+本轮在 compact 共用解析器内额外读取有效 event 名称，保留通用解析器接口与原字节。
+[SSE 规范](https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation)
+
+OpenAI Responses 事件参考的 payload 定义包含 type，error、failed 和 incomplete
+各自有明确类型。本补强针对兼容上游遗漏该字段的情况，未将其宣称为官方标准
+payload；SSE event 名称仍可独立提供失败证据。
+[OpenAI streaming 事件参考](https://developers.openai.com/api/reference/resources/responses/streaming-events)
+
+事件头与 data.type 分别参与失败判断，任一明确失败均锁定先前的 failure 状态。
+header-only error、failed/incomplete/cancelled 即使 data 缺失或无法解析也会拒绝交付
+历史。缺少可复用错误结构或标记互相冲突时返回通用 invalid_compaction，避免将成功
+response/output 嵌入错误体。已识别的 error 对象继续经过既有脱敏。普通进度事件
+仍忽略，header-only completed 必须提供有效结果，显式非 completed status 仍拒绝。
+
+浏览器 EventSource 会忽略没有 data 的事件。本轮按 compact 的失败保护要求，对
+明确 error 头采取保守拒绝，属于本地校验策略，并非声称浏览器会派发空数据事件。
+未改变官方或第三方普通请求路径，JSON 行为、32 MiB 响应及 8 MiB 事件边界继续验证。
+
+扩展原有两条 mock 测试，覆盖原生 v2 与摘要 v1/v2 的事件头失败前后顺序、仅 event、
+无 type/仅 response、非法 JSON、无 data、头与 data.type 冲突，以及 BOM、混合换行、
+多行 data、正常进度与仅事件头 completed。原生成功响应继续逐字节比较，失败响应
+不含 output、合成 compaction/摘要或假密钥，也不自动回放。未增加测试框架或新依赖。
+
+前轮 bad port 报错发生在客户端 fetch 发出请求之前，不会进入 compact 解析器。
+WLB 偶发 502 的断言位于四个 endpoint 的循环，旧日志无法确定具体入口，已修正
+上节将其称为普通 `/responses` 的表述。该循环由 WLB mock 返回 403 后回到官方：
+摘要路径的非成功 HTTP 在解析前返回，原生校验也要求第三方上游成功，官方响应
+不进入本解析器。该失败未证明与解析变更相关，根因仍待获得对应请求错误体及端口
+证据后再判断，本轮没有修改选端口或回退逻辑。
+
+新增用例修改前的定向验证为 0 通过、2 失败，均为 event-error 后 completed 返回
+200；修复后 `node --test --test-name-pattern="原生 v2：|压缩 SSE：摘要" test/router-fixes.mjs`
+为 4 通过、0 失败、0 跳过。`node --test test/router-fixes.mjs` 为 44 通过、0 失败、
+0 跳过，包括前轮的持续 SSE 和 WLB 回退用例；`node --check src/router.mjs` 与
+`npm run check` 通过，npm 仅报告已有 store-dir 配置警告。
+
+本轮全套 `npm test` 共 134 项，131 通过、1 失败、2 跳过。前轮的 bad port 与 WLB
+502 均未复现；唯一失败为 Windows 服务测试的沙箱 Get-CimInstance 查询退出码 5。
+沙箱外执行
+`node --test --test-name-pattern="Windows stop terminates only the verified service process tree" test/windows-service-process.mjs`
+为 1 通过、0 失败、0 跳过。单项复验与全套计数分别保留，两项平台条件跳过未改动。
+
+17 个正式状态、配置及凭据候选文件前后哈希一致，登记服务仍存活。修改范围仍为
+src/router.mjs、test/router-fixes.mjs 和本审计文档，验证收尾时保留未提交且暂存区为空。
+上述三文件已通过本次 Review，纳入本次 P2 提交。
+未修改供应商兼容开关、通用 SSE 模块或正式服务，真实 API 调用为 0，Issue #5 open。

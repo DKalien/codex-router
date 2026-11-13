@@ -1042,19 +1042,39 @@ function parseCompactResponse(bytes) {
     return JSON.parse(bytes.toString("utf8"));
   } catch {
     let parsed;
+    let failure;
     let overflow = false;
+    const invalidCompaction = {
+      type: "invalid_compaction",
+      message: "The provider reported an unsuccessful compaction. Conversation history was not replaced.",
+    };
     const events = new SseEventBuffer((event) => {
+      let eventType;
+      for (const line of event.toString("utf8").replace(/^\uFEFF/, "").split(/\r\n|\r|\n/)) {
+        if (line === "event" || line.startsWith("event:")) {
+          eventType = line.slice(6).replace(/^ /, "");
+        }
+      }
       const payload = parseSseEvent(event);
-      if (!payload) return;
-      if (payload.type === "response.completed" || payload.type === "response.failed") {
-        parsed = payload.response;
-      } else if (payload.type === "error" || payload.error) {
-        parsed = { error: payload.error ?? payload };
+      const types = [eventType, payload?.type];
+      const status = payload?.response?.status;
+      // 已报告的失败不能被同一上游流后续的完成事件覆盖。
+      if (types.includes("error") || payload?.error || payload?.response?.error) {
+        failure ??= { error: payload?.error ?? payload?.response?.error ??
+          (payload?.type === "error" ? payload : invalidCompaction) };
+      } else if (
+        types.some((type) => ["response.failed", "response.incomplete", "response.cancelled"].includes(type)) ||
+        ["failed", "incomplete", "cancelled"].includes(status) ||
+        (types.includes("response.completed") && status !== undefined && status !== "completed")
+      ) {
+        failure ??= { error: invalidCompaction };
+      } else if (types.includes("response.completed")) {
+        parsed = payload?.response;
       }
     }, () => { overflow = true; });
     events.write(bytes);
     events.end();
-    return overflow ? undefined : parsed;
+    return overflow ? undefined : failure ?? parsed;
   }
 }
 

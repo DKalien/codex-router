@@ -383,37 +383,77 @@ error，原生 v2 校验因此接受结果并交付压缩历史。反向顺序 c
 本摘录未保存秒级时间和请求编号。请求字段描述用于复核 schema，原始响应、密文、
 账户信息及密钥均省略。所有上下文为短公开合成数据。
 
-WLB 使用 `gpt-5.6-luna`，目标为 `https://codex.wlbclub.com`。
-
-- 直接 `POST /responses/compact`，正文含 model、input、instructions，极小合成上下文，
-  返回 502 JSON，`code=sub2_unavailable`、`type=api_error`。请确认该端点、模型及套餐
-  的支持范围、最小 schema，并说明错误发生层次及代码定义，是否存在临时通道异常。
-- 直接 `POST /responses`，input 为一条 user 消息加末尾 compaction_trigger，
-  `stream=true`、`store=false`、`max_output_tokens=64`，完成并报告 output_tokens=55；
-  同供应商一次 max32 回放完成，报告 5。请确认接受 max64 的校验及压缩预算规则，
-  与 OpenAI 专项最小 20000 的差异，给出当前模型适用的输出或费用硬上限和公开依据。
-
-SuperGPT 使用 `gpt-5.6-sol`，目标为 `https://api.supergpt.dev/v1`。
-
-- 直接 `POST /responses/compact`，同型最小 model/input/instructions schema，返回
-  502 JSON，未取得可记录的 code/type/param。请确认端点与当前模型支持、所需参数，
-  以及如何区分端点、分组权限和上游通道故障。
-- 普通 `POST /responses` 设置 `stream=false` 时，直连及隔离 Router 均为 HTTP 200
-  加 SSE `server_error`。请确认是否支持非流式 JSON，若仅支持流式应使用何种请求契约，
-  该错误是否可能产生费用，以及错误事件与 HTTP 状态的约定。
-- trigger v2 使用上述单条 user 消息加末尾 trigger，`stream=true`、`store=false`、
-  `max_output_tokens=64`，200 SSE completed，生成 compaction，output_tokens=67。
-  请说明 67 的组成、是否汇总独立压缩过程、max64 的实际处理方式，以及与专项最小
-  20000 的差异。该请求未回放，请提供当前模型的预算硬上限与支持文档。
-- 请列明 compact v1/v2 的输入、输出、reasoning、缓存及独立计费项，对应哪条用量
-  记录，适用单价与倍率如何确定，以及取消、超时和 SSE 错误的结算规则。当前仅凭
-  output_tokens 无法确认最终费用，答复无需包含账号或私人对话。
-
 共同依据为 [OpenAI 输出长度帮助](https://help.openai.com/en/articles/5072518-controlling-the-length-of-openai-model-responses)、
 [Responses create 参考](https://developers.openai.com/api/reference/resources/responses/methods/create) 和
 [SuperGPT 计费说明](https://console.supergpt.dev/help/models-and-billing)。询证期间保留现有
 summarizeCompaction、orphanToolOutputs 和 omitClientMetadata，真实 E2E 预算缺口及
 Keyless 具体环境仍待确认，Issue #5 继续 open。
+
+### 公开支持入口与询证交付包（2026-11-13）
+
+本节只记录匿名公开页面的可达性和可直接复制的技术问题草稿，没有登录、发送表单、
+创建工单或读取账户数据。日期、模型和请求字段均为本审计已有的合成探针信息。
+
+| 供应商 | 已核实的官方入口 | 验证方式 | 当前可送达性 |
+| --- | --- | --- | --- |
+| WLB | [官网](https://www.wlbclub.com/)、[Codex 站点](https://codex.wlbclub.com/)、官网的[内部论坛](https://www.wlbclub.com/forum) | 匿名 HTTPS GET 的两个首页及论坛均为 200。官网 HTML 发布的[静态资源](https://static.wlbclub.com/assets/index-B06ywk0i.js) 包含 Codex 站点链接、论坛路由及[Codex 说明文章](https://www.wlbclub.com/forum/mqetnt55-436cc4)，可交叉确认关系。Codex 首页公开配置没有联系信息或文档 URL | 已确认官网和论坛入口，但 200 为脚本页面外壳，阅读/发帖的账号或会员条件未确认。已查页面未找到专用支持邮箱、工单或支持 issue，不能把论坛当作已验证的 API 工单收件入口 |
+| SuperGPT | [安全与支持](https://console.supergpt.dev/help/security-and-support) 的官方入口表列出控制台、API、帮助中心和 [Telegram 频道](https://t.me/supergpt666)；[官网关于页](https://supergpt.dev/about) 同样链接该频道 | 两个官方页面均指向该频道，匿名[频道预览](https://t.me/s/supergpt666) 标注为官方频道，公开内容也链接回 SuperGPT 控制台。帮助页要求反馈时提供时间、模型、分组、错误正文和请求编号 | 公开文档和频道预览无需供应商账号登录即可查看。已查公开页面未发现邮箱或工单表单，频道是公告入口，具体收件方式及 Telegram/控制台账号条件尚未确认。官网链接的 SuperGPT Connect [GitHub Issues](https://github.com/superpilot69/supergpt-connect/issues) 公开可读，README 将其用于配置器反馈，未承诺受理 API 计费或端点问题 |
+
+本轮复核的 SuperGPT API 示例只展示 `POST /v1/responses` 的
+`stream=true` SSE 调用，并提醒每次成功调用可能产生费用，未说明 `compaction_trigger`
+或 `/responses/compact`。公开模型广场列出 `gpt-5.6-sol`，同时声明实际可用范围、
+价格和账户条件以当前目录及密钥分组为准。因此这些页面不能证明当前分组支持原生
+compact，也不能解释本次 `usage.output_tokens=67` 或提供费用硬上限。
+[SuperGPT API 示例](https://console.supergpt.dev/help/api-examples)、
+[公开模型广场](https://console.supergpt.dev/model-plaza)
+
+SuperGPT 计费页仍要求按输入、输出、缓存和推理等计费项及分组倍率核算，且不同协议
+字段口径可能不同，最终扣费以使用记录为准。使用记录页还提醒客户端错误、超时或
+断流不代表没有扣费。本次已查公开资料未说明 compact v1/v2 的压缩过程如何映射到
+费用，也未取得 `max_output_tokens=64` 对当前模型构成费用硬上限的证据。[计费说明](https://console.supergpt.dev/help/models-and-billing)、
+[使用记录说明](https://console.supergpt.dev/help/usage)
+
+WLB 新增证据限于官网、论坛与 Codex 站点的关联和匿名可达性。文档抓取工具未能
+解析脚本页，沙箱内请求也曾失败，沙箱外匿名 GET 则成功，不能据前者宣称站点不可用。
+公开静态资源和定向搜索未取得原生 compact、`gpt-5.6-luna` 的 max64 保证或
+`sub2_unavailable` 解释，当前仍不明。WLB 502、v2 的 55 Token 及回放 5 Token
+均继续作为此前直连观测，不能由官网页面可达推断端点能力。
+官网主脚本出现 `gpt-5.6-luna` 名称，两份已检索脚本均未出现 `/responses/compact`、
+`compaction_trigger`、`max_output_tokens`、`usage.output_tokens` 或 `sub2_unavailable`
+字面量。此范围内没有协议或预算说明，支持范围仍待供应商确认。
+
+#### WLB 中文支持消息草稿（未发送）
+
+> **请确认 Responses compact v1/v2、gpt-5.6-luna 和 Token 计量规则（2026-11-13）**
+>
+> 您好。请协助确认以下接口与计量规则。观测来自 2026-11-13（UTC+08）使用短公开合成上下文对 `gpt-5.6-luna` 的直连测试，下列 schema 为字段级重建示意。
+>
+> 1. `POST /responses/compact`，字段为 `model="gpt-5.6-luna"`、`input=[{"role":"user","content":"public fixture"}]`、`instructions="Keep the fixture fact."`。此前同型最小请求收到 HTTP 502，错误字段为 `code=sub2_unavailable`、`type=api_error`。请确认该端点、模型和分组是否支持，最小合法请求 schema 是什么，`sub2_unavailable` 代表哪一层失败，以及是否有公开错误码说明。
+> 2. `POST /responses`，`input` 为一条合成 user 消息和最后一个 `{ "type": "compaction_trigger" }`，`stream=true`、`store=false`、`max_output_tokens=64`，收到 200 SSE 和 compaction，`usage.output_tokens=55`。同一供应商一次 `max_output_tokens=32` 的最小回放报告 5。请确认 trigger v2 是否接受 max64、与 OpenAI 专项最小 20000 的说明有何差异、是否有费用硬上限，以及 usage 是否包含压缩、推理和不可见结构 Token。
+> 3. 请提供当前模型和分组适用的输入、输出、缓存、推理及 compact 费用映射，说明失败、超时、取消和 SSE 错误是否可能产生费用。
+>
+> 请提供能力文档、适用分组及官方技术问题接收入口。可补充日期、模型、协议、路径、HTTP 状态、脱敏错误类型和合成请求 schema 用于定位。[OpenAI 输出长度说明](https://help.openai.com/en/articles/5072518-controlling-the-length-of-openai-model-responses)
+
+#### SuperGPT 中文支持消息草稿（未发送）
+
+> **请确认 Responses compact v1/v2、gpt-5.6-sol 的 Token 计量和费用规则（2026-11-13）**
+>
+> 您好。请协助确认以下接口与计量规则。观测来自 2026-11-13（UTC+08）使用短公开合成上下文对 `gpt-5.6-sol` 的直连测试，下列 schema 为字段级重建示意。
+>
+> 1. `POST /v1/responses/compact`，字段为 `model="gpt-5.6-sol"`、`input=[{"role":"user","content":"public fixture"}]`、`instructions="Keep the fixture fact."`。此前同型最小请求收到 HTTP 502，未取得可记录的 `error.code`、`error.type` 或 `error.param`。请确认该端点、模型和密钥分组是否支持，最小合法 schema 是什么，以及如何区分端点、权限、分组和上游通道故障。
+> 2. 普通 `POST /v1/responses` 设置 `stream=false` 时收到 HTTP 200 加 SSE `server_error`。请确认非流式 Responses 是否受支持，若仅支持流式应使用什么契约，并说明该响应形态是否可能产生费用。
+> 3. trigger v2 请求的 `input` 为一条合成 user 消息和最后一个 `{ "type": "compaction_trigger" }`，设置 `stream=true`、`store=false`、`max_output_tokens=64`，收到 200 SSE completed 和 compaction，`usage.output_tokens=67`。请说明 67 的组成、是否包含压缩过程/推理/不可见结构 Token、max64 实际如何处理，以及与 OpenAI 对 compaction_trigger 的专项最小 20000 说明如何对应。
+> 4. 请列明 compact v1/v2 的输入、输出、reasoning、缓存和独立计费项，说明对应的使用记录字段、分组倍率，以及失败、超时、取消和 SSE 错误的结算规则。我们需要确认是否存在可靠的费用硬上限，不能仅凭 `usage.output_tokens` 推断最终扣费。
+>
+> 请提供计量和能力文档，并告知官方频道公布的技术问题接收方式。可补充日期、模型、协议、路径、HTTP 状态、脱敏错误类型和合成请求 schema 用于定位。[OpenAI 输出长度说明](https://help.openai.com/en/articles/5072518-controlling-the-length-of-openai-model-responses)
+
+在获得一手答复前，继续停止真实 Router v2 生成/回放，保留 `summarizeCompaction`、
+`orphanToolOutputs` 和 `omitClientMetadata` 的现有配置。当前没有可靠费用硬上限证据，
+也没有新的 v1/v2 能力声明；Issue #5 继续 open。
+
+后续最小外部依赖为 WLB 官网可核验的 API 支持收件入口，以及 SuperGPT 官方频道
+当前公布的技术问题接收方式或工单 URL。这里只需要公开入口和提交条件，账号、
+Key、私人账单、个人联系人字段和原始历史均不需要。是否登录及发送由审核层后续安排。
 
 ## 2026-11-13 压缩 SSE 失败状态保留的 P2 修复（已审核）
 

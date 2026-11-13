@@ -157,3 +157,178 @@ compaction 或替换历史结构。原生 compact 的 5xx 触发供应商停止�
 
 建议进入提交前 Review，Review 通过后可进入提交和推送阶段。原生 compact 的 502、原生 v2 与密文回放缺口，以及 keyless 实际
 部署的适用范围应由审核层明确接受边界或继续验证，再决定 Issue #5 的最终关闭。
+
+## 2026-11-13 后续原生 compact 能力验证
+
+本轮基于 `082c11efb2d185d565be52fb632071a8cf882415` 的干净 `lite` 工作区执行。
+上一节保留首轮 A/B 的历史结果，本节更新独立的 v2 能力及回放结论。生产逻辑与供应商
+兼容配置沿用已审核版本。
+
+### 文档与原生 v1 的可归因边界
+
+OpenAI Responses 参考明确声明 `compaction_trigger` 为最后一个 input item，
+`max_output_tokens` 为响应生成 Token 上限，涵盖可见输出及 reasoning。v2 复用普通
+`/responses`，因此按独立能力验证。该规范给出的参数语义作为探针预算依据，
+实际供应商的计量结果另行记录。[OpenAI Responses 参考](https://developers.openai.com/api/reference/resources/responses/methods/create)
+
+SuperGPT 公开文档列出 `/v1/responses` 和 `stream=true` 示例，并说明能力取决于模型、
+分组和客户端。已查阅的文档未明确承诺原生 compact v1/v2 或 Responses 非流式能力。
+其故障排查将 5xx 归入服务异常/通道状态，要求结合正文判断原因。
+[接口示例](https://console.supergpt.dev/help/api-examples)、[地址与能力说明](https://console.supergpt.dev/help/clients)、[故障排查](https://console.supergpt.dev/help/troubleshooting)
+
+WLB 公开页面在本轮文档访问工具中不可用，公开搜索未取得 `sub2_unavailable` 的供应商
+错误码定义。因此该代码只作为原样记录的错误分类，不用于断言供应商内部组件及根因。
+
+| 归因层次 | 已有证据 | 当前结论 |
+| --- | --- | --- |
+| 本地 Router 或 URL 拼接 | 首轮 v1 为直接调用已校验的供应商 HTTPS 地址；该调用绕过 Router，收到完整 HTTP 502 | 已定位到直连供应商 HTTP 响应层，Router 转换逻辑未参与这次失败 |
+| 端点缺失或方法错误 | 观察到 502 JSON，未取得 404/405 或明确的 unsupported-endpoint 错误 | 端点是否缺失尚未证实，502 可能掩盖内部转发错误 |
+| WLB 网关/上游转发 | `code=sub2_unavailable`、`type=api_error` | 可记录为供应商服务错误 envelope，生成错误的具体 hop、上游状态及是否临时故障均待确认 |
+| SuperGPT 网关/上游转发 | 502 JSON，未取得可记录 code/type/param | 服务侧失败已观测，内部转发层次与原因待确认 |
+| 模型或账户普遍不可用 | 相同模型的首轮普通 SSE 成功；本轮额度查询均为 200 且可用，v2 均完成 | 普通及本次 v2 请求可用。v1 专属模型、套餐或通道约束仍待供应商证据 |
+| v1 payload/schema | 首轮使用 model/input/instructions 的最小文档字段，未取得字段级 param 错误 | 未发现明确 schema 拒绝证据，供应商的端点专用字段或最短历史要求仍可能不同 |
+
+本轮复用首轮 v1 证据。相同探针不足以进一步定位，且 standalone compact 缺少已确认的
+输出硬上限，本轮 v1 真实调用次数为 0。下一步归因需要供应商公开错误码定义、端点能力
+声明或其服务端日志。当前结论为「上游 502 原因未确认」。
+
+SuperGPT 非流式问题同样复用首轮两侧的 `200 + SSE server_error` 结果。当前 Router
+将普通 HTTP 200 响应中的 SSE 错误事件继续交给客户端，HTTP 错误翻译处理非成功
+HTTP 响应，摘要路径固定流式。本轮针对 `stream=false` 的真实重复调用次数为 0。
+
+### 原生 v2 独立单次探针与回放
+
+每家先经受保护凭据接口读取持久 Key、校验默认 HTTPS 目标，再各查询一次额度。
+两家额度查询均为 200 且可用，沿用已成功调用的 WLB `gpt-5.6-luna` 和 SuperGPT
+`gpt-5.6-sol`。没有通过官方身份、真实 Cookie 或私人对话发起请求。
+
+每家仅调用一次直接 `/responses`，schema 为 `final-trigger-stream-storefalse-max64`。
+请求 input 仅有一条合成事实消息及末尾 `{ "type": "compaction_trigger" }`，
+设置 `stream=true`、`store=false`、`max_output_tokens=64`，完整请求体小于 512 字节。
+总 deadline 为 20 秒，读取闲置上限 10 秒，响应限读 64 KiB，拒绝重定向，无自动重试
+或供应商切换。公开文档给出生成上限语义，实际响应 usage 继续用于预算复核。
+
+| 供应商/模型 | endpoint 与 schema | HTTP/内容 | 终态与错误 | compaction | 后续回放 |
+| --- | --- | --- | --- | --- | --- |
+| WLB / `gpt-5.6-luna` | `/responses`，末尾 trigger，stream=true，max64 | 200 / SSE | `response.compaction.compacting`、`response.completed`；无 failed/incomplete/error，type/code/param 均无 | 生成，报告 output_tokens=55 | 同供应商一次最小回放成功 |
+| SuperGPT / `gpt-5.6-sol` | `/responses`，末尾 trigger，stream=true，max64 | 200 / SSE | `response.compaction.compacting`、`response.completed`；无 failed/incomplete/error，type/code/param 均无 | 生成，报告 output_tokens=67 | 67 超过请求上限 64，触发停止条件并跳过回放 |
+
+WLB 回放只在内存中保留其成功 v2 的完整 output，作为下次 input 的前缀原样传回同一
+供应商、同一模型和同一临时探针流程，再追加最小合成追问。返回 output 先限制在 8 KiB
+以内，回放设置 `stream=true`、`store=false`、`max_output_tokens=32`，沿用相同超时和
+限读边界。唯一一次回放返回 200 SSE `response.completed`，报告 5 输出 Token，
+合成事实回答断言正确。compaction 密文及原始响应均未落地、打印或发送给其他供应商。
+
+SuperGPT 的本次 `output_tokens=67` 大于请求的 64。已有证据无法区分压缩计量口径与
+生成上限实现差异，也无法确认该参数对压缩生成形成严格费用上限。按停止条件结束该
+供应商后续请求，密文仅在内存使用后释放。继续真实验证前需先明确压缩 Token 的计量
+和预算约束。该差异属于供应商能力/计量边界，尚无 Router 代码缺陷的本地复现。
+
+本轮真实请求共 5 次，包含 2 次只读额度查询、2 次 v2 单次探针和 1 次 WLB 回放。
+三次生成/回放响应报告的输出 Token 分别为 55、67、5。正式主/子代理与 Pi 路由、
+供应商选择、服务 PID、安装清单、caller secret、Codex config 和持久凭据候选文件在
+探针前后校验一致。没有启动 Router 测试实例，直接供应商请求以现有代理环境规则运行。
+
+### Keyless 环境与兼容开关建议
+
+本轮只读识别结果为 registry 中 keyless 数量 0，PATH 未发现 `ollama`、`llama-server`、
+`llama-cli`、`llama.cpp`。已知候选进程名未检出，回环端口 11434、8080、1234 均未监听。
+当前已检查范围内没有可验证的本地 Responses 部署及版本，实际 Keyless 验证状态为
+「待具体环境」。本轮没有安装程序、下载模型或启用服务。
+
+`summarizeCompaction` 建议保留。v2 单次成功更新了能力证据，v1 502 仍待归因，
+SuperGPT 压缩预算存在未决计量问题，长历史及跨版本行为尚未覆盖。当前一个开关同时
+控制两条压缩路径，关闭会同时改变 v1 行为，尚缺单独关闭条件。
+
+`orphanToolOutputs` 建议保留，首轮两家的 400/200 对照继续作为直接证据。
+`omitClientMetadata` 建议保留待独立 Review，首轮仅验证小型 metadata 被接受，
+本轮没有增加该项覆盖。各项建议以现有模型和配置范围为限，Issue #5 继续 open。
+
+本轮专项回归使用 `node --test --test-name-pattern="Keyless|透明转发|审计：第三方压缩始终|审计：SSE 压缩|失败或空摘要" test/router-fixes.mjs`，
+9 项通过，0 失败、0 跳过。文档示例、相对链接与 `git diff --check` 通过。
+本轮仅修订本审计文档，完整回归沿用已提交版本的记录。
+
+## 2026-11-13 Token 计量调查与 Router 原生 v2 验收边界
+
+本轮从同一 HEAD 继续，开始时唯一未提交文件为本审计文档，已有后续能力记录共新增
+90 行。以下内容增量补充计量证据及 Router E2E 的执行条件，上轮直连结果保留。
+
+### 规范、供应商说明与实测的区别
+
+| 来源 | 可核实内容 | 尚未解决的边界 |
+| --- | --- | --- |
+| OpenAI Responses create 参考 | `compaction_trigger` 应为最后一个 input item；通用 `max_output_tokens` 定义涵盖可见输出及 reasoning，schema 最小值为 16 | 通用参数定义不能单独证明第三方 compact 对 max64 的预算保证。参见 [create 参考](https://developers.openai.com/api/reference/resources/responses/methods/create) |
+| OpenAI 官方输出长度帮助 | 针对 `compaction_trigger` 明确要求省略 `max_output_tokens` 或至少设为 20000，更小值会被拒绝 | 该专项说明比 create 页面展示的通用 schema 更严格。第三方此前接受 max64 与此说明存在行为差异，实际采用何种校验及预算规则需各供应商确认。参见 [输出长度帮助](https://help.openai.com/en/articles/5072518-controlling-the-length-of-openai-model-responses) |
+| OpenAI Token 计数说明 | output usage 包括不可见的格式与 reasoning Token，可高于可见文本 Token 数；通用输出上限也覆盖不可见 Token | 这只能解释 usage 与可见文本的差异，未提供本次 67 大于请求 64 的 compact 专用解释。参见 [Token 计数说明](https://developers.openai.com/api/docs/guides/token-counting) |
+| OpenAI compact 与 streaming 参考 | v1 usage 描述压缩过程的输入、缓存、推理和输出用量；`response.compaction.compacting` 仅报告进度，最终密文由 output item 事件交付 | 进度事件数量、密文长度及可见文本均不足以推算费用。参见 [compact 参考](https://developers.openai.com/api/reference/resources/responses/methods/compact) 和 [streaming 事件](https://developers.openai.com/api/reference/resources/responses/streaming-events) |
+| SuperGPT 计费说明 | 输入、输出、缓存及推理可能影响费用，不同协议字段口径可能不同，最终扣费以使用记录为准 | 未找到明确适用于 `gpt-5.6-sol` 原生 compact v2 的 Token 映射、额外压缩计费项或硬预算保证。参见 [模型与计费](https://console.supergpt.dev/help/models-and-billing) |
+| SuperGPT 使用记录与公开模型目录 | 使用记录用于核对实际用量和扣费；超时、断流也可能已处理。公开目录可见 `gpt-5.6-sol` | 公开目录未提供本次密钥适用的 compact 专项单价及能力保证，本轮未登录、导出账单或读取私人使用历史。参见 [使用记录说明](https://console.supergpt.dev/help/usage) 和 [公开模型目录](https://console.supergpt.dev/model-plaza) |
+
+OpenAI 的 compaction 指南说明返回项为不透明状态，后续应按相应协议原样传回。
+本轮继续使用项目已有的 trigger v2 定义，未将指南中的自动 `context_management`
+机制计为 trigger v2 的真实验证。[Compaction 指南](https://developers.openai.com/api/docs/guides/compaction)
+
+SuperGPT 上轮 `max_output_tokens=64`、`usage.output_tokens=67` 及完成状态均为直连
+实测。当前证据不足以判定上限实现违规、确定多扣费用，或将差值归因于固定的 3 个
+协议 Token。供应商是否映射、忽略或提高 compact 专用输出预算，以及 usage 是否包含
+独立压缩过程，均未明确。当前成本边界记为不明，继续保留停止条件。
+
+### 本轮真实调用与预算决定
+
+| 供应商/模型 | 验收场景 | 本轮真实 API 次数 | 状态与原因 |
+| --- | --- | --- | --- |
+| WLB / `gpt-5.6-luna` | 隔离 Router `/responses`、末尾 trigger、stream=true、store=false、max64；至多一次 max32 回放 | 0，含额度查询 0 | 预算前提阻塞。上轮直连 55 Token 和一次成功回放保留，但单次实际用量不足以证明后续硬上限。新检出的官方 compact 专项最小值与 max64 探针存在差异，未取得 WLB 的明确限额规则，未启动真实 E2E 实例 |
+| SuperGPT / `gpt-5.6-sol` | 原生 v2 Router E2E 与回放 | 0，含额度查询 0 | 仅完成零费用文档调查。67>64 的计量和费用边界仍不明，未找到符合继续调用条件的专项证据 |
+| 两家 | 原生 v1 `/responses/compact` 和 SuperGPT 非流式复测 | 0 | 复用既有 502 及 200+SSE server_error，未取得可进一步归因的公开资料 |
+
+本轮没有产生新的供应商推理请求或费用。未提高 max64 预算、未省略该上限，也未通过
+重试、故障切换或更换凭据继续探针。余额查询推迟到预算规则确认之后，当前可用额度
+沿用历史记录并标为未刷新。20 秒 deadline、10 秒 idle 和 64 KiB 响应边界只能约束
+本地等待及读取，客户端停止无法证明上游立即停止计费。
+
+原生 v1 仍为「直连供应商 HTTP 502，原因未确认」。SuperGPT 故障帮助将 5xx 列为
+临时服务或分组通道异常，未给出 compact 专属归因；WLB 页面本轮访问仍不可用，
+定向搜索未取得 `sub2_unavailable` 的可靠定义。[SuperGPT 故障排查](https://console.supergpt.dev/help/troubleshooting)
+
+### Router 源码与本地回归
+
+`src/router.mjs` 在末尾 trigger 处识别 v2，仅在供应商显式开启 `summarizeCompaction`
+时进入摘要路径。未开启时保留 trigger 和顶层参数，经 `/responses` 发出。上游原生
+compact 成功体先按 32 MiB 总量读取、解析 JSON/SSE，并要求无解析出的 error、status
+缺省或为 completed，以及非空 compaction 密文，验证通过后交还原始字节。SSE 事件
+解析另有 8 MiB 单事件边界。
+
+本轮重跑既有本地测试，全部使用合成凭据、临时状态和回环 mock。覆盖范围如下。
+
+- 透明 A/B 对两家配置 ID、主代理、子代理和 Pi 验证原生 v2 input、查询参数、协议头
+  白名单、凭据隔离及逐字节相同的 SSE 响应。
+- 原生 v1/v2 均验证失败、不完整、空密文、非法结构与 SSE failed 的拒绝及错误脱敏。
+  现有 33 MiB 超限用例从 v1 入口运行，源码限读分支由 v1/v2 共用，v2 专项超大响应
+  和真实密文回放的在线行为仍未单独覆盖。
+- Keyless 参数 opt-in 与迁移提示、unknown compaction、兼容项独立启停、zstd、
+  无 content-type SSE、caller capability 脱敏及摘要失败保护通过。
+
+执行 `node --test --test-name-pattern="Keyless|透明转发|审计：第三方压缩始终|审计：SSE 压缩|失败或空摘要|请求日志会脱敏|上游巨型错误|无 content-type 的 SSE|zstd 请求|主代理和子代理|Pi 命名空间使用" test/router-fixes.mjs`，
+15 项通过，0 失败、0 跳过。`npm run check` 通过，出现已有 npm `store-dir` 配置警告。
+本轮未重跑完整 `npm test`，历史 130 项及 Windows CIM 权限复验结论见前文。
+当前未取得新的 Router 业务缺陷复现，未修改生产源码或测试。
+
+### 后续需供应商确认
+
+1. SuperGPT 应明确 `gpt-5.6-sol` 的 trigger v2 `usage.output_tokens` 是否汇总压缩及
+   其他生成、不可见结构、推理 Token，各项对应哪条实际计费记录，67>64 的原因是什么。
+2. 两家应确认 trigger v2 是否接受 max64，是否存在最小值、预算覆盖或忽略行为，
+   并给出适用于当前模型和分组的输出或费用硬上限。确认前继续暂停 Router 真实 E2E。
+3. SuperGPT 应说明 compact v1/v2 的输入、缓存、推理、输出及独立费用项，以及失败、
+   取消、超时的结算规则。若需核对上轮实际扣费，由用户在控制台按合成探针时间查找，
+   仅提供必要的脱敏字段。
+4. 两家应确认 v1 `/responses/compact` 的端点、模型和订阅支持范围、最小 payload，
+   并解释已有 502。WLB 需补充 `sub2_unavailable` 的定义；SuperGPT 需说明非流式
+   Responses 的协议与现有 SSE server_error。
+
+两家 `summarizeCompaction` 继续保留。`orphanToolOutputs` 继续依据首轮 400/200
+对照保留，`omitClientMetadata` 维持待独立 Review。Keyless 实际部署仍待具体环境。
+本轮只增量编辑审计文档，原有 90 行未提交记录完整保留。17 个正式配置、主/子代理/Pi
+路由、服务 PID、caller secret 及凭据候选文件前后哈希一致，登记服务进程仍存活。
+文档 JSON 示例、相对链接、HTTPS 来源 URL 和新增内容的明显秘密模式检查通过，
+`git diff --check` 通过。未暂存或提交文件，Issue #5 继续 open。

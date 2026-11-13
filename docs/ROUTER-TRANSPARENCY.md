@@ -563,3 +563,70 @@ WLB 偶发 502 的断言位于四个 endpoint 的循环，旧日志无法确定�
 src/router.mjs、test/router-fixes.mjs 和本审计文档，验证收尾时保留未提交且暂存区为空。
 上述三文件已通过本次 Review，纳入本次 P2 提交。
 未修改供应商兼容开关、通用 SSE 模块或正式服务，真实 API 调用为 0，Issue #5 open。
+
+## 2026-11-13 Issue #5 八项验收证据复核
+
+复核基线为 `lite` 的 `0e313b1cc5c303f6dfcaa40398847f76d1c7c9e8`，开始时
+HEAD、origin/lite、远端分支一致且工作树 clean。以下按题述八项原始标准核对实际
+代码和测试断言。本轮只增加离线回归与本文，供应商模型、额度、生成和回放 API 调用均为 0。
+表中源码行号基于该基线，测试行号包含本轮新增内容，测试名称作为后续定位依据。
+按用户调整后的范围，八项标准的 Router 本地可控内容已完成验收。真实供应商能力和
+Keyless 具体部署的未验证项保留为外部限制，不构成本地交付的等待条件。
+
+| 验收项 | 结论与可核查证据 | 剩余边界 |
+| --- | --- | --- |
+| 1. 全部请求/响应转换点审计 | 本地可控范围满足。本文「全部转换点」列出请求解压/JSON、模型和头、input/参数、摘要、原生 compact 验证、usage 和错误处理。对应 `src/router.mjs:259–455、536–559、806–969、998–1224、1255–1688`，以及 `src/response-usage.mjs`。透明 A/B 测试逐项断言 URL、完整 JSON、协议头、响应 Buffer。zstd、Pi、auto、错误和 SSE 专项分别核对各分支 | 此结论覆盖当前仓库支持的路径，供应商内部转换不可见 |
+| 2. 区分三类处理 | 满足。路由必需包括模型/目标认证、头白名单和有界传输。供应商兼容由 `compatibility` 七项显式控制。跨供应商历史包括 `kcr1:` 恢复、官方 reasoning 清理与协作 relay。`src/model-registry.mjs:173–190` 校验协议及 boolean，`src/router.mjs:416–422、536–559、806–929` 按目标 provider 或官方回放路径执行。本文两个转换表记录范围与理由 | `relayAgentPayloads` 同时属于供应商 opt-in 和跨供应商历史适配，需保留两层适用条件 |
+| 3. 直连/Router A/B 定位差异 | 本地 A/B 满足，真实供应商能力部分未验证。`test/router-fixes.mjs:230–315` 的「透明转发 A/B」对两家 ID × 主/子/Pi × JSON/SSE/原生 v1/v2 比较真实收到的 JSON、URL、五个协议头、目标凭据及响应原字节。兼容项矩阵 `520–613` 对照完整 expected body。线上证据见「真实供应商 A/B」和「后续原生 compact 能力验证」，保留成功与失败记录 | 原生 v1 直连 502 原因不明。真实 Router 原生 v2 E2E 的费用硬上限未证实，保留未验证状态 |
+| 4. 标准 Responses 默认透明 | 满足本地验收。`src/router.mjs:416–422、536–559、1472、1508–1540、1561–1577` 中供应商兼容仅按显式开关启用，自产摘要恢复及原生 compact 完整性校验另有明确边界。透明 A/B 保留未知字段、工具关联、空消息、reasoning 和未知 compaction。`114–228` Keyless 专项核对缺省/false/true、严格上游 400、仅剔除两个顶层字段、迁移提示及官方参数不受影响。启动提示位于 `src/router.mjs:1962–1967` | Keyless 表示 loopback 与免密钥，不能据此推断参数支持能力。实际部署版本待具体环境 |
+| 5. WLB/SuperGPT 必要兼容及覆盖 | 本地兼容机制与专项覆盖满足。两份 provider 配置分别显式保留 orphan、metadata、relay、summary、error translation。`520–613` 对两家逐开关启停，完整比对参数和 input，并验证零用量补偿默认关闭、错误结构与精确脱敏。`1824` 起的 relay 专项断言顺序、并发上限与缓存。真实 orphan 400→200、摘要 v1/v2 成功为保留依据 | 小型 metadata 已被两家接受，该样本不足以确定关闭开关。原生 v1、v2 费用规则及 Keyless 版本保留为已知外部限制 |
+| 6. 工具/SSE/压缩/主子代理/切换 | 本地满足，真实跨供应商历史能力部分满足。新增「跨供应商连续历史」`352–479` 串联前次 mock 返回 output、工具配对、orphan 降级、reasoning 清理、主 SuperGPT/子 WLB 和实际生成 kcr1 的三目标回放。既有 `661–916` 覆盖 v2 分片原字节、32 MiB/8 MiB、event/data 两种失败标记和摘要 v1/v2 失败不可生成替换历史。`939` 起主/子、`1095` 起 Pi、auto 专项保留独立状态与凭据断言 | 合成 token 形状与 mock 接受均不能证明真实发行来源或跨供应商解密。既有真实 WLB 原生 v2 回放仅在同供应商直连成功，SuperGPT 未回放 |
+| 7. 认证/Key/重定向/重试安全 | 本地门禁满足。`src/router.mjs:358–414、424–455、485–487、1547–1560、1829–1840` 保留身份白名单、脱敏、输出前重试和 caller capability。A/B 断言官方账户/Cookie/组织/项目/安装/子代理头不进入第三方。`test/generation-redirect-lite.mjs` 对五类生成入口及 301/302/303/307/308 断言 origin 一次、target 零次且不泄露 Location。新增「重试安全」`481–518` 用内存 fetch 替身核对次数上限、canRetry=false、时间预算、429/500 不重试、取消及相同请求对象/字节。凭据安全测试另核验符号链接、ACL 与临时文件所有权 | 这些是本地安全边界证据。未访问真实账单、账号或凭据，未更改既有手动重试策略 |
+| 8. 保留转换的范围/理由/回归 | 满足可审计性要求。「默认路径与兼容配置」「全部转换点」「Keyless 配置升级」逐项记录范围、依据、关闭影响和迁移。七项 flag 在 `520–613` 的完整 expected body、usage、错误断言及 `918–937` schema 拒绝用例中对应。官方 reasoning、协作 relay、Pi、prompt cache、auto response ID 和摘要均有专项断言，定位见本表及前述审计 | 历史兼容理由与本次线上必要性分开记录。metadata 的证据边界和供应商能力未决项继续保留 |
+
+新增串联回归使用同一临时 Router 和三个 localhost 上游，所有凭据为合成值。
+官方 mock 首次返回合成 reasoning 与 function_call，下一请求复用该 output 并追加
+匹配的 function_call_output 和缺少 call_id 的 orphan，断言只有 orphan 被目标兼容
+折回用户消息。随后复用 WLB mock 返回的 reasoning/message，比较同 WLB、切 SuperGPT
+及独立 WLB 子代理的完整 input 和目标凭据。返回官方时丢弃非原生形状 reasoning、
+移除合形状项的 output-only content，同时保留工具配对。
+
+官方严格 mock 对原样保留的 orphan 返回 400。测试随后由合成 caller 移除该项才继续
+成功，未把 caller 选择算作 Router 转换。WLB 的摘要 v2 实际生成 `kcr1:` 后，同 WLB、
+SuperGPT 和官方均恢复相同公开摘要。合成未知 opaque compaction 原样到达 SuperGPT
+和官方严格 mock 后返回 400，断言无替换历史、每次仅一个上游请求。测试没有尝试
+解密或证明未知密文可跨供应商回放。
+
+本轮未发现新的可复现生产代码缺陷。两家 `summarizeCompaction`、`orphanToolOutputs`
+继续保留，`omitClientMetadata` 沿用当前配置。此前供应商询证草稿作为历史审计保留，
+依用户最新指示，本阶段结束供应商询证工作。
+
+八项本地可控验收已完成，适合提交交付。两家原生 v1 502、SuperGPT 67>64 计量、
+真实 Router v2 E2E 费用边界、Keyless 缺少实例，以及真实跨供应商 opaque 历史的
+可回放性，均为已记录的未验证外部限制。后续不再研究或联系供应商，不发起真实
+付费探针，不以外部答复作为 Issue #5 本地验收的强制前提。Issue 状态由审核层
+收到提交回报后决定，本轮不创建、关闭或评论 Issue。
+
+上轮离线复核的验证记录如下，各次结果分别保留。
+
+- `node --test --test-name-pattern="跨供应商连续历史：" test/router-fixes.mjs` 为
+  1 通过、0 失败、0 跳过。随后 `node --test test/router-fixes.mjs` 为 45 通过、
+  0 失败、0 跳过，该次启动时尚未加入重试专项。
+- 最终版本执行 `node --test --test-name-pattern="重试安全：|跨供应商连续历史：" test/router-fixes.mjs`，
+  为 2 通过、0 失败、0 跳过。`npm run check` 通过，仅有既有 npm store-dir 配置警告。
+- 最终版本 `npm test` 共 136 项，133 通过、1 失败、2 平台条件跳过，包含全部
+  46 项 router-fixes。唯一失败为 Windows 服务测试 `Get-CimInstance` 退出码 5，
+  bad-port 与 WLB 502 均未复现。核对该测试仅使用临时状态与自建进程后，沙箱外执行
+  `node --test --test-name-pattern="Windows stop terminates only the verified service process tree" test/windows-service-process.mjs`，
+  为 1 通过、0 失败、0 跳过。此单项复验未改变全套原始统计。
+- 文档 1 个 JSON 示例解析通过，36 个链接通过 HTTPS/URL 语法及本地路径存在性检查，
+  本轮未重新访问外部页面。新增内容秘密模式与合成凭据检查、`git diff --check` 通过。
+
+仅 `test/router-fixes.mjs` 与本审计文档新增未提交内容，暂存区为空。生产源码、
+供应商配置均无差异，未执行正式 Router、主/子/Pi 路由或持久凭据变更操作。
+以上为上轮保留未提交时的状态。两项新增回归及验收矩阵现已通过审核层 Review，
+纳入本次本地验收提交。
+
+本次提交前 `node --test test/router-fixes.mjs` 为 46 通过、0 失败、0 跳过，
+`npm run check`、`git diff --check` 及新增内容秘密扫描通过。生产逻辑与测试内容
+沿用已审核版本，本次未重复完整 `npm test`，上轮全套及沙箱外单项复验统计保留如上。

@@ -14,6 +14,7 @@ import { ResponseUsageTransform } from "../src/response-usage.mjs";
 import { readResponseTextLimited } from "../src/http-utils.mjs";
 import { isUsageExhausted, sanitizeUpstreamText } from "../src/error-translation.mjs";
 import { statusIsReady } from "../src/status.mjs";
+import { fetchWithRetry } from "../src/upstream-retry.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const callerKey = "test-router-caller-capability-with-sufficient-length";
@@ -346,6 +347,174 @@ test("透明转发：未知压缩历史保持原样，Router 自产摘要按标�
       }
     }
   } finally { await router.close(); await close(upstream); }
+});
+
+test("跨供应商连续历史：工具关联、reasoning、独立子代理与自产摘要回放", async () => {
+  const received = [];
+  const nativeReasoning = {
+    type: "reasoning", encrypted_content: "gAAAAABpublic-native-shape-fixture", summary: [],
+    content: [{ type: "reasoning_text", text: "public output-only fixture" }],
+  };
+  const call = { type: "function_call", call_id: "call_public", name: "read_fixture", arguments: "{}" };
+  const wlbOutput = [
+    { type: "reasoning", encrypted_content: "public-wlb-plaintext-fixture", summary: [] },
+    { type: "message", role: "assistant", content: [{ type: "output_text", text: "public WLB reply" }] },
+  ];
+  const summary = "Public checkpoint: fixture code is CEDAR.";
+  const upstream = (provider) => http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks));
+    received.push({ provider, body, authorization: request.headers.authorization });
+    const unknownCompaction = body.input.some((item) => item.type === "compaction");
+    const nativeOrphan = provider === "official" && body.input.some((item) =>
+      item.type === "function_call_output" && !item.call_id);
+    response.writeHead(unknownCompaction || nativeOrphan ? 400 : 200, { "Content-Type": "application/json" });
+    if (unknownCompaction || nativeOrphan) {
+      response.end(JSON.stringify({ error: { type: "fixture_rejection", code: "fixture_history_rejected", message: "Public fixture history rejected." } }));
+      return;
+    }
+    const summarizing = body.input.at(-1)?.content?.[0]?.text?.includes("CONTEXT CHECKPOINT COMPACTION");
+    const output = summarizing
+      ? [{ type: "message", role: "assistant", content: [{ type: "output_text", text: summary }] }]
+      : provider === "official" ? [nativeReasoning, call] : wlbOutput;
+    response.end(JSON.stringify({ status: "completed", output }));
+  });
+  const official = upstream("official");
+  const wlb = upstream("wlb");
+  const supergpt = upstream("supergpt");
+  const officialPort = await listen(official);
+  const wlbPort = await listen(wlb);
+  const supergptPort = await listen(supergpt);
+  const router = await startRouter({
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${officialPort}`,
+    WLB_BASE_URL: `http://127.0.0.1:${wlbPort}`, WLB_API_KEY: "test-wlb-key",
+    SUPERGPT_BASE_URL: `http://127.0.0.1:${supergptPort}`, SUPERGPT_API_KEY: "test-supergpt-key",
+    CODEX_ROUTER_SESSIONS_PATH: "", CODEX_ROUTER_SESSION_INDEX: "",
+  });
+  const setMain = (provider) => writeFileSync(path.join(router.stateDir, "gpt-route.json"), JSON.stringify({ version: 1, route: provider }));
+  const send = async (provider, input, subagent = false) => {
+    const before = received.length;
+    const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/responses`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json", Authorization: "Bearer test-official-key",
+        ...(subagent ? { "X-OpenAI-Subagent": "true" } : {}),
+      },
+      body: JSON.stringify({ model: "gpt-fixture", stream: false, store: false, input }),
+    });
+    const payload = await response.json();
+    assert.equal(received.length, before + 1, "one upstream request, without fallback or relay");
+    assert.equal(received.at(-1).provider, provider);
+    assert.equal(received.at(-1).authorization, `Bearer test-${provider}-key`);
+    return { status: response.status, payload };
+  };
+  const user = { type: "message", role: "user", content: [{ type: "input_text", text: "Public fixture code is CEDAR." }] };
+  const paired = { type: "function_call_output", call_id: "call_public", output: "public tool result" };
+  const orphan = { type: "function_call_output", namespace: "agent", name: "snapshot", output: "public snapshot" };
+  const folded = { type: "message", role: "user", content: [{ type: "input_text", text: "[孤立工具结果：agent.snapshot]\npublic snapshot" }] };
+  try {
+    const first = await send("official", [user]);
+    assert.equal(first.status, 200);
+    const history = [user, ...first.payload.output, paired, orphan];
+    setMain("wlb");
+    const second = await send("wlb", history);
+    assert.equal(second.status, 200);
+    assert.deepEqual(received.at(-1).body.input, [user, nativeReasoning, call, paired, folded]);
+    history.push(...second.payload.output);
+    const routedHistory = [user, nativeReasoning, call, paired, folded, ...second.payload.output];
+    assert.equal((await send("wlb", history)).status, 200);
+    assert.deepEqual(received.at(-1).body.input, routedHistory);
+
+    setMain("supergpt");
+    assert.equal((await send("supergpt", history)).status, 200);
+    assert.deepEqual(received.at(-1).body.input, routedHistory);
+    writeFileSync(path.join(router.stateDir, "subagent-route.json"), JSON.stringify({ version: 1, route: "wlb" }));
+    assert.equal((await send("wlb", history, true)).status, 200);
+    assert.deepEqual(received.at(-1).body.input, routedHistory);
+    assert.equal(JSON.parse(readFileSync(path.join(router.stateDir, "gpt-route.json"))).route, "supergpt");
+
+    setMain("official");
+    assert.equal((await send("official", history)).status, 400, "official path preserves the orphan for upstream validation");
+    const { content, ...replayableShape } = nativeReasoning;
+    const nativeHistory = [user, replayableShape, call, paired, orphan, second.payload.output[1]];
+    assert.deepEqual(received.at(-1).body.input, nativeHistory);
+    assert.equal((await send("official", history.filter((item) => item !== orphan))).status, 200);
+    assert.deepEqual(received.at(-1).body.input, nativeHistory.filter((item) => item !== orphan));
+
+    setMain("wlb");
+    const compact = await send("wlb", [...history, { type: "compaction_trigger" }]);
+    assert.equal(compact.status, 200);
+    assert.equal(received.at(-1).body.stream, true);
+    assert.deepEqual(received.at(-1).body.tools, []);
+    assert.deepEqual(received.at(-1).body.input.slice(0, -1), routedHistory);
+    assert.match(compact.payload.output[0].encrypted_content, /^kcr1:/);
+    assert.equal(Buffer.from(compact.payload.output[0].encrypted_content.slice(5), "base64").toString("utf8"), summary);
+    const replay = [...compact.payload.output, user];
+    let restored;
+    for (const provider of ["wlb", "supergpt", "official"]) {
+      setMain(provider);
+      assert.equal((await send(provider, replay)).status, 200);
+      const actual = received.at(-1).body.input;
+      assert.equal(actual[0].type, "message");
+      assert.equal(actual[0].role, "user");
+      assert.ok(actual[0].content[0].text.endsWith(summary));
+      assert.deepEqual(actual[1], user);
+      if (restored) assert.deepEqual(actual, restored);
+      restored = actual;
+    }
+    const unknown = { type: "compaction", encrypted_content: "public-unknown-opaque-fixture" };
+    for (const provider of ["supergpt", "official"]) {
+      setMain(provider);
+      const rejected = await send(provider, [unknown, user]);
+      assert.equal(rejected.status, 400);
+      assert.deepEqual(received.at(-1).body.input, [unknown, user]);
+      assert.ok(rejected.payload.error);
+      assert.equal(rejected.payload.output, undefined);
+    }
+  } finally {
+    await router.close();
+    await Promise.all([close(official), close(wlb), close(supergpt)]);
+  }
+});
+
+test("重试安全：输出后、取消、预算耗尽及非重试状态停止，允许重试保持请求不变", async () => {
+  const init = { method: "POST", body: Buffer.from('{"input":"public fixture"}') };
+  for (const scenario of [
+    { name: "recover", statuses: [503, 200], expected: 2 },
+    { name: "retry-limit", statuses: [502, 502, 502], expected: 3 },
+    { name: "already-relayed", statuses: [503], canRetry: false, expected: 1 },
+    { name: "budget", statuses: [504], elapsed: 101, expected: 1 },
+    { name: "rate-limit", statuses: [429], expected: 1 },
+    { name: "origin-error", statuses: [500], expected: 1 },
+  ]) {
+    let attempts = 0;
+    let canceled = 0;
+    let clockReads = 0;
+    const result = await fetchWithRetry("http://127.0.0.1/public-fixture", init, {
+      retries: 2, backoffMs: 0, budgetMs: 100,
+      now: () => clockReads++ === 0 ? 0 : (scenario.elapsed ?? 0),
+      canRetry: () => scenario.canRetry !== false,
+      fetchImpl: async (target, actual) => {
+        assert.equal(target, "http://127.0.0.1/public-fixture");
+        assert.strictEqual(actual, init);
+        assert.equal(actual.body.toString(), '{"input":"public fixture"}');
+        return { status: scenario.statuses[attempts++], body: { cancel: async () => { canceled++; } } };
+      },
+    });
+    assert.equal(attempts, scenario.expected, scenario.name);
+    assert.equal(result.retries, attempts - 1, scenario.name);
+    assert.equal(result.response.status, scenario.statuses.at(-1), scenario.name);
+    assert.equal(canceled, attempts - 1, scenario.name);
+  }
+  const controller = new AbortController();
+  let attempts = 0;
+  await assert.rejects(fetchWithRetry("http://127.0.0.1/public-fixture", init, {
+    retries: 2, backoffMs: 0, budgetMs: 100, now: () => 0, signal: controller.signal,
+    fetchImpl: async () => { attempts++; return new Response(null, { status: 503 }); },
+    sleepImpl: async () => { controller.abort(); },
+  }), { name: "AbortError" });
+  assert.equal(attempts, 1);
 });
 
 test("透明转发：兼容项独立启停，错误保留结构并脱敏，零用量补偿需显式开启", async () => {

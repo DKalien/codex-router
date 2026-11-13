@@ -183,12 +183,24 @@ Codex 后端；主代理或子代理选择 `wlb` 或 `supergpt` 时注入对应�
 空间的旧 slug，它会解析服务商，将模型名替换为 `upstreamModel`，
 读取对应密钥，再使用服务商的 `Authorization` 请求头直接发送
 `POST <provider base URL>/responses`。Codex 的账户和安装凭据不会发送给第三方
-服务商。数据流会直接透传；`/responses/compact` 使用相同的直连路径，并在需要时
-生成由路由器管理的续接摘要。摘要响应含 error、明确的非 completed 状态或空白
+服务商。请求查询参数与安全白名单内的协议头会保留。供应商兼容由片段中的
+`compatibility` 逐项开启；WLB / SuperGPT 显式保留已有的孤立结果折算、metadata 删除、
+协作转接、流式摘要压缩和错误翻译。完整转换清单及配置迁移见
+[请求与响应转换审计](ROUTER-TRANSPARENCY.md)。`/responses/compact` 在开启
+`summarizeCompaction` 时生成由路由器管理的续接摘要，摘要始终使用 `stream=true`。
+摘要响应含 error、明确的非 completed 状态或空白
 摘要时返回 502，不生成替换历史；省略 status 但摘要有效时仍兼容。部分中转即使
 `stream=false` 也返回事件流：路由器先按 JSON 解析，失败后按有界 SSE 事件取
 `response.completed` / `response.failed`，`error` 事件作为上游错误体交统一翻译
-与脱敏，避免解析失败被误报成本地 502。
+与脱敏，避免解析失败被误报成本地 502。未开启摘要兼容时使用原始 compact 端点或
+trigger，并在 32 MiB 有界缓冲内验证有效 compaction 输出后原样交付响应；失败、
+不完整、空结果返回 502。未知供应商压缩历史保持原项，Router 自有 `kcr1:` 摘要继续恢复。
+
+供应商级 `compatibility.omitReasoningParameters=true` 会通过共享的顶层参数处理入口，
+在普通、原生 compact 与摘要请求中删除 `reasoning` 和 `reasoning_effort`，input 中的
+reasoning item 保留。该项默认关闭。旧 keyless 配置需按上游参数能力显式选择 true/false，
+尚未设置时 Router 每次启动输出一次迁移提示；keyless 认证使用 `Bearer local` 占位值。
+历史剔除逻辑的证据指向旧 LiteLLM 路径，实际直接 Responses 实现需按版本独立验证。
 
 `GET /models` 和 `GET /v1/models` 始终使用官方身份透传到官方上游，并保留请求查询
 参数和官方完整响应元数据；WLB 和 SuperGPT 路由不会把模型列表替换成本地简化目录。没有当前
@@ -201,7 +213,9 @@ SSE。字段名可跨 chunk，开头允许 UTF-8 BOM、注释和空行；探测�
 包括跨 chunk 的 CRLF；空行 CR 到达即交付事件，不等待后续字节。按固定块积累事件
 避免逐 chunk 全量复制，单事件缓存上限 8 MiB。用量统计超限时释放已缓存原字节并
 继续透传，跳过该事件解析，在下一事件恢复；未修改的事件始终保持原字节。第三方输入 Token 的兜底估算会扣除 `encrypted_content` 字符串值，
-因为这些密文不是模型可见提示词；未知字段仍默认计入，保持向上估算。
+因为这些密文不是模型可见提示词；未知字段仍默认计入，保持向上估算。只有供应商显式
+开启 `compatibility.estimateZeroInputTokens` 才会把估算值写回零用量响应，当前两家均未开启。
+`CODEX_ROUTER_ZERO_INPUT_ESTIMATE=0` 继续作为强制关闭开关。
 
 第三方路由仍需回放的标准原生 `agent_message` envelope 可能只含不可由本地解开的
 `encrypted_content`。路由器使用原生 Codex 后端的受控 function call 取回明文，
@@ -235,7 +249,7 @@ Windows 原生解码器崩溃。后台凭据 ACL 与服务管理的非交互 Pow
 协作载荷 relay 和 compact 响应分别最多缓冲 4 MiB 与 32 MiB，超限会立即取消上游
 流；这些限制在数据到达时执行，不会先由 `arrayBuffer()` 无界收集。
 
-第三方普通和压缩请求共用历史规范化入口：缺少有效调用 ID 的孤立工具结果无法与
+开启 `compatibility.orphanToolOutputs` 的第三方普通和压缩请求共用历史规范化入口：缺少有效调用 ID 的孤立工具结果无法与
 调用配对，严格的标准 Responses HTTP 上游会以 `function_call_output requires
 call_id` 拒绝整个请求（如 Codex apps 注入的 `codex_app` / `agent` 命名空间页面
 快照）。路由器对任意命名空间的孤立结果保留命名空间、名称及原始输出文本（结构化

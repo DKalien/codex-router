@@ -2,6 +2,11 @@
 
 ## Lite 分支（未发布）
 
+- 第三方协议转换改为供应商 `compatibility` 显式启用，WLB / SuperGPT 保留已有专项兼容。
+  默认保留查询参数、协议头白名单、JSON 未知字段和成功响应字节；移除旧 LiteLLM 空消息
+  过滤，零输入 Token 补偿需单独开启。未知压缩历史保持原样，原生 compact 路径验证失败、
+  不完整、空和超限结果；新增合成 fixture 的直连/Router A/B 与兼容项独立启停回归。
+  自定义注册表迁移、完整转换清单及真实供应商验证缺口见 `docs/ROUTER-TRANSPARENCY.md`。
 - 第三方压缩兼容 `stream=false` 仍返回 SSE 的中转：先按 JSON 解析，失败后按有界
   SSE 事件取 `response.completed` / `response.failed`，`error` 事件作为上游错误体
   统一翻译脱敏，不再把解析失败冒泡成本地 502。

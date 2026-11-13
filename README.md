@@ -260,6 +260,32 @@ POSIX：`bin/model-router codex pi enable|disable|status`；路由切换使用
 - 第三方是否支持 Pi 选中的模型及其工具/推理能力由上游决定；同一任务中途切换
   服务商同样有历史上下文兼容风险。
 
+## 第三方协议兼容
+
+第三方 Responses 请求默认保留 JSON 字段、input 顺序、工具关联、reasoning、未知字段和
+查询参数。协议请求头使用安全白名单，供应商认证独立，官方账户、Cookie 和安装信息继续隔离。
+普通成功 JSON/SSE 响应默认按原字节传递，用量统计只观察。
+
+WLB / SuperGPT 的供应商片段通过 `compatibility` 显式保留已有的孤立工具结果折算、
+`client_metadata` 删除、协作 payload 转接、流式摘要压缩与错误翻译。每项可独立设为
+`false`，缺省均为关闭。当前两家的原生 compact 能力尚待验证，继续使用摘要路径。
+Router 自有 `kcr1:` 摘要继续恢复为可读历史，未知供应商 compaction 原样保留。
+
+自定义 `MODEL_ROUTER_REGISTRY` / `CODEX_ROUTER_REGISTRY` 需要按上游实际需求补入兼容项。
+依赖旧行为的配置可参考 `config/wlb/wlb.json` 或 `config/supergpt/supergpt.json` 迁移。
+旧空消息过滤已移除。零输入 Token 补偿默认关闭，只有供应商显式配置
+`compatibility.estimateZeroInputTokens=true` 才启用，环境变量
+`CODEX_ROUTER_ZERO_INPUT_ESTIMATE=0` 仍可强制关闭。配置更改需重启 Router。
+
+旧自定义 keyless 配置升级时应显式设置 `compatibility.omitReasoningParameters`。
+设为 `true` 会在普通、原生 compact 和摘要请求中删除顶层 `reasoning` / `reasoning_effort`，
+适用于确认拒绝这些参数的上游；设为 `false` 保持透明传递。input 中的 reasoning item
+独立保留。该项缺省关闭，未显式选择的 keyless 供应商会在启动时收到一次迁移提示。
+keyless 表示回环目标无需真实密钥，实际参数能力需按上游版本确认。完整配置示例见审计文档。
+
+转换清单、各兼容项的依据、原生压缩验证规则与本地 A/B 覆盖见
+[请求与响应转换审计](docs/ROUTER-TRANSPARENCY.md)。
+
 ## 维护
 
 - 更新官方模型：无需重建本地目录，Codex 会自行更新官方模型目录。

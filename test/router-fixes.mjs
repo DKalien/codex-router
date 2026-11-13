@@ -100,6 +100,416 @@ async function startRouter(overrides = {}) {
   };
 }
 
+function writeCompatibilityRegistry(directory, compatibility) {
+  const providers = ["wlb", "supergpt"].map((name) => ({
+    ...JSON.parse(readFileSync(path.join(root, "config", name, `${name}.json`))).providers[0],
+    compatibility,
+  }));
+  const registryPath = path.join(directory, "registry.json");
+  writeFileSync(registryPath, JSON.stringify({ version: 1, providers, models: [] }));
+  return registryPath;
+}
+
+test("Keyless 回环请求默认透明保留推理参数，严格上游可显式启用兼容剔除", async () => {
+  const fixture = JSON.parse(readFileSync(path.join(root, "test/fixtures/responses-transparency.json")));
+  const received = [];
+  let strict = false;
+  const upstream = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks));
+    received.push({ url: request.url, headers: request.headers, body });
+    const unsupported = ["reasoning", "reasoning_effort"].find((name) => Object.hasOwn(body, name));
+    if (strict && unsupported) {
+      response.writeHead(400, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: { type: "invalid_request_error", code: "unsupported_parameter", param: unsupported, message: `Unsupported parameter ${unsupported}` } }));
+      return;
+    }
+    const kind = new URL(request.url, "http://localhost").searchParams.get("reply");
+    response.writeHead(200, { "Content-Type": kind.includes("sse") ? "text/event-stream" : "application/json" });
+    response.end(kind === "summary"
+      ? JSON.stringify({ status: "completed", output: [{ type: "message", content: [{ type: "output_text", text: "keyless fixture summary" }] }] })
+      : fixture[kind]);
+  });
+  const port = await listen(upstream);
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-keyless-"));
+  const registryPath = path.join(directory, "registry.json");
+  const cases = [
+    { endpoint: "responses", kind: "json_response" },
+    { endpoint: "responses", kind: "sse_response" },
+    { endpoint: "responses", kind: "json_response", pi: true },
+    { endpoint: "responses/compact", kind: "compact_response", compact: true },
+    { endpoint: "responses", kind: "compact_sse_response", compact: true, trigger: true },
+  ];
+  try {
+    // 同一严格 mock 在移除两个字段后接受请求，固定升级回归的适用条件。
+    const legacy = { model: "fixture", input: [] };
+    strict = true;
+    const legacyResponse = await fetch(`http://127.0.0.1:${port}/v1/responses?reply=json_response`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(legacy),
+    });
+    assert.equal(legacyResponse.status, 200);
+    await legacyResponse.arrayBuffer();
+    for (const compatibility of [undefined, {}, { omitReasoningParameters: false }, { omitReasoningParameters: true }, { omitReasoningParameters: true, summarizeCompaction: true }]) {
+      writeFileSync(registryPath, JSON.stringify({
+        version: 1,
+        providers: [{ id: "local-fixture", displayName: "Local Fixture", ownedBy: "fixture", kind: "openai-compatible", protocol: "openai-responses", keyless: true, baseUrl: `http://127.0.0.1:${port}/v1`, compatibility }],
+        models: [{ slug: "local-fixture/model", provider: "local-fixture", upstreamModel: "fixture", gatewayModel: "local-fixture-model" }],
+      }));
+      const router = await startRouter({
+        MODEL_ROUTER_REGISTRY: registryPath,
+        CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${port}/v1`, PI_NATIVE_BASE_URL: `http://127.0.0.1:${port}/v1`,
+        CODEX_ROUTER_SESSIONS_PATH: "", CODEX_ROUTER_SESSION_INDEX: "",
+      });
+      try {
+        for (const rejectReasoning of [false, true]) {
+          strict = rejectReasoning;
+          for (const mode of cases) {
+            const payload = { ...structuredClone(fixture.request), model: "local-fixture/model", reasoning_effort: "high", stream: mode.kind.includes("sse") };
+            if (mode.trigger) payload.input.push({ type: "compaction_trigger" });
+            const summary = compatibility?.summarizeCompaction && mode.compact;
+            const kind = summary ? "summary" : mode.kind;
+            const query = `?fixture=keyless&reply=${kind}`;
+            const before = received.length;
+            const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/${mode.pi ? "pi/v1" : "v1"}/${mode.endpoint}${query}`, {
+              method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer official-fixture", "ChatGPT-Account-Id": "private-fixture" },
+              body: JSON.stringify(payload),
+            });
+            const text = await response.text();
+            const omitted = compatibility?.omitReasoningParameters === true;
+            assert.equal(response.status, strict && !omitted ? 400 : 200, text);
+            assert.equal(received.length, before + 1, "参数拒绝不会触发重试或官方回退");
+            const actual = received.at(-1);
+            assert.equal(actual.url, `/v1/${summary ? "responses" : mode.endpoint}${query}`);
+            assert.equal(actual.headers.authorization, "Bearer local");
+            assert.equal(actual.headers["chatgpt-account-id"], undefined);
+            const expected = { ...payload, model: "fixture" };
+            if (omitted) {
+              delete expected.reasoning;
+              delete expected.reasoning_effort;
+            }
+            if (summary) {
+              expected.stream = true;
+              expected.tools = [];
+              delete expected.previous_response_id;
+              expected.input = payload.input.filter((item) => item.type !== "compaction_trigger");
+              assert.match(actual.body.input.at(-1).content[0].text, /CONTEXT CHECKPOINT COMPACTION/);
+              assert.deepEqual(actual.body.input.slice(0, -1), expected.input);
+              expected.input = actual.body.input;
+            }
+            assert.deepEqual(actual.body, expected);
+            if (response.status === 400) assert.equal(JSON.parse(text).error.code, "unsupported_parameter");
+            else if (summary) {
+              const expectedSummary = mode.trigger
+                ? "kcr1:" + Buffer.from("keyless fixture summary").toString("base64")
+                : "keyless fixture summary";
+              assert.ok(text.includes(expectedSummary));
+            }
+            else assert.equal(text, fixture[kind], "成功的 JSON/SSE/原生 compact 响应保持原字节");
+          }
+        }
+        if (compatibility?.omitReasoningParameters) {
+          strict = false;
+          const native = { model: "gpt-keyless-fixture", input: "fixture", reasoning: { effort: "high" }, reasoning_effort: "high" };
+          const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/responses?reply=json_response`, {
+            method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer official-fixture" }, body: JSON.stringify(native),
+          });
+          assert.equal(response.status, 200, await response.text());
+          assert.deepEqual(received.at(-1).body, native, "官方路径保持两个推理参数");
+          assert.equal(received.at(-1).headers.authorization, "Bearer official-fixture");
+        }
+        const hasMigrationNotice = router.stderr().includes("keyless reasoning migration");
+        assert.equal(hasMigrationNotice, compatibility?.omitReasoningParameters === undefined);
+        if (hasMigrationNotice) assert.equal(router.stderr().match(/keyless reasoning migration/g).length, 1);
+      } finally { await router.close(); }
+    }
+  } finally { await close(upstream); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("透明转发 A/B：两家供应商的普通与原生压缩请求保持 JSON 语义及响应字节", async () => {
+  const fixture = JSON.parse(readFileSync(path.join(root, "test/fixtures/responses-transparency.json")));
+  const received = [];
+  let responseKind = "json_response";
+  const upstream = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    received.push({ url: request.url, headers: request.headers, body: JSON.parse(Buffer.concat(chunks)) });
+    response.writeHead(200, {
+      "Content-Type": responseKind.includes("sse") ? "text/event-stream" : "application/json",
+      "X-Fixture-Response": "preserved",
+    });
+    const bytes = Buffer.from(fixture[responseKind]);
+    for (let offset = 0; offset < bytes.length; offset += 3) response.write(bytes.subarray(offset, offset + 3));
+    response.end();
+  });
+  const port = await listen(upstream);
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-transparency-"));
+  const router = await startRouter({
+    MODEL_ROUTER_REGISTRY: writeCompatibilityRegistry(directory),
+    WLB_BASE_URL: `http://127.0.0.1:${port}/v1`, WLB_API_KEY: "test-wlb-key",
+    SUPERGPT_BASE_URL: `http://127.0.0.1:${port}/v1`, SUPERGPT_API_KEY: "test-supergpt-key",
+    CODEX_ROUTER_SESSIONS_PATH: "", CODEX_ROUTER_SESSION_INDEX: "",
+  });
+  try {
+    for (const provider of ["wlb", "supergpt"]) {
+      for (const state of ["gpt-route.json", "subagent-route.json", "pi-route.json"]) {
+        writeFileSync(path.join(router.stateDir, state), JSON.stringify({ version: 1, route: provider }));
+      }
+      for (const client of ["main", "subagent", "pi"]) {
+        for (const kind of ["json_response", "sse_response", "compact_response", "compact_sse_response"]) {
+          responseKind = kind;
+          const payload = structuredClone(fixture.request);
+          payload.instructions = "public fixture ".repeat(500);
+          payload.stream = kind.includes("sse");
+          if (kind === "compact_sse_response") payload.input.push({ type: "compaction_trigger" });
+          const endpoint = kind === "compact_response" ? "responses/compact" : "responses";
+          const suffix = `${endpoint}?fixture=one%20two&repeat=a&repeat=b`;
+          const protocolHeaders = {
+            Accept: payload.stream ? "text/event-stream" : "application/json",
+            "OpenAI-Beta": "responses=fixture", "User-Agent": "fixture-client/1",
+            "X-Client-Request-Id": "fixture-request", "Idempotency-Key": "fixture-idempotency",
+          };
+          const direct = await fetch(`http://127.0.0.1:${port}/v1/${suffix}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer test-${provider}-key`, ...protocolHeaders },
+            body: JSON.stringify(payload),
+          });
+          const expectedResponse = Buffer.from(await direct.arrayBuffer());
+          const directRequest = received.at(-1);
+          const namespace = client === "pi" ? "pi/v1" : "v1";
+          const routed = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/${namespace}/${suffix}`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json", Authorization: "Bearer test-official-key",
+              "ChatGPT-Account-Id": "private-account-fixture", Cookie: "private-cookie-fixture",
+              "OpenAI-Organization": "private-organization-fixture", "OpenAI-Project": "private-project-fixture",
+              "X-Codex-Installation-Id": "private-installation-fixture",
+              ...(client === "subagent" ? { "X-OpenAI-Subagent": "true" } : {}),
+              ...protocolHeaders,
+            },
+            body: JSON.stringify(payload),
+          });
+          const actualResponse = Buffer.from(await routed.arrayBuffer());
+          const actual = received.at(-1);
+          const label = `${provider}/${client}/${kind}`;
+          assert.equal(routed.status, 200, `${label}: ${actualResponse}`);
+          assert.equal(actual.url, directRequest.url, label);
+          assert.deepEqual(actual.body, directRequest.body, label);
+          for (const name of ["authorization", ...Object.keys(protocolHeaders).map((key) => key.toLowerCase())]) {
+            assert.equal(actual.headers[name], directRequest.headers[name], `${label}/${name}`);
+          }
+          for (const name of ["chatgpt-account-id", "cookie", "openai-organization", "openai-project", "x-codex-installation-id", "x-openai-subagent"]) {
+            assert.equal(actual.headers[name], undefined, `${label}/${name}`);
+          }
+          assert.deepEqual(actualResponse, expectedResponse, label);
+          assert.equal(routed.headers.get("x-fixture-response"), "preserved");
+        }
+      }
+    }
+  } finally {
+    await router.close();
+    await close(upstream);
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("透明转发：未知压缩历史保持原样，Router 自产摘要按标记恢复", async () => {
+  const received = [];
+  const upstream = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    received.push(JSON.parse(Buffer.concat(chunks)));
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ output: [{ type: "message", content: [{ type: "output_text", text: "summary" }] }] }));
+  });
+  const port = await listen(upstream);
+  const router = await startRouter({
+    WLB_BASE_URL: `http://127.0.0.1:${port}`, WLB_API_KEY: "test-wlb-key",
+    SUPERGPT_BASE_URL: `http://127.0.0.1:${port}`, SUPERGPT_API_KEY: "test-supergpt-key",
+  });
+  const unknown = { type: "compaction", encrypted_content: "supplier-opaque-fixture", extra: true };
+  const own = { type: "compaction", encrypted_content: "kcr1:" + Buffer.from("saved fixture summary").toString("base64") };
+  const emptyMessage = { type: "message", role: "assistant", content: [{ type: "output_text", text: "  " }] };
+  try {
+    for (const provider of ["wlb", "supergpt"]) {
+      writeFileSync(path.join(router.stateDir, "gpt-route.json"), JSON.stringify({ version: 1, route: provider }));
+      for (const endpoint of ["responses", "responses/compact"]) {
+        const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/${endpoint}`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "gpt-fixture", input: [unknown, own, emptyMessage] }),
+        });
+        assert.equal(response.status, 200, await response.text());
+        const input = received.at(-1).input;
+        assert.deepEqual(input[0], unknown);
+        assert.match(input[1].content[0].text, /saved fixture summary/);
+        assert.deepEqual(input[2], emptyMessage);
+      }
+    }
+  } finally { await router.close(); await close(upstream); }
+});
+
+test("透明转发：兼容项独立启停，错误保留结构并脱敏，零用量补偿需显式开启", async () => {
+  const fixture = JSON.parse(readFileSync(path.join(root, "test/fixtures/responses-transparency.json")));
+  const received = [];
+  let fail = false;
+  const secret = "sk-public-fixture-secret-123456";
+  const upstream = http.createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks));
+    received.push({ url: request.url, body });
+    response.writeHead(fail ? 422 : 200, { "Content-Type": "application/json", "Retry-After": "7" });
+    if (fail) {
+      response.end(JSON.stringify({ error: {
+        type: "fixture_error", code: "fixture_code", param: "future_field", extra: { preserved: true },
+        message: `fixture rejected; Authorization: Bearer ${secret}`,
+      }, future_error_field: true, upstream_note: request.headers.authorization.slice(7) }).replaceAll("test-", "\\u0074est-"));
+    } else if (body.input.at(-1)?.content?.[0]?.text?.includes("CONTEXT CHECKPOINT COMPACTION")) {
+      response.end(JSON.stringify({ status: "completed", output: [{ type: "message", content: [{ type: "output_text", text: "fixture summary" }] }] }));
+    } else response.end(fixture.json_response);
+  });
+  const port = await listen(upstream);
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-compatibility-"));
+  const flags = ["orphanToolOutputs", "omitClientMetadata", "relayAgentPayloads", "summarizeCompaction", "estimateZeroInputTokens", "translateErrors", "omitReasoningParameters"];
+  const disabled = Object.fromEntries(flags.map((name) => [name, false]));
+  try {
+    for (const flag of [...flags, "disabled", "estimate-kill-switch"]) {
+      const compatibility = flag === "disabled" ? disabled : { [flag === "estimate-kill-switch" ? "estimateZeroInputTokens" : flag]: true };
+      const router = await startRouter({
+        MODEL_ROUTER_REGISTRY: writeCompatibilityRegistry(directory, compatibility),
+        WLB_BASE_URL: `http://127.0.0.1:${port}/v1`, WLB_API_KEY: "test-wlb-key",
+        SUPERGPT_BASE_URL: `http://127.0.0.1:${port}/v1`, SUPERGPT_API_KEY: "test-supergpt-key",
+        CODEX_ROUTER_ZERO_INPUT_ESTIMATE: flag === "estimate-kill-switch" ? "0" : "1",
+      });
+      try {
+        assert.equal(router.stderr().includes("keyless reasoning migration"), false);
+        for (const provider of ["wlb", "supergpt"]) {
+          writeFileSync(path.join(router.stateDir, "gpt-route.json"), JSON.stringify({ version: 1, route: provider }));
+          const payload = structuredClone(fixture.request);
+          payload.reasoning_effort = "high";
+          payload.instructions = "public fixture ".repeat(500);
+          const send = (endpoint = "responses") => fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/v1/${endpoint}?fixture=compatibility`, {
+            method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+          });
+          fail = false;
+          const normal = await send();
+          assert.equal(normal.status, 200);
+          const result = await normal.json();
+          const expected = structuredClone(payload);
+          if (compatibility.orphanToolOutputs) {
+            expected.input[6] = { type: "message", role: "user", content: [{ type: "input_text", text: '[孤立工具结果：agent.snapshot]\n{"text":"public fixture"}' }] };
+          }
+          if (compatibility.omitClientMetadata) delete expected.client_metadata;
+          if (compatibility.omitReasoningParameters) {
+            delete expected.reasoning;
+            delete expected.reasoning_effort;
+          }
+          if (compatibility.relayAgentPayloads) {
+            expected.input[8].content[1] = { type: "input_text", text: "provider collaboration fixture" };
+          }
+          assert.deepEqual(received.at(-1).body, expected, `${provider}/${flag}`);
+          assert.equal(result.usage.input_tokens > 0, flag === "estimateZeroInputTokens", flag);
+
+          if (compatibility.summarizeCompaction) {
+            const compact = await send("responses/compact");
+            assert.equal(compact.status, 200, await compact.text());
+            assert.equal(received.at(-1).url, "/v1/responses?fixture=compatibility");
+            assert.equal(received.at(-1).body.stream, true);
+            assert.deepEqual(received.at(-1).body.client_metadata, payload.client_metadata);
+            assert.equal(received.at(-1).body.previous_response_id, undefined);
+          }
+
+          fail = true;
+          const failed = await send();
+          const errorText = await failed.text();
+          const error = JSON.parse(errorText);
+          assert.equal(failed.status, 422);
+          assert.equal(failed.headers.get("retry-after"), "7");
+          assert.equal(errorText.includes(secret), false);
+          assert.equal(errorText.includes(`test-${provider}-key`), false);
+          assert.equal(router.stderr().includes(secret), false);
+          if (compatibility.translateErrors) assert.equal(error.error.code, "422");
+          else {
+            assert.equal(error.error.type, "fixture_error");
+            assert.equal(error.error.code, "fixture_code");
+            assert.equal(error.error.param, "future_field");
+            assert.deepEqual(error.error.extra, { preserved: true });
+            assert.equal(error.future_error_field, true);
+            assert.equal(error.upstream_note, "[REDACTED]");
+          }
+        }
+      } finally { await router.close(); }
+    }
+  } finally { await close(upstream); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("透明转发：原生 compact 拒绝失败、不完整、空和超限结果", async () => {
+  let body = "{}";
+  const upstream = http.createServer(async (request, response) => {
+    for await (const _ of request) {}
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(body);
+  });
+  const port = await listen(upstream);
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-native-compact-"));
+  const router = await startRouter({
+    MODEL_ROUTER_REGISTRY: writeCompatibilityRegistry(directory),
+    WLB_BASE_URL: `http://127.0.0.1:${port}`, WLB_API_KEY: "test-wlb-key",
+  });
+  writeFileSync(path.join(router.stateDir, "gpt-route.json"), JSON.stringify({ version: 1, route: "wlb" }));
+  const output = [{ type: "compaction", encrypted_content: "fixture-ciphertext" }];
+  try {
+    for (const endpoint of ["responses/compact", "responses"]) {
+      for (const invalid of [
+        "{}", "not JSON", '{"output":[]}',
+        JSON.stringify({ status: "failed", output }), JSON.stringify({ status: "incomplete", output }),
+        JSON.stringify({ output: [{ type: "compaction", encrypted_content: " " }] }),
+        '{"error":{"message":"Bearer sk-public-native-compact-secret-123456"}}',
+        'event: response.failed\ndata: {"type":"response.failed","response":{"status":"failed"}}\n\n',
+      ]) {
+        body = invalid;
+        const response = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/${endpoint}`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model: "gpt-fixture", input: endpoint === "responses" ? [{ type: "compaction_trigger" }] : [] }),
+        });
+        const text = await response.text();
+        assert.equal(response.status, 502, invalid);
+        const result = JSON.parse(text);
+        assert.ok(result.error);
+        assert.equal(result.output, undefined);
+        assert.equal(text.includes("sk-public-native-compact-secret-123456"), false);
+      }
+    }
+    body = "x".repeat(33 * 1024 * 1024);
+    const oversized = await fetch(`http://127.0.0.1:${router.routerPort}/_codex-router/${callerKey}/responses/compact`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: "gpt-fixture", input: [] }),
+    });
+    assert.equal(oversized.status, 502);
+    assert.equal((await oversized.json()).output, undefined);
+  } finally { await router.close(); await close(upstream); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("透明转发：注册表验证兼容项名称与 boolean 类型", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-compatibility-schema-"));
+  try {
+    for (const [compatibility, valid] of [
+      [undefined, true], [{}, true], [{ orphanToolOutputs: true, translateErrors: false }, true],
+      [{ omitReasoningParameters: true }, true], [{ omitReasoningParameters: false }, true],
+      [null, false], [[], false], [true, false], [{ orphanToolOutputs: "true" }, false],
+      [{ omitReasoningParameters: "true" }, false], [{ omitReasoningParameters: null }, false], [{ omitReasoningParameters: 1 }, false],
+      [{ estimateZeroInputTokens: 1 }, false], [{ unknownFlag: true }, false],
+    ]) {
+      const registryPath = writeCompatibilityRegistry(directory, compatibility);
+      const result = spawnSync(process.execPath, ["--input-type=module", "-e", "await import('./src/model-registry.mjs')"], {
+        cwd: root, encoding: "utf8", windowsHide: true,
+        env: { ...process.env, MODEL_ROUTER_REGISTRY: registryPath },
+      });
+      assert.equal(result.status, valid ? 0 : 1, JSON.stringify(compatibility));
+      if (!valid) assert.match(result.stderr, /compatibility/);
+    }
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 test("原生 GPT 主代理和子代理分别遵循各自供应商路由，旧命名空间和错误边界保持不变", async () => {
   const received = [];
   const receivedUrls = [];

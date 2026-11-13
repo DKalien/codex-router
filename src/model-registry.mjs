@@ -173,6 +173,22 @@ function loadRegistry() {
       if (provider.protocol !== "openai-responses") {
         fail(`provider ${provider.id} requires protocol openai-responses; legacy gateway protocols are retired`);
       }
+      if (provider.compatibility !== undefined) {
+        const compatibility = provider.compatibility;
+        const flags = new Set([
+          "orphanToolOutputs", "omitClientMetadata", "relayAgentPayloads",
+          "summarizeCompaction", "estimateZeroInputTokens", "translateErrors",
+          "omitReasoningParameters",
+        ]);
+        if (!compatibility || typeof compatibility !== "object" || Array.isArray(compatibility)) {
+          fail(`provider ${provider.id} has an invalid compatibility object`);
+        }
+        for (const [name, value] of Object.entries(compatibility)) {
+          if (!flags.has(name) || typeof value !== "boolean") {
+            fail(`provider ${provider.id} has an invalid compatibility.${name}`);
+          }
+        }
+      }
     }
     providers.set(provider.id, Object.freeze(provider));
   }

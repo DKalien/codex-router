@@ -139,6 +139,13 @@
   `node --test test/graceful-shutdown.mjs`。
 - 修改注册表时必须保留 slug 命名空间格式（`<provider>/<model>`），并通过
   `src/model-registry.mjs` 的验证器。
+- 第三方协议兼容通过供应商 `compatibility` 的 boolean 项显式开启，未知项或非法类型
+  必须拒绝。WLB / SuperGPT 的现有兼容由各自片段保留，默认路径保留请求 JSON 语义、
+  查询参数和成功响应字节。未知 compaction 保留原项，仅解开 Router 自有 `kcr1:` 标记；
+  原生 compact 成功响应有界验证后交付。零输入 Token 补偿需供应商显式开启，
+  `CODEX_ROUTER_ZERO_INPUT_ESTIMATE=0` 可强制关闭。修改相关路径运行
+  `node --test test/router-fixes.mjs test/response-usage-hardening.mjs test/http-health-bounds.mjs`，
+  转换清单与迁移规则见 `docs/ROUTER-TRANSPARENCY.md`。
 - 绝不能记录或提交凭据。持久化的服务商密钥只能通过 `provider-key set` 或
   `writeProviderCredential` 写入 `~/.codex/codex-router/*.secret`；不得记录临时
   环境变量中的密钥。

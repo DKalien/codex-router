@@ -60,7 +60,7 @@ import {
 } from "./response-usage.mjs";
 import { fetchWithRetry, sleep } from "./upstream-retry.mjs";
 import { activityMetadataFromHeaders } from "./codex-session-names.mjs";
-import { isUsageExhausted, translateGatewayError } from "./error-translation.mjs";
+import { isUsageExhausted, sanitizeUpstreamText, translateGatewayError } from "./error-translation.mjs";
 import { createAutoRouteController } from "./auto-route.mjs";
 import {
   writeAutoRouteStatus,
@@ -127,10 +127,7 @@ function officialUsageExhausted(status, bodyText) {
 const CALLER_KEY = process.env.CODEX_ROUTER_CALLER_KEY;
 const QUIET =
   process.env.CODEX_ROUTER_QUIET === "1" || process.env.KIMI_PROXY_QUIET === "1";
-// Kill switch for the zero-prompt-token substitution (#95). It is on because a
-// provider that reports no prompt tokens breaks compaction outright, but an
-// operator who would rather see the provider's own numbers can turn it off
-// without downgrading the router.
+// Explicit provider opt-in is also required for the legacy zero-usage repair.
 const ZERO_INPUT_ESTIMATE = process.env.CODEX_ROUTER_ZERO_INPUT_ESTIMATE !== "0";
 const ERROR_STATUS_DURATION_MS = 8_000;
 const configuredDecodedBodyBytes = Number(
@@ -402,19 +399,54 @@ const fallbackDelayNumber = Number(fallbackDelayValue);
 const WLB_FALLBACK_DELAY_MS = fallbackDelayValue?.trim() && Number.isInteger(fallbackDelayNumber) &&
   fallbackDelayNumber >= 0 && fallbackDelayNumber <= 30_000 ? fallbackDelayNumber : 0;
 
-function routedHeaders(credential) {
-  return {
+function routedHeaders(request, credential) {
+  const headers = {
     Authorization: `Bearer ${credential.value}`,
     "Content-Type": "application/json",
     "Accept-Encoding": "identity",
-    "User-Agent": `codex-router/${VERSION}`,
+    "user-agent": `codex-router/${VERSION}`,
   };
+  for (const name of ["accept", "openai-beta", "user-agent", "x-client-request-id", "idempotency-key"]) {
+    const value = request.headers[name];
+    if (value !== undefined) headers[name] = Array.isArray(value) ? value.join(", ") : value;
+  }
+  return headers;
 }
 
-function writeRoutedError(response, status, bodyText, route, retryAfter) {
+function applyRoutedParameterCompatibility(payload, provider) {
+  if (provider.compatibility?.omitClientMetadata) delete payload.client_metadata;
+  if (provider.compatibility?.omitReasoningParameters) {
+    delete payload.reasoning;
+    delete payload.reasoning_effort;
+  }
+}
+
+function writeRoutedError(response, status, bodyText, route, retryAfter, credential) {
   const provider = providerForModel(route);
+  try {
+    // Canonical JSON exposes escaped credentials to exact-value redaction.
+    bodyText = JSON.stringify(JSON.parse(bodyText));
+  } catch {
+    // Plain text and truncated errors use the same redaction below.
+  }
+  if (credential?.value) {
+    bodyText = bodyText
+      .replaceAll(JSON.stringify(credential.value).slice(1, -1), "[REDACTED]")
+      .replaceAll(credential.value, "[REDACTED]");
+  }
   const retryAfterSeconds = Number(retryAfter);
   if (retryAfter) response.setHeader("Retry-After", retryAfter);
+  if (!provider?.compatibility?.translateErrors) {
+    try {
+      const sanitized = JSON.parse(sanitizeUpstreamText(bodyText));
+      if (typeof sanitized?.error?.message === "string") {
+        writeJson(response, status, sanitized);
+        return;
+      }
+    } catch {
+      // Non-standard errors still need a safe Codex error envelope.
+    }
+  }
   writeJson(response, status, translateGatewayError({
     status, bodyText,
     modelName: route.displayName || route.slug,
@@ -501,16 +533,16 @@ function messageItem(text) {
   };
 }
 
-function normalizeRoutedInput(input) {
+function normalizeRoutedInput(input, compatibility) {
   if (!Array.isArray(input)) return input;
   return input
-    .filter((item) => item?.type !== "compaction_trigger")
     .map((item) => {
       // 孤立工具结果缺少 call_id 就无法与调用配对，严格的标准 Responses HTTP
       // 上游会以 "function_call_output requires call_id" 拒绝整个请求（如
       // Codex apps 注入的 namespace "agent" 页面快照）。折算成普通消息保留
       // 命名空间、名称和输出，不伪造没有对应调用的 call_id。
-      if (item?.type !== "function_call_output" || (typeof item.call_id === "string" && item.call_id)) return item;
+      if (!compatibility?.orphanToolOutputs || item?.type !== "function_call_output" ||
+          (typeof item.call_id === "string" && item.call_id)) return item;
       const name = typeof item.name === "string" && item.name
         ? (typeof item.namespace === "string" && item.namespace ? `${item.namespace}.${item.name}` : item.name)
         : "";
@@ -522,38 +554,7 @@ function normalizeRoutedInput(input) {
     .map((item) => {
       if (item?.type !== "compaction") return item;
       const summary = decodeSummary(item.encrypted_content);
-      return messageItem(
-        summary
-          ? `${SUMMARY_PREFIX}\n\n${summary}`
-          : "[Earlier conversation history was compacted in an unreadable format.]",
-      );
-    })
-    .map((item) => {
-      // LiteLLM rejects messages whose text content is empty; Codex emits
-      // such filler assistant messages around tool calls. Strip empty text
-      // parts, and drop messages that carry nothing at all.
-      if (item?.type !== "message" || !Array.isArray(item.content)) return item;
-      const content = item.content.filter((part) => {
-        if (!part || typeof part !== "object") return true;
-        if (
-          (part.type === "input_text" ||
-            part.type === "output_text" ||
-            part.type === "text") &&
-          typeof part.text === "string" &&
-          part.text.trim() === ""
-        ) {
-          return false;
-        }
-        return true;
-      });
-      return { ...item, content };
-    })
-    .filter((item) => {
-      if (item?.type !== "message") return true;
-      if (Array.isArray(item.tool_calls) && item.tool_calls.length > 0) return true;
-      if (typeof item.content === "string") return item.content.trim() !== "";
-      if (Array.isArray(item.content)) return item.content.length > 0;
-      return true;
+      return summary === undefined ? item : messageItem(`${SUMMARY_PREFIX}\n\n${summary}`);
     });
 }
 
@@ -802,9 +803,9 @@ function withAgentPayload(item, plaintext) {
   };
 }
 
-async function normalizeRoutedAgentInput(request, input, signal) {
-  const normalized = normalizeRoutedInput(input);
-  if (!Array.isArray(normalized)) return normalized;
+async function normalizeRoutedAgentInput(request, input, signal, provider) {
+  const normalized = normalizeRoutedInput(input, provider.compatibility);
+  if (!provider.compatibility?.relayAgentPayloads || !Array.isArray(normalized)) return normalized;
   const output = new Array(normalized.length);
   let nextIndex = 0;
   let stopped = false;
@@ -841,10 +842,6 @@ async function normalizeRoutedAgentInput(request, input, signal) {
   );
   if (stopped) throw firstError;
   return output;
-}
-
-async function bridgeVisionInput(input, _route, _request) {
-  return input;
 }
 
 // OpenAI-issued reasoning `encrypted_content` is an opaque token (Fernet-style,
@@ -1061,21 +1058,11 @@ function parseCompactResponse(bytes) {
   }
 }
 
-async function summarize(request, payload, route, signal) {
+async function summarize(request, payload, route, signal, search) {
   const originalInput = Array.isArray(payload.input) ? payload.input : [];
-  // Compaction replays the whole conversation, so any image still in it would
-  // reach the text-only model unbridged and fail the compaction rather than
-  // the turn. The evidence is already cached from the turn that pasted it.
-  //
-  // It replays the collaboration items too, so the agent-payload resolution a
-  // routed turn performs has to happen here as well -- otherwise a compaction
-  // inside a `/goal` or subagent session summarizes opaque payloads. The relay
-  // is cached by ciphertext, so a conversation whose turns already resolved
-  // costs nothing extra here.
-  const bridged = await bridgeVisionInput(
-    await normalizeRoutedAgentInput(request, originalInput, signal),
-    route,
-    request,
+  const provider = providerForModel(route);
+  const input = await normalizeRoutedAgentInput(
+    request, originalInput.filter((item) => item?.type !== "compaction_trigger"), signal, provider,
   );
   const body = {
     ...payload,
@@ -1092,11 +1079,10 @@ async function summarize(request, payload, route, signal) {
     // xAI rejects tool_choice "none" paired with it, so the field is omitted
     // rather than sent redundantly.
     tools: [],
-    input: [...bridged, messageItem(COMPACT_PROMPT)],
+    input: [...input, messageItem(COMPACT_PROMPT)],
   };
   delete body.previous_response_id;
-  delete body.client_metadata;
-  const provider = providerForModel(route);
+  applyRoutedParameterCompatibility(body, provider);
   const credential = resolveProviderCredential(provider);
   if (!credential) {
     return {
@@ -1109,10 +1095,10 @@ async function summarize(request, payload, route, signal) {
       },
     };
   }
-  const upstream = await rejectGenerationRedirect(await fetch(`${providerBaseUrl(provider)}/responses`, {
+  const upstream = await rejectGenerationRedirect(await fetch(`${providerBaseUrl(provider)}/responses${search}`, {
     method: "POST",
     redirect: "manual",
-    headers: routedHeaders(credential),
+    headers: routedHeaders(request, credential),
     body: JSON.stringify(body),
     signal,
   }));
@@ -1122,6 +1108,7 @@ async function summarize(request, payload, route, signal) {
       status: upstream.status,
       bodyText: await readResponseTextLimited(upstream, MAX_UPSTREAM_ERROR_BYTES, { signal }),
       retryAfter: upstream.headers.get("retry-after"),
+      credential,
     };
   }
   let bytes;
@@ -1143,7 +1130,7 @@ async function summarize(request, payload, route, signal) {
   const parsed = parseCompactResponse(bytes);
   if (parsed?.error) {
     // SSE 错误事件没有 HTTP 状态码，按上游失败返回，交给统一翻译与脱敏。
-    return { ok: false, status: 502, bodyText: JSON.stringify({ error: parsed.error }) };
+    return { ok: false, status: 502, bodyText: JSON.stringify({ error: parsed.error }), credential };
   }
   const summary = extractResponseText(parsed);
   if ((parsed?.status !== undefined && parsed.status !== "completed") || !summary.trim()) {
@@ -1152,10 +1139,7 @@ async function summarize(request, payload, route, signal) {
       payload: { error: { type: "invalid_compaction", message: "The provider did not return a complete, non-empty summary; conversation history was not replaced." } },
     };
   }
-  // Compaction is a plain non-streaming call, so the usage block (when the
-  // provider sends one) is already in hand. `tokenUsageFromPayload` returns
-  // undefined when it is absent, and `recordUsageEvent` then omits the token
-  // fields entirely rather than metering an invented zero.
+  // The bounded completed response supplies usage even for streaming summaries.
   const usage = tokenUsageFromPayload(parsed);
   return { ok: true, summary, input: originalInput, usage };
 }
@@ -1200,10 +1184,10 @@ function writeCompactionSse(response, model, summary) {
 
 // Returns what the request path needs to meter and log the compaction, so a
 // routed compaction leaves the same telemetry trail as any other routed turn.
-async function handleRoutedCompaction(request, response, payload, route, signal, v2) {
-  const result = await summarize(request, payload, route, signal);
+async function handleRoutedCompaction(request, response, payload, route, signal, v2, search) {
+  const result = await summarize(request, payload, route, signal, search);
   if (!result.ok) {
-    return { status: result.status, usage: result.usage, payload: result.payload, bodyText: result.bodyText, retryAfter: result.retryAfter };
+    return { status: result.status, usage: result.usage, payload: result.payload, bodyText: result.bodyText, retryAfter: result.retryAfter, credential: result.credential };
   }
   if (v2) {
     if (payload.stream === false) {
@@ -1465,7 +1449,7 @@ async function handleResponses(request, response, requestUrl, client = "codex") 
         attempted.add(selected);
       }
       activity.setRoute({ provider: route ? canonicalProviderId(route.provider) : "openai", model: route?.slug || requestedModel, ...activityMetadata });
-      if (route && (compactV1 || compactV2)) {
+      if (route && providerForModel(route).compatibility?.summarizeCompaction && (compactV1 || compactV2)) {
         const compaction = await handleRoutedCompaction(
           request,
           response,
@@ -1473,6 +1457,7 @@ async function handleResponses(request, response, requestUrl, client = "codex") 
           route,
           controller.signal,
           compactV2,
+          requestUrl.search,
         );
         // Compaction used to return here without metering or logging, so neither
         // a successful nor a failed one appeared anywhere in the router's own
@@ -1493,7 +1478,7 @@ async function handleResponses(request, response, requestUrl, client = "codex") 
         const compactionError = compaction.bodyText ?? JSON.stringify(compaction.payload);
         if (await advanceAutomatic(compaction.status, compactionError) || await fallbackToOfficial(compaction.status, compactionError)) continue;
         if (compaction.bodyText !== undefined) {
-          writeRoutedError(response, compaction.status, compaction.bodyText, route, compaction.retryAfter);
+          writeRoutedError(response, compaction.status, compaction.bodyText, route, compaction.retryAfter, compaction.credential);
         } else {
           writeJson(response, compaction.status, compaction.payload);
         }
@@ -1502,27 +1487,18 @@ async function handleResponses(request, response, requestUrl, client = "codex") 
 
       let target;
       let headers;
+      let credential;
       if (route) {
-        const input = await bridgeVisionInput(
-          await normalizeRoutedAgentInput(request, payload.input, controller.signal),
-          route,
-          request,
-        );
         const provider = providerForModel(route);
+        const input = await normalizeRoutedAgentInput(request, payload.input, controller.signal, provider);
         const routed = {
           ...payload,
           model: route.upstreamModel,
           input,
         };
-        // Native OpenAI traffic keeps client_metadata; routed providers do not
-        // consume it and the strict ones reject the unknown field.
-        delete routed.client_metadata;
+        applyRoutedParameterCompatibility(routed, provider);
         if (autoMode) delete routed.previous_response_id;
-        if (provider?.keyless) {
-          delete routed.reasoning;
-          delete routed.reasoning_effort;
-        }
-        const credential = resolveProviderCredential(provider);
+        credential = resolveProviderCredential(provider);
         if (!credential) {
           writeJson(response, 409, {
             error: {
@@ -1533,8 +1509,8 @@ async function handleResponses(request, response, requestUrl, client = "codex") 
           });
           return;
         }
-        target = `${providerBaseUrl(provider)}/responses`;
-        headers = routedHeaders(credential);
+        target = `${providerBaseUrl(provider)}/responses${compactV1 ? "/compact" : ""}${requestUrl.search}`;
+        headers = routedHeaders(request, credential);
         routedBody = Buffer.from(JSON.stringify(routed), "utf8");
       } else {
         ({ target, headers, routedBody } = await prepareNativeRequest(request, requestUrl, payload, compactV1, client));
@@ -1562,6 +1538,22 @@ async function handleResponses(request, response, requestUrl, client = "codex") 
         },
       ));
       await rejectGenerationRedirect(upstream);
+      if (route && upstream.ok && (compactV1 || compactV2)) {
+        const bytes = await readResponseBody(upstream, { maxBytes: 32 * 1024 * 1024, signal: controller.signal });
+        const parsed = parseCompactResponse(bytes);
+        const valid = !parsed?.error && (parsed?.status === undefined || parsed.status === "completed") &&
+          Array.isArray(parsed?.output) && parsed.output.some((item) =>
+            item?.type === "compaction" && typeof item.encrypted_content === "string" && item.encrypted_content.trim());
+        if (valid) {
+          upstream = new Response(bytes, { status: upstream.status, statusText: upstream.statusText, headers: upstream.headers });
+        } else {
+          const error = parsed?.error ?? {
+            type: "invalid_compaction",
+            message: "The provider did not return a complete, non-empty compaction. Conversation history was not replaced.",
+          };
+          upstream = new Response(JSON.stringify({ error }), { status: 502, headers: { "Content-Type": "application/json" } });
+        }
+      }
       upstreamRetries = retries;
       upstreamStatus = upstream.status;
       // Gateway error bodies leak LiteLLM's internal exception chain, which
@@ -1576,7 +1568,7 @@ async function handleResponses(request, response, requestUrl, client = "codex") 
           durationMs: Date.now() - startedAt,
         });
         if (await advanceAutomatic(upstream.status, bodyText) || await fallbackToOfficial(upstream.status, bodyText)) continue;
-        writeRoutedError(response, upstream.status, bodyText, route, upstream.headers.get("retry-after"));
+        writeRoutedError(response, upstream.status, bodyText, route, upstream.headers.get("retry-after"), credential);
         if (!QUIET) console.error(`[codex-router] model=${requestedModel || "unknown"} provider=${route.provider} status=${upstream.status}`);
         return;
       }
@@ -1593,19 +1585,12 @@ async function handleResponses(request, response, requestUrl, client = "codex") 
     // Native OpenAI responses carry the same `usage` shape as routed ones, so
     // meter both paths; without this, native traffic reports zero tokens.
     //
-    // A routed provider that answers a large prompt with `input_tokens: 0` is
-    // reporting something that cannot be true, and Codex reads exactly that
-    // number to decide when to compact -- opencode's Go endpoint did it for a
-    // whole model family and sessions ran past the context window and died
-    // (#95). The estimate below is offered only for those responses; the
-    // predicate is structural (this request, these bytes, an explicit zero),
-    // so it cannot fire on a provider that reports correctly and it disables
-    // itself the moment the upstream starts reporting again.
+    // Zero-usage repair requires provider evidence and an explicit opt-in.
     usageTransform = new ResponseUsageTransform(
       upstream.headers.get("content-type") || "",
       {
         estimatedInputTokens:
-          ZERO_INPUT_ESTIMATE && route
+          ZERO_INPUT_ESTIMATE && route && providerForModel(route).compatibility?.estimateZeroInputTokens
             ? estimateInputTokens(routedBody, { contextWindow: route.contextWindow })
             : undefined,
       },
@@ -1953,6 +1938,14 @@ process.on("unhandledRejection", (reason) => {
 server.requestTimeout = 0;
 applyKeepAliveTimeouts(server);
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
+  for (const provider of PROVIDERS.values()) {
+    if (provider.keyless && provider.compatibility?.omitReasoningParameters === undefined) {
+      console.error(
+        `[codex-router] keyless reasoning migration provider=${provider.id} ` +
+        "defaults to forwarding reasoning and reasoning_effort. Set compatibility.omitReasoningParameters=true to omit unsupported parameters, or false to confirm passthrough.",
+      );
+    }
+  }
   console.error("[codex-router] listening");
 });
 

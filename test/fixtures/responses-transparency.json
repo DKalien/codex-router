@@ -1,0 +1,28 @@
+{
+  "request": {
+    "model": "gpt-transparency",
+    "stream": false,
+    "store": false,
+    "previous_response_id": "resp_fixture_previous",
+    "client_metadata": { "fixture": "public-test-data" },
+    "reasoning": { "effort": "high", "summary": "auto" },
+    "future_field": { "enabled": true, "values": [0, false, null] },
+    "tools": [{ "type": "function", "name": "read_fixture", "parameters": { "type": "object" } }],
+    "input": [
+      { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "fixture" }] },
+      { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "  " }] },
+      { "type": "reasoning", "encrypted_content": "provider-fixture-ciphertext", "summary": [], "future_reasoning": true },
+      { "type": "function_call", "call_id": "call_fixture", "name": "read_fixture", "arguments": "{}" },
+      { "type": "function_call_output", "call_id": "call_fixture", "output": "paired" },
+      { "type": "function_call_output", "call_id": "call_unpaired", "output": "unpaired" },
+      { "type": "function_call_output", "namespace": "agent", "name": "snapshot", "output": { "text": "public fixture" } },
+      { "type": "compaction", "encrypted_content": "provider-native-compaction-fixture" },
+      { "type": "agent_message", "content": [{ "type": "input_text", "text": "Message Type: MESSAGE\nPayload:" }, { "type": "encrypted_content", "encrypted_content": "provider collaboration fixture" }] },
+      { "type": "future_input_item", "value": { "preserve": true } }
+    ]
+  },
+  "json_response": "{\n  \"id\": \"resp_fixture\", \"output\": [], \"future_response\": true,\n  \"usage\": {\"input_tokens\": 0, \"output_tokens\": 2}\n}\n",
+  "sse_response": ": fixture\r\nevent: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fixture\",\"future_response\":true,\"usage\":{\"input_tokens\":0,\"output_tokens\":2}}}\r\n\r\ndata: [DONE]\r\n\r\n",
+  "compact_response": "{\n  \"output\": [{\"type\":\"compaction\",\"encrypted_content\":\"provider-new-compaction-fixture\",\"future_compaction\":true}]\n}\n",
+  "compact_sse_response": "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"compaction\",\"encrypted_content\":\"provider-new-compaction-fixture\"}]}}\n\n"
+}

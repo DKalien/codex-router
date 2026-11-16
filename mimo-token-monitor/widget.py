@@ -171,6 +171,20 @@ def _window_used_percent(window):
     return window.get("used_percent")
 
 
+def _gpt_window_label(window, default):
+    """Name a GPT window after its declared duration."""
+    seconds = window.get("window_seconds") if isinstance(window, dict) else None
+    if not isinstance(seconds, int) or seconds <= 0:
+        return default
+    if seconds == 7 * 24 * 60 * 60:
+        return "周限额"
+    if seconds % 86400 == 0:
+        return f"{seconds // 86400}天"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}小时"
+    return default
+
+
 def _format_reset_datetime(reset_at, reset_after=None) -> str:
     """Format a reset timestamp for the full-detail views."""
     parsed = _parse_reset_datetime(reset_at, reset_after)
@@ -1035,12 +1049,23 @@ class TokenWidget(QWidget):
         reset_text = _format_reset_datetime(*_reset_parts(tp_weekly))
         if reset_text:
             lines.append(f"WLB 周重置: {reset_text}")
-        has_gpt = bool(self.cfg.get("gpt_session_cookie", "").strip()) or (isinstance(self._gpt_data, dict) and self._gpt_data.get("used_percent") is not None)
+        has_gpt = bool(self.cfg.get("gpt_session_cookie", "").strip()) or isinstance(self._gpt_data, dict)
         gpt_pct = self._gpt_data.get("used_percent") if isinstance(self._gpt_data, dict) else None
         gpt_primary = self._gpt_data.get("primary") if isinstance(self._gpt_data, dict) else None
+        gpt_secondary = self._gpt_data.get("secondary") if isinstance(self._gpt_data, dict) else None
         primary_pct = _window_used_percent(gpt_primary)
-        lines.append(f"GPT 5\u5c0f\u65f6剩余: {self._format_overview_percent(primary_pct, has_gpt)}")
-        lines.append(f"GPT \u5468\u9650\u989d剩余: {self._format_overview_percent(gpt_pct, has_gpt)}")
+        lines.append(
+            f"GPT {_gpt_window_label(gpt_primary, '5小时')}剩余: "
+            f"{self._format_overview_percent(primary_pct, has_gpt)}"
+        )
+        lines.append(
+            f"GPT {_gpt_window_label(gpt_secondary, '周限额')}剩余: "
+            f"{self._format_overview_percent(gpt_pct, has_gpt)}"
+        )
+        if gpt_secondary is None and isinstance(self._gpt_data, dict):
+            plan_type = self._gpt_data.get("plan_type")
+            if isinstance(plan_type, str) and plan_type:
+                lines.append(f"GPT 套餐: {plan_type}")
         if self._gpt_data_time is not None:
             lines.append(f"GPT 数据时间: {self._gpt_data_time:%Y-%m-%d %H:%M:%S}")
         return lines
@@ -2131,7 +2156,7 @@ class TokenWidget(QWidget):
         p.setFont(overview_font)
         has_cookie = bool(self.cfg.get("cookie", "").strip())
         has_api_key = self._tp_key_configured
-        has_gpt = bool(self.cfg.get("gpt_session_cookie", "").strip()) or (isinstance(self._gpt_data, dict) and self._gpt_data.get("used_percent") is not None)
+        has_gpt = bool(self.cfg.get("gpt_session_cookie", "").strip()) or isinstance(self._gpt_data, dict)
 
         rows: list[tuple[str, bool, object]] = [
             (

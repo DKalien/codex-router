@@ -1439,6 +1439,24 @@ class TestGPTCallback(unittest.TestCase):
         self.assertIn("GPT \u5468\u9650\u989d剩余: 60.0%", lines)
         w.close()
 
+    def test_overview_free_plan_live_data_has_no_error_and_shows_actual_window(self):
+        w = _make_widget(display_mode=OVERVIEW_MODE)
+        data = {
+            "primary": {"used_percent": 0.0, "window_seconds": 2592000,
+                        "reset_after_seconds": 2592000},
+            "secondary": None,
+            "plan_type": "free",
+            "source": "local_codex_auth",
+        }
+        w._on_gpt_fetch_done({"ok": True, "data": data})
+
+        self.assertEqual(w._gpt_error, "")
+        lines = w._build_overview_tooltip_lines()
+        self.assertIn("GPT 30天剩余: 100.0%", lines)
+        self.assertIn("GPT 周限额剩余: --", lines)
+        self.assertIn("GPT 套餐: free", lines)
+        w.close()
+
     def test_failure_keeps_last_data_and_marks_it_stale(self):
         w = _make_widget(display_mode=OVERVIEW_MODE)
         old_data = {"used_percent": 30.0, "remaining_percent": 70.0}

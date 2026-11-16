@@ -469,6 +469,23 @@ def _gpt_failure(errors: list | None, source: str, reason: str):
     return None
 
 
+def _gpt_window_seconds(candidate):
+    """Return the declared window duration in seconds, or None."""
+    if not isinstance(candidate, dict):
+        return None
+    try:
+        seconds = int(candidate.get("limit_window_seconds") or 0)
+    except (TypeError, ValueError, OverflowError):
+        seconds = 0
+    if seconds > 0:
+        return seconds
+    try:
+        minutes = int(candidate.get("window_minutes") or 0)
+    except (TypeError, ValueError, OverflowError):
+        minutes = 0
+    return minutes * 60 if minutes > 0 else None
+
+
 def _parse_gpt_window(candidate):
     """Normalize one GPT rate-limit window."""
     if not isinstance(candidate, dict):
@@ -488,6 +505,7 @@ def _parse_gpt_window(candidate):
         "remaining_percent": round(100.0 - used_pct, 2),
         "reset_at": candidate.get("resets_at") or candidate.get("reset_at"),
         "reset_after_seconds": candidate.get("reset_after_seconds") or candidate.get("reset_after"),
+        "window_seconds": _gpt_window_seconds(candidate),
     }
 
 
@@ -516,10 +534,7 @@ def _parse_gpt_windows(data):
             if not isinstance(entry, dict):
                 continue
             window = str(entry.get("window") or entry.get("type") or "").lower()
-            try:
-                seconds = int(entry.get("limit_window_seconds", 0) or 0)
-            except (TypeError, ValueError):
-                seconds = 0
+            seconds = _gpt_window_seconds(entry) or 0
             if window in {"weekly", "7d", "secondary"} or seconds == GPT_WEEKLY_WINDOW_SECONDS:
                 secondary = secondary or entry
             elif window in {"primary", "5h", "5_hour", "5-hour"} or seconds == GPT_PRIMARY_WINDOW_SECONDS:
@@ -533,12 +548,7 @@ def _parse_gpt_windows(data):
 
     # 只有一个窗口时，按时长识别放在 primary 中的周窗口。
     if secondary is None and isinstance(primary, dict):
-        try:
-            seconds = int(primary.get("limit_window_seconds") or
-                          int(primary.get("window_minutes", 0) or 0) * 60)
-        except (TypeError, ValueError, OverflowError):
-            seconds = 0
-        if seconds == GPT_WEEKLY_WINDOW_SECONDS:
+        if _gpt_window_seconds(primary) == GPT_WEEKLY_WINDOW_SECONDS:
             secondary, primary = primary, None
 
     return {"primary": _parse_gpt_window(primary), "secondary": _parse_gpt_window(secondary)}
@@ -550,20 +560,45 @@ def _parse_gpt_secondary_window(data):
     return windows.get("secondary") if windows else None
 
 
-def _gpt_result_with_windows(data, source):
-    windows = _parse_gpt_windows(data)
-    secondary = windows.get("secondary") if windows else None
-    if secondary is None:
+def _gpt_plan_type(data):
+    """Return a sanitized plan type from a usage response, if present."""
+    if not isinstance(data, dict):
         return None
-    result = dict(secondary)
-    result["primary"] = windows.get("primary")
-    result["secondary"] = dict(secondary)
+    source = data.get("data") if isinstance(data.get("data"), dict) else data
+    plan_type = source.get("plan_type")
+    if not isinstance(plan_type, str):
+        return None
+    plan_type = plan_type.strip()
+    if not plan_type or len(plan_type) > 24:
+        return None
+    if not all(ch.isalnum() or ch in "_-" for ch in plan_type):
+        return None
+    return plan_type
+
+
+def _gpt_result_with_windows(data, source):
+    """Build a usage result when any window or plan metadata is present.
+
+    A response without the weekly window is still live data, so callers no
+    longer fall back to stale local history just because that window is missing.
+    """
+    windows = _parse_gpt_windows(data)
+    primary = windows.get("primary") if windows else None
+    secondary = windows.get("secondary") if windows else None
+    plan_type = _gpt_plan_type(data)
+    if primary is None and secondary is None and plan_type is None:
+        return None
+    result = dict(secondary) if isinstance(secondary, dict) else {}
+    result["primary"] = primary
+    result["secondary"] = secondary
     result["source"] = source
+    if plan_type is not None:
+        result["plan_type"] = plan_type
     return result
 
 
 def fetch_gpt_weekly_usage(session_cookie=""):
-    """Fetch GPT weekly (secondary window) usage.
+    """Fetch GPT 5-hour/weekly usage.
 
     Sources tried in order:
       1. Local Codex auth.json (offline, no user config needed)
@@ -571,7 +606,9 @@ def fetch_gpt_weekly_usage(session_cookie=""):
       3. Local JSONL session files (offline fallback)
 
     Returns: {ok, data: {used_percent, remaining_percent, reset_at,
-             reset_after_seconds, source}, error}
+             reset_after_seconds, primary: {...}, secondary: {...}|None,
+             window_seconds, source}, error}
+    Missing windows stay None; a live response with only one window is kept.
     """
     errors = []
     sources = [
@@ -653,7 +690,7 @@ def _gpt_try_local_auth(errors=None):
         resp.close()
     parsed = _gpt_result_with_windows(data, "local_codex_auth")
     if parsed is None:
-        return _gpt_failure(errors, "本机 Codex 登录", "响应中没有 7 天额度窗口")
+        return _gpt_failure(errors, "本机 Codex 登录", "响应中没有可用额度窗口")
 
     return parsed
 
@@ -706,7 +743,7 @@ def _gpt_try_session_cookie(session_cookie="", errors=None):
         resp2.close()
     parsed = _gpt_result_with_windows(data, "session_cookie")
     if parsed is None:
-        return _gpt_failure(errors, "ChatGPT Cookie", "响应中没有 7 天额度窗口")
+        return _gpt_failure(errors, "ChatGPT Cookie", "响应中没有可用额度窗口")
 
     return parsed
 

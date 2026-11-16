@@ -517,6 +517,40 @@ class TestGPTWeeklyUsageParser(unittest.TestCase):
         self.assertEqual(result["remaining_percent"], 38.0)
         self.assertEqual(result["reset_at"], 1792472967)
 
+    def test_free_plan_monthly_window_is_live_data(self):
+        from api_client import _gpt_result_with_windows
+
+        data = {"plan_type": "free", "rate_limit": {
+            "primary_window": {
+                "used_percent": 0,
+                "limit_window_seconds": 2592000,
+                "reset_at": 1797434050,
+                "reset_after_seconds": 2592000,
+            },
+            "secondary_window": None,
+        }}
+        result = _gpt_result_with_windows(data, "local_codex_auth")
+        self.assertIsNotNone(result)
+        self.assertIsNone(result["secondary"])
+        self.assertNotIn("used_percent", result)
+        self.assertEqual(result["primary"]["used_percent"], 0.0)
+        self.assertEqual(result["primary"]["window_seconds"], 2592000)
+        self.assertEqual(result["plan_type"], "free")
+
+    def test_plan_type_without_windows_is_live_data(self):
+        from api_client import _gpt_result_with_windows
+
+        result = _gpt_result_with_windows({"plan_type": "free", "rate_limit": {}}, "local_codex_auth")
+        self.assertIsNotNone(result)
+        self.assertIsNone(result["primary"])
+        self.assertIsNone(result["secondary"])
+        self.assertEqual(result["plan_type"], "free")
+
+    def test_response_without_windows_or_plan_returns_none(self):
+        from api_client import _gpt_result_with_windows
+
+        self.assertIsNone(_gpt_result_with_windows({"detail": "unauthorized"}, "local_codex_auth"))
+
     def test_new_format_rate_limits_list(self):
         from api_client import _parse_gpt_secondary_window
         data = {"data": {"rate_limits": [{"window": "weekly", "used_percent": 42.5, "resets_at": "2026-08-01T00:00:00Z"}]}}
@@ -901,6 +935,34 @@ class TestFetchGPTWeeklyUsage(unittest.TestCase):
         self.assertIn("GPT", result["error"])
         # Must not display 0% for missing data
         self.assertIsNone(result["data"])
+
+    def test_local_auth_free_plan_does_not_fall_back_to_history(self):
+        import json
+        import pathlib
+        import tempfile
+        from unittest.mock import patch, Mock
+        from api_client import fetch_gpt_weekly_usage
+        usage_data = {"plan_type": "free", "rate_limit": {
+            "primary_window": {"used_percent": 0, "limit_window_seconds": 2592000},
+            "secondary_window": None,
+        }}
+        usage_resp = Mock(status_code=200)
+        usage_resp.json.return_value = usage_data
+        with tempfile.TemporaryDirectory() as td:
+            auth_dir = pathlib.Path(td) / ".codex"
+            auth_dir.mkdir()
+            (auth_dir / "auth.json").write_text(
+                json.dumps({"tokens": {"access_token": "tok"}}), encoding="utf-8",
+            )
+            with (patch("api_client._pl.Path.home", return_value=pathlib.Path(td)),
+                  patch("api_client._GPT_SESSION.get", return_value=usage_resp),
+                  patch("api_client._gpt_try_jsonl") as history):
+                result = fetch_gpt_weekly_usage()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["source"], "local_codex_auth")
+        self.assertEqual(result["data"]["plan_type"], "free")
+        self.assertEqual(result["data"]["primary"]["window_seconds"], 2592000)
+        history.assert_not_called()
 
     def test_failure_reports_each_source_reason(self):
         import pathlib

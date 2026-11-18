@@ -37,7 +37,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QPoint, QRect, Qt  # noqa: E402
 from PyQt6.QtGui import QFont, QFontMetrics, QFontDatabase  # noqa: E402
-from PyQt6.QtWidgets import QApplication, QLineEdit, QMessageBox  # noqa: E402
+from PyQt6.QtWidgets import QApplication, QDialog, QLineEdit, QMessageBox, QPushButton  # noqa: E402
 
 # Ensure QApplication exists
 _app = QApplication.instance() or QApplication(sys.argv)
@@ -53,7 +53,7 @@ from widget import (  # noqa: E402
     MIMO_MODE, THIRD_PARTY_MODE, OVERVIEW_MODE,
     BASE_HEIGHT, OVERVIEW_HEIGHT, DUAL_BAR_GAP,
     BG_COLOR, BAR_BG, BALANCE_LAYER_COLORS, TEXT_COLOR, ACCENT_GREEN, ACCENT_YELLOW, ACCENT_RED, DIM, SuperGPTBalanceWorker, _format_overview_expiry,
-    _parse_reset_datetime, _format_overview_reset_time, _format_overview_reset_days,
+    _parse_reset_datetime, _format_overview_reset_time, _format_overview_reset_remaining,
 )
 from router_control import RouterResult  # noqa: E402
 
@@ -527,6 +527,27 @@ class TestOverviewPercentFormat(unittest.TestCase):
 
     def test_clamp_below(self):
         self.assertEqual(TokenWidget._format_overview_percent(-10.0, True), "100.0%")
+
+
+class TestMiMoSettings(unittest.TestCase):
+    def test_renew_button_fills_today_plus_30_days_for_save(self):
+        original = {"expiry_date": "2027-02-01"}
+        dialog = SettingsDialog(original)
+        self.addCleanup(dialog.close)
+        renew_btn = next(btn for btn in dialog.findChildren(QPushButton) if btn.text() == "续费")
+
+        with patch("widget.datetime") as clock:
+            clock.now.return_value = datetime(2026, 12, 20)
+            renew_btn.click()
+            self.assertEqual(dialog.expiry_edit.text(), "2027-01-19")
+            renew_btn.click()
+        self.assertEqual(dialog.expiry_edit.text(), "2027-01-19")
+        self.assertEqual(dialog.result(), QDialog.DialogCode.Rejected)
+
+        dialog.accept()
+        self.assertEqual(dialog.result(), QDialog.DialogCode.Accepted)
+        self.assertEqual(dialog.get_config()["expiry_date"], "2027-01-19")
+        self.assertEqual(original["expiry_date"], "2027-02-01")
 
 
 class TestSuperGPTSettings(unittest.TestCase):
@@ -1044,20 +1065,37 @@ class TestWlbResetRendering(unittest.TestCase):
             _format_overview_reset_time(timestamp),
             utc_reset.astimezone().strftime("%H:%M"),
         )
-        self.assertEqual(
-            _format_overview_reset_days(timestamp),
-            f"{(utc_reset.astimezone().date() - datetime.now().date()).days}天",
-        )
-
         before = datetime.now().astimezone().replace(tzinfo=None)
         fallback = _parse_reset_datetime(None, 3600)
         self.assertAlmostEqual((fallback - before).total_seconds(), 3600, delta=1)
         self.assertRegex(_format_overview_reset_time(None, 3600), r"^\d{2}:\d{2}$")
-        self.assertRegex(_format_overview_reset_days(None, 5 * 86400), r"^\d+天$")
+
+    def test_weekly_reset_countdown_uses_elapsed_time_across_midnight(self):
+        class FixedDatetime(datetime):
+            @classmethod
+            def now(cls):
+                return cls(2026, 11, 18, 21, 30)
+
+        cases = (
+            ("2026-11-18T23:45:00", None, "2小时15分"),
+            ("2026-11-19T00:15:00", None, "2小时45分"),
+            ("2026-11-19T21:29:00", None, "23小时59分"),
+            ("2026-11-19T21:30:00", None, "1天"),
+            ("2026-11-18T21:00:00", None, "0小时0分"),
+            (None, 25 * 60, "0小时25分"),
+            (None, 86400, "1天"),
+            (None, None, "--天"),
+        )
+        with patch("widget.datetime", FixedDatetime):
+            for reset_at, reset_after, expected in cases:
+                with self.subTest(reset_at=reset_at, reset_after=reset_after):
+                    self.assertEqual(
+                        _format_overview_reset_remaining(reset_at, reset_after), expected
+                    )
 
     def test_overview_wlb_dual_labels_are_compact_and_use_nine_point_font(self):
         reset_at = (
-            datetime.now().astimezone() + timedelta(days=5)
+            datetime.now().astimezone() + timedelta(days=5, hours=1)
         ).replace(microsecond=0).isoformat()
         w = _make_widget(display_mode=OVERVIEW_MODE, third_party_api_key="k")
         w._tp_data = {
@@ -1125,13 +1163,13 @@ class TestWlbResetRendering(unittest.TestCase):
         self.assertTrue(all(record[3].pointSize() == 9 for record in row_records))
         w.close()
 
-    def test_overview_gpt_dual_labels_use_primary_time_and_weekly_days(self):
+    def test_overview_gpt_dual_labels_fit_primary_time_and_weekly_countdown(self):
         primary_reset = datetime.now().astimezone() + timedelta(hours=1, minutes=46)
         w = _make_widget(display_mode=OVERVIEW_MODE, gpt_session_cookie="k")
         w._gpt_data = {
             "used_percent": 42.5,
             "primary": {"used_percent": 12.5, "reset_at": primary_reset.timestamp()},
-            "secondary": {"used_percent": 42.5, "reset_after": 5 * 86400},
+            "secondary": {"used_percent": 0, "reset_after": 23 * 3600 + 59 * 60},
         }
         painter = _OverviewPainter()
 
@@ -1146,8 +1184,8 @@ class TestWlbResetRendering(unittest.TestCase):
             [
                 f"GPT - {_format_overview_reset_time(primary_reset.timestamp())}",
                 "87.5%",
-                _format_overview_reset_days(None, 5 * 86400),
-                "57.5%",
+                "23小时59分",
+                "100.0%",
             ],
         )
         segment_width = (228 - DUAL_BAR_GAP) // 2

@@ -121,7 +121,7 @@ def _format_overview_expiry(expiry_date) -> str:
     return f"{max(0, days_left)}天" if days_left is not None else ""
 
 
-def _parse_reset_datetime(reset_at, reset_after=None):
+def _parse_reset_datetime(reset_at, reset_after=None, *, now=None):
     """Parse an ISO/Unix reset time, falling back to a relative delay."""
     parsed = reset_at if isinstance(reset_at, datetime) else None
     if parsed is None and isinstance(reset_at, (int, float)) and not isinstance(reset_at, bool):
@@ -151,7 +151,9 @@ def _parse_reset_datetime(reset_at, reset_after=None):
         return None
     if not math.isfinite(seconds) or seconds < 0:
         return None
-    return datetime.now().astimezone().replace(tzinfo=None) + timedelta(seconds=seconds)
+    if now is None:
+        now = datetime.now()
+    return now + timedelta(seconds=seconds)
 
 
 def _reset_parts(window):
@@ -199,13 +201,17 @@ def _format_overview_reset_time(reset_at, reset_after=None) -> str:
     return parsed.strftime("%H:%M") if parsed is not None else "--:--"
 
 
-def _format_overview_reset_days(reset_at, reset_after=None) -> str:
-    """Format days until reset as N天, or a clear placeholder."""
-    parsed = _parse_reset_datetime(reset_at, reset_after)
+def _format_overview_reset_remaining(reset_at, reset_after=None) -> str:
+    """Format the time until reset for a compact overview label."""
+    now = datetime.now()
+    parsed = _parse_reset_datetime(reset_at, reset_after, now=now)
     if parsed is None:
         return "--天"
-    days_left = max(0, (parsed.date() - datetime.now().date()).days)
-    return f"{days_left}天"
+    remaining = max(timedelta(), parsed - now)
+    if remaining.days:
+        return f"{remaining.days}天"
+    hours, minutes = divmod(remaining.seconds // 60, 60)
+    return f"{hours}小时{minutes}分"
 
 
 # ── Plan tier definitions ──────────────────────────────────────
@@ -437,7 +443,13 @@ class SettingsDialog(QDialog):
 
         self.expiry_edit = QLineEdit(str(cfg.get("expiry_date", "") or ""))
         self.expiry_edit.setPlaceholderText("例如 2026-08-31")
-        layout.addRow("有效期至:", self.expiry_edit)
+        renew_btn = QPushButton("续费")
+        renew_btn.setAutoDefault(False)
+        renew_btn.clicked.connect(self._fill_renewed_expiry)
+        expiry_row = QHBoxLayout()
+        expiry_row.addWidget(self.expiry_edit, 1)
+        expiry_row.addWidget(renew_btn)
+        layout.addRow("有效期至:", expiry_row)
 
         self.expiry_alert_check = QCheckBox("有效期小于等于 3 天时显示红色")
         self.expiry_alert_check.setChecked(cfg.get("expiry_alert_enabled", True))
@@ -477,7 +489,7 @@ class SettingsDialog(QDialog):
             "自动导入: Edge 快捷方式末尾加 --remote-debugging-port=9222 --remote-allow-origins=*，重启浏览器后点击按钮\n"
             "手动导入: F12 → Network → 刷新页面 → 点任意请求 → 复制 Cookie 头\n\n"
             "Playwright 自动续期: 使用独立浏览器配置定时刷新登录状态；首次或失效时可能需要验证码\n"
-            "有效期至: 手动填写套餐到期日期，例如 2026-08-31\n"
+            "有效期至: 可手动填写，或点击「续费」填入今天加 30 天的日期，再点击保存\n"
             "快照路径: 填写后会生成 JSON 供 claude-hud 读取显示用量\n"
             "WLB: 填写 Base URL 和 API Key 后可点击标题栏切换图标显示第三方用量\n"
             "WLB / SuperGPT API Key: 与 Router 共用，保存后双方生效；留空保持不变\n"
@@ -494,6 +506,9 @@ class SettingsDialog(QDialog):
         btn_row.addWidget(ok_btn)
         btn_row.addWidget(cancel_btn)
         layout.addRow(btn_row)
+
+    def _fill_renewed_expiry(self):
+        self.expiry_edit.setText((datetime.now().date() + timedelta(days=30)).isoformat())
 
     def _validate_base_urls(self) -> bool:
         """保存前统一校验 Base URL；非默认域名需用户显式确认。
@@ -2210,7 +2225,7 @@ class TokenWidget(QWidget):
                     primary_title = f"GPT - {primary_reset_text}"
                     primary_center_text = None
                 secondary_reset_at, secondary_reset_after = _reset_parts(secondary)
-                secondary_title = _format_overview_reset_days(
+                secondary_title = _format_overview_reset_remaining(
                     secondary_reset_at, secondary_reset_after
                 )
                 primary_text = self._format_overview_percent(

@@ -3,6 +3,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from unittest.mock import patch
 
 from config import (
@@ -61,7 +62,7 @@ class TestConfigStorage(unittest.TestCase):
         self.assertEqual(loaded["supergpt_base_url"], "https://example.test/v1")
         self.assertNotIn("supergpt_api_key", loaded)
 
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn:
             rows = conn.execute("SELECT count(1) FROM settings").fetchone()[0]
         self.assertEqual(rows, len(DEFAULT_CONFIG))
 
@@ -98,7 +99,7 @@ class TestConfigStorage(unittest.TestCase):
 
         db_path = os.path.join(self.data_dir, "settings.db")
         os.makedirs(self.data_dir, exist_ok=True)
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn, conn:
             conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value_json TEXT NOT NULL)")
             conn.execute(
                 "INSERT INTO settings(key, value_json) VALUES (?, ?)",
